@@ -35,6 +35,39 @@ pub const Matches = @import("header/name.zig").Matches;
 pub const KeywordValue = @import("header/value.zig").KeywordValue;
 /// An 80-byte header card with byte-exact round-trip (FR-HDR-1).
 pub const Card = @import("header/card.zig").Card;
+/// The ordered cards of one HDU header (FR-HDR-5/7/11).
+pub const Header = @import("header/header.zig").Header;
+
+// ── HDU model & file handle (§10) ──────────────────────────────────────────────────────
+const fits_mod = @import("fits.zig");
+/// The FITS file handle (open/create/navigate/build).
+pub const Fits = fits_mod.Fits;
+/// Open mode for a file handle.
+pub const Mode = fits_mod.Mode;
+/// Options for `open`/`create`.
+pub const OpenOpts = fits_mod.OpenOpts;
+/// Specification for a programmatically-built image HDU (FR-TPL-2).
+pub const ImageSpec = fits_mod.ImageSpec;
+/// One Header/Data Unit (FR-HDU-1/2).
+pub const Hdu = @import("hdu.zig").Hdu;
+/// The kind of an HDU.
+pub const HduKind = @import("hdu.zig").HduKind;
+
+/// Open an existing FITS file over a device (FR-HDU-1).
+pub const open = Fits.open;
+/// Create a new FITS file over a device.
+pub const create = Fits.create;
+/// Open an on-disk FITS file by path (the handle owns the device).
+pub const openFile = Fits.openFile;
+/// Create a new on-disk FITS file by path.
+pub const createFile = Fits.createFile;
+
+// ── Images (§11) ───────────────────────────────────────────────────────────────────────
+const image_mod = @import("image.zig");
+/// A typed view over an HDU's image data array (FR-IMG-*).
+pub const ImageView = image_mod.ImageView;
+/// Linear scaling state (BSCALE/BZERO/BLANK).
+pub const Scaling = image_mod.Scaling;
 
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
@@ -60,6 +93,10 @@ test {
     _ = @import("header/name.zig");
     _ = @import("header/value.zig");
     _ = @import("header/card.zig");
+    _ = @import("header/header.zig");
+    _ = @import("hdu.zig");
+    _ = @import("fits.zig");
+    _ = @import("image.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
