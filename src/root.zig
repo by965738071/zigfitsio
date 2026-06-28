@@ -88,6 +88,8 @@ pub const checksum = @import("checksum.zig");
 // ── World Coordinate System (§18) ──────────────────────────────────────────────────────
 /// The WCS keyword set parse/serialize (FR-WCS-1).
 pub const Wcs = @import("wcs/keys.zig").Wcs;
+/// Celestial pixel<->world transforms (FR-WCS-2).
+pub const Celestial = @import("wcs/celestial.zig").Celestial;
 
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
@@ -120,6 +122,7 @@ test {
     _ = @import("fits.zig");
     _ = @import("image.zig");
     _ = @import("wcs/keys.zig");
+    _ = @import("wcs/celestial.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
