@@ -12,12 +12,23 @@
 //! fastest (§10.1); tile `r` is table row `r`. Tiles on an axis whose length is not a multiple
 //! of the tile size are clipped to the image bound (edge/partial tiles).
 //!
-//! This is the **read** path and supports **GZIP only** for now: `GZIP_1` (plain gzip over the
-//! big-endian stored values) and `GZIP_2` (gzip over the MSB-first type-aware byte shuffle, see
-//! `compress/gzip.zig`). Any other `ZCMPTYPE` (`RICE_1`/`PLIO_1`/`HCOMPRESS_1`/unknown) yields
-//! `error.UnsupportedCodec` from `readAll` — never a silent mis-read (`NFR-INTEROP-1`). All
-//! declared sizes are validated against `Limits` and the device length before allocating
-//! (`NFR-SAFE-1`); a tile that decodes to the wrong size is `error.CorruptTile`.
+//! The read path decodes `GZIP_1`/`GZIP_2` (`compress/gzip.zig`), `RICE_1` (`compress/rice.zig`),
+//! `PLIO_1` (`compress/plio.zig`) and `HCOMPRESS_1` (`compress/hcompress.zig`); only an unrecognized
+//! `ZCMPTYPE` yields `error.UnsupportedCodec` from `readAll` — never a silent mis-read
+//! (`NFR-INTEROP-1`). The write path (`writeCompressed`) emits GZIP for any BITPIX and RICE/PLIO/
+//! HCOMPRESS for integer 8/16/32-bit images. All declared sizes are validated against `Limits` and
+//! the device length before allocating (`NFR-SAFE-1`); a tile that decodes to the wrong size is
+//! `error.CorruptTile`.
+//!
+//! Resolved spec ambiguities (no external toolchain here; correctness is proven by lossless
+//! write→read round-trips, `NFR-INTEROP-1`):
+//!   * `ZBLANK` null substitution on read mirrors the uncompressed image layer — a floating output
+//!     type receives NaN; an integer output type (which has no representable null) passes the raw
+//!     `ZBLANK` value through unchanged. On the dithered-float path a declared `ZBLANK` overrides
+//!     the convention's reserved `null_value` sentinel (§10.2.1).
+//!   * The write path records `RICE_1`'s `BLOCKSIZE` (default 32) and `BYTEPIX` (= |ZBITPIX|/8) and
+//!     `HCOMPRESS_1`'s `SCALE` (= 0, lossless) as `ZNAMEn`/`ZVALn` pairs; the RICE read path derives
+//!     `BYTEPIX` from `ZBITPIX` and `SCALE` is carried in the HCOMPRESS stream header.
 const std = @import("std");
 const builtin = @import("builtin");
 const errors = @import("../errors.zig");
@@ -435,6 +446,9 @@ pub const TiledImage = struct {
 
             const zs: f64 = if (scaled) try self.tileScale(row) else 1.0;
             const zz: f64 = if (scaled) try self.tileZero(row) else 0.0;
+            // Resolve the per-tile/keyword `ZBLANK` (integer images only; `BLANK` is undefined for
+            // floating images). A decoded stored value equal to `ZBLANK` is the null marker.
+            const blank: ?i64 = if (@typeInfo(Stored) == .int) try self.tileBlank(row) else null;
 
             const expected = try limits.mul(npix_tile, w);
             try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
@@ -455,6 +469,19 @@ pub const TiledImage = struct {
                 }
                 const byteoff: usize = @intCast(p * w);
                 const s = endian.read(Stored, stored_bytes[byteoff..][0..w]);
+                // `ZBLANK` null substitution, mirroring the uncompressed image layer: a floating
+                // output type receives NaN; an integer output type has no representable null, so the
+                // raw `ZBLANK` value passes through unchanged.
+                if (@typeInfo(Stored) == .int) {
+                    if (blank) |bl| {
+                        if (@as(i64, s) == bl) {
+                            if (nullSubstitute(T)) |nv| {
+                                out[@intCast(full)] = nv;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 const val: T = if (scaled) v: {
                     const sf: f64 = switch (@typeInfo(Stored)) {
                         .int => @floatFromInt(s),
@@ -517,6 +544,9 @@ pub const TiledImage = struct {
 
             const zs = try self.tileScale(row);
             const zz = try self.tileZero(row);
+            // The null sentinel for the quantized integers is the declared `ZBLANK` when present,
+            // otherwise the convention's reserved `null_value` (handled inside `unquantizeNext`).
+            const blank: ?i64 = try self.tileBlank(row);
 
             const expected = try limits.mul(npix_tile, w);
             try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
@@ -537,8 +567,12 @@ pub const TiledImage = struct {
                 }
                 const byteoff: usize = @intCast(p * w);
                 const s = endian.read(i32, stored_bytes[byteoff..][0..w]);
+                // `unquantizeNext` always advances the dither cursor (keeping it in lock-step with the
+                // encoder) and maps the reserved `null_value` to NaN; a declared `ZBLANK` overrides
+                // that sentinel so its pixels also read back as the null substitute.
                 const fval = cur.unquantizeNext(s, zs, zz, nan);
-                out[@intCast(full)] = try convert.cast(T, fval, .bulk);
+                const sub: f32 = if (blank) |bl| (if (@as(i64, s) == bl) nan else fval) else fval;
+                out[@intCast(full)] = try convert.cast(T, sub, .bulk);
             }
         }
     }
@@ -660,6 +694,17 @@ pub const TiledImage = struct {
         }
         return self.zzero_kw orelse 0.0;
     }
+
+    // The effective `ZBLANK` for tile `row`: the per-tile column value when a `ZBLANK` column is
+    // present, else the `ZBLANK` keyword (or `null` when neither is declared).
+    fn tileBlank(self: *TiledImage, row: u64) binary.AccessError!?i64 {
+        if (self.zblank_col) |col| {
+            var buf: [1]i64 = undefined;
+            try self.base.readColumn(i64, .{ .index = col }, row, &buf, .{});
+            return buf[0];
+        }
+        return self.zblank_kw;
+    }
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────
@@ -668,6 +713,16 @@ fn validBitpix(b: i64) bool {
     return switch (b) {
         8, 16, 32, 64, -32, -64 => true,
         else => false,
+    };
+}
+
+// The null substitute emitted for a `ZBLANK` pixel decoded into output type `T`: NaN for a floating
+// `T`, and `null` (no substitution) for an integer `T`, which cannot represent a null value (the raw
+// `ZBLANK` then passes through). Mirrors the uncompressed image layer's null handling.
+fn nullSubstitute(comptime T: type) ?T {
+    return switch (@typeInfo(T)) {
+        .float => std.math.nan(T),
+        else => null,
     };
 }
 
@@ -829,7 +884,9 @@ pub const CompressSpec = struct {
     axes: []const u64,
     /// `ZTILEn`. `null` selects the default row-strip tiling (full first axis, 1 elsewhere).
     tile: ?[]const u64 = null,
-    /// `ZCMPTYPE`. The write path implements `GZIP_1`/`GZIP_2` (CMP-8); anything else is
+    /// `ZCMPTYPE`. The write path implements `GZIP_1`/`GZIP_2` (any BITPIX), and `RICE_1`/`PLIO_1`/
+    /// `HCOMPRESS_1` for integer 8/16/32-bit images (HCOMPRESS additionally requires `ZNAXIS ≥ 2`);
+    /// an invalid codec/BITPIX pairing is `error.DataConstraintViolated` and `.unknown` is
     /// `error.UnsupportedCodec`.
     codec: Codec = .gzip_1,
     /// `ZQUANTIZ`. For a float `bitpix`, `subtractive_dither_1`/`_2` quantizes pixels to 32-bit
@@ -849,14 +906,15 @@ pub const WriteCompressError = FitsError || errors.CompressError || errors.Table
 /// The mandatory `Z*` keywords are emitted (`ZIMAGE`, `ZCMPTYPE`, `ZBITPIX`, `ZNAXIS`, `ZNAXISn`,
 /// `ZTILEn`, plus `ZQUANTIZ`/`ZDITHER0` for a dithered float image); the image is tiled and each
 /// tile compressed and stored in the `COMPRESSED_DATA` (`1P`) heap column. For a dithered float
-/// image the per-tile `ZSCALE`/`ZZERO` are stored as columns. `error.UnsupportedCodec` for a
-/// non-GZIP `codec`; `error.BadDimensions` when `pixels.len` ≠ ∏`axes`.
+/// image the per-tile `ZSCALE`/`ZZERO` are stored as columns. RICE_1/PLIO_1/HCOMPRESS_1 dispatch
+/// through `encodeRaw` for integer 8/16/32-bit images and emit their `ZNAMEn`/`ZVALn` parameters.
+/// `error.UnsupportedCodec` for `.unknown`, `error.DataConstraintViolated` for an invalid codec/
+/// BITPIX pairing, `error.BadDimensions` when `pixels.len` ≠ ∏`axes`.
 pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels: []const T) WriteCompressError!*Hdu {
     const alloc = fits.alloc;
     if (fits.mode == .read_only or !fits.dev.isWritable()) return error.NotWritable;
     if (!validBitpix(spec.bitpix)) return error.BadBitpix;
     const codec_name = spec.codec.name() orelse return error.UnsupportedCodec;
-    if (spec.codec != .gzip_1 and spec.codec != .gzip_2) return error.UnsupportedCodec;
     const znaxis = spec.axes.len;
     if (znaxis == 0 or znaxis > 999) return error.BadNaxis;
 
@@ -869,6 +927,23 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
     const w = bitpixWidth(spec.bitpix);
     const do_dither = spec.bitpix < 0 and spec.quantize.isDithered();
+
+    // Validate the codec/BITPIX pairing (CMP-8 write path). GZIP_1/GZIP_2 accept any BITPIX (they
+    // store raw big-endian bytes). RICE_1/PLIO_1/HCOMPRESS_1 encode integer stored values, so they
+    // require an integer image of 8/16/32 bits (RICE bytepix ∈ {1,2,4}; PLIO/HCOMPRESS produce i32),
+    // are unavailable on the dithered-float path, and HCOMPRESS additionally requires a 2-D image.
+    switch (spec.codec) {
+        .gzip_1, .gzip_2 => {},
+        .rice_1, .plio_1, .hcompress_1 => {
+            if (do_dither) return error.UnsupportedCodec;
+            switch (spec.bitpix) {
+                8, 16, 32 => {},
+                else => return error.DataConstraintViolated,
+            }
+            if (spec.codec == .hcompress_1 and znaxis < 2) return error.BadTiling;
+        },
+        .unknown => return error.UnsupportedCodec,
+    }
 
     const tile = try alloc.alloc(u64, znaxis);
     defer alloc.free(tile);
@@ -983,11 +1058,12 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
                 }
                 try zscales.append(alloc, zs);
                 try zzeros.append(alloc, zz);
-                break :blk try encodeRaw(alloc, spec.codec, raw, 4);
+                // The dithered path is GZIP-only (validated above), so `tdim`/`znaxis` are unused.
+                break :blk try encodeRaw(alloc, spec.codec, raw, .{ .w = 4, .tdim = tdim, .znaxis = @intCast(znaxis) });
             } else {
                 const raw = try buildRawBytes(T, alloc, spec.bitpix, pixels, tile_idx);
                 defer alloc.free(raw);
-                break :blk try encodeRaw(alloc, spec.codec, raw, w);
+                break :blk try encodeRaw(alloc, spec.codec, raw, .{ .w = w, .tdim = tdim, .znaxis = @intCast(znaxis) });
             }
         };
         {
@@ -998,7 +1074,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     }
 
     const ncols: u64 = if (do_dither) 3 else 1;
-    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_dither, tile);
+    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_dither, tile, w);
     const hdu = try fits.appendHdu(h); // takes ownership of `h` (frees it on its own error)
 
     var bt = try BinTable.of(fits, hdu);
@@ -1017,7 +1093,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
 // Build the compressed-image BINTABLE header. Has its own errdefer; on success the caller passes
 // the returned header to `appendHdu`, which then owns (and on its own error frees) it.
-fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_dither: bool, tile: []const u64) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
+fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_dither: bool, tile: []const u64, w: usize) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
     var h = Header.initEmpty();
     errdefer h.deinit(alloc);
     try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
@@ -1047,6 +1123,22 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     for (tile, 0..) |tv, i| {
         try h.appendValue(alloc, std.fmt.bufPrint(&nb, "ZTILE{d}", .{i + 1}) catch unreachable, .{ .int = @intCast(tv) }, null);
     }
+    // Codec parameters (ZNAMEn/ZVALn), contiguous from n=1 so the read path's `parseParams` finds
+    // them. RICE_1 records BLOCKSIZE/BYTEPIX; HCOMPRESS_1 records SCALE. GZIP_1/2 and PLIO_1 take no
+    // parameters.
+    switch (spec.codec) {
+        .rice_1 => {
+            try h.appendValue(alloc, "ZNAME1", .{ .string = "BLOCKSIZE" }, null);
+            try h.appendValue(alloc, "ZVAL1", .{ .int = @intCast(default_rice_blocksize) }, null);
+            try h.appendValue(alloc, "ZNAME2", .{ .string = "BYTEPIX" }, null);
+            try h.appendValue(alloc, "ZVAL2", .{ .int = @intCast(w) }, null);
+        },
+        .hcompress_1 => {
+            try h.appendValue(alloc, "ZNAME1", .{ .string = "SCALE" }, null);
+            try h.appendValue(alloc, "ZVAL1", .{ .int = default_hcompress_scale }, null);
+        },
+        else => {},
+    }
     if (do_dither) {
         try h.appendValue(alloc, "ZQUANTIZ", .{ .string = spec.quantize.name().? }, null);
         try h.appendValue(alloc, "ZDITHER0", .{ .int = spec.zdither0 }, null);
@@ -1055,12 +1147,90 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     return h;
 }
 
-fn encodeRaw(alloc: Allocator, codec: Codec, raw: []const u8, w: usize) (errors.CompressError || Allocator.Error)![]u8 {
-    return switch (codec) {
-        .gzip_1 => gzip.gzipEncode(alloc, raw),
-        .gzip_2 => gzip.gzip2Encode(alloc, raw, w),
-        else => error.UnsupportedCodec,
-    };
+/// The default RICE_1 block size emitted on the write path (CFITSIO default; also the read-path
+/// fallback when no `BLOCKSIZE` parameter is present). Recorded as the `BLOCKSIZE` `ZVALn`.
+pub const default_rice_blocksize: u32 = 32;
+
+/// The HCOMPRESS_1 scale emitted on the write path. `0` selects lossless compression so the
+/// integer write→read round-trip is exact. Recorded as the `SCALE` `ZVALn`.
+pub const default_hcompress_scale: i32 = 0;
+
+// Per-tile encode context: the stored element width and the tile geometry HCOMPRESS needs.
+const EncodeCtx = struct {
+    w: usize,
+    tdim: []const u64,
+    znaxis: u16,
+};
+
+// Encode one tile's big-endian stored values (`raw`, width `ctx.w`) with `codec`, returning the
+// compressed cell bytes the read path's `decodeCompressed` consumes. RICE_1 re-derives native-endian
+// element bytes; PLIO_1/HCOMPRESS_1 unpack the big-endian values to `i32` (matching `i32ToBig` on
+// read). The codec error sets (`{DataConstraintViolated, CorruptTile, OutOfMemory}`) are a subset of
+// the declared return set, so they propagate directly.
+fn encodeRaw(alloc: Allocator, codec: Codec, raw: []const u8, ctx: EncodeCtx) (errors.CompressError || Allocator.Error)![]u8 {
+    switch (codec) {
+        .gzip_1 => return gzip.gzipEncode(alloc, raw),
+        .gzip_2 => return gzip.gzip2Encode(alloc, raw, ctx.w),
+        .rice_1 => {
+            const bytepix = std.math.cast(u8, ctx.w) orelse return error.DataConstraintViolated;
+            const native = try bigToNative(alloc, raw, ctx.w);
+            defer alloc.free(native);
+            return rice.compress(alloc, native, bytepix, default_rice_blocksize);
+        },
+        .plio_1 => {
+            const vals = try bigToI32(alloc, raw, ctx.w);
+            defer alloc.free(vals);
+            return plio.compress(alloc, vals);
+        },
+        .hcompress_1 => {
+            if (ctx.znaxis < 2) return error.BadTiling;
+            const vals = try bigToI32(alloc, raw, ctx.w);
+            defer alloc.free(vals);
+            // tdim[0] is the fastest axis = columns = ny; tdim[1] = rows = nx (see `decodeCompressed`).
+            const ny = std.math.cast(usize, ctx.tdim[0]) orelse return error.DataConstraintViolated;
+            const nx = std.math.cast(usize, ctx.tdim[1]) orelse return error.DataConstraintViolated;
+            return hcompress.compress(alloc, vals, nx, ny, default_hcompress_scale);
+        },
+        .unknown => return error.UnsupportedCodec,
+    }
+}
+
+// Re-encode `raw` (big-endian element bytes, width `w`) as native-endian element bytes — the inverse
+// of `nativeToBig` — so it can be fed to `rice.compress`.
+fn bigToNative(alloc: Allocator, raw: []const u8, w: usize) (errors.CompressError || Allocator.Error)![]u8 {
+    if (w == 0 or raw.len % w != 0) return error.CorruptTile;
+    const out = try alloc.alloc(u8, raw.len);
+    errdefer alloc.free(out);
+    var i: usize = 0;
+    while (i < raw.len) : (i += w) {
+        switch (w) {
+            1 => out[i] = raw[i],
+            2 => std.mem.writeInt(u16, out[i..][0..2], std.mem.readInt(u16, raw[i..][0..2], .big), native_endian),
+            4 => std.mem.writeInt(u32, out[i..][0..4], std.mem.readInt(u32, raw[i..][0..4], .big), native_endian),
+            8 => std.mem.writeInt(u64, out[i..][0..8], std.mem.readInt(u64, raw[i..][0..8], .big), native_endian),
+            else => return error.DataConstraintViolated,
+        }
+    }
+    return out;
+}
+
+// Unpack `raw` (big-endian signed element bytes, width `w`) to `i32` values, the form PLIO_1 and
+// HCOMPRESS_1 compress. A width-8 value outside the `i32` range is `error.DataConstraintViolated`.
+fn bigToI32(alloc: Allocator, raw: []const u8, w: usize) (errors.CompressError || Allocator.Error)![]i32 {
+    if (w == 0 or raw.len % w != 0) return error.CorruptTile;
+    const out = try alloc.alloc(i32, raw.len / w);
+    errdefer alloc.free(out);
+    for (out, 0..) |*o, idx| {
+        const off = idx * w;
+        o.* = switch (w) {
+            1 => std.mem.readInt(i8, raw[off..][0..1], .big),
+            2 => std.mem.readInt(i16, raw[off..][0..2], .big),
+            4 => std.mem.readInt(i32, raw[off..][0..4], .big),
+            8 => std.math.cast(i32, std.mem.readInt(i64, raw[off..][0..8], .big)) orelse return error.DataConstraintViolated,
+            else => return error.DataConstraintViolated,
+        };
+    }
+    return out;
 }
 
 // Widen any numeric pixel value to f32/f64 (the dither branch is runtime-gated but still compiled
@@ -1295,6 +1465,7 @@ const ZSpec = struct {
     zquantiz: ?[]const u8 = null,
     zscale: ?f64 = null,
     zzero: ?f64 = null,
+    zblank: ?i64 = null,
 };
 
 fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
@@ -1331,6 +1502,7 @@ fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
     if (spec.zquantiz) |q| try h.appendValue(alloc, "ZQUANTIZ", .{ .string = q }, null);
     if (spec.zscale) |s| try h.appendValue(alloc, "ZSCALE", .{ .float = s }, null);
     if (spec.zzero) |z| try h.appendValue(alloc, "ZZERO", .{ .float = z }, null);
+    if (spec.zblank) |b| try h.appendValue(alloc, "ZBLANK", .{ .int = b }, null);
     try h.ensureEnd(alloc);
     return h;
 }
@@ -1594,6 +1766,75 @@ test "per-tile keyword ZSCALE/ZZERO applied on read" {
     var out: [3]f64 = undefined;
     try ti.readAll(f64, &out);
     try testing.expectEqualSlices(f64, &[_]f64{ 12.0, 14.0, 16.0 }, &out);
+}
+
+test "keyword ZBLANK pixels decode to the null substitute (NaN for float output)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // ZBLANK = 2: the second stored value is the null marker.
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{3},
+        .ztilen = &.{3},
+        .nrows = 1,
+        .pcount = 2048,
+        .tforms = &.{"1PB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+        .zblank = 2,
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+
+    var t = try BinTable.of(&fx.f, hdu);
+    var mgr = try HeapManager.initForTable(&t);
+    try writeTileI16(alloc, &t, &mgr, 0, 0, &[_]i16{ 1, 2, 3 }, false);
+    mgr.deinit(alloc);
+    t.deinit(alloc);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(?i64, 2), ti.zblank_kw);
+
+    var out: [3]f32 = undefined;
+    try ti.readAll(f32, &out);
+    try testing.expectEqual(@as(f32, 1.0), out[0]);
+    try testing.expect(std.math.isNan(out[1])); // ZBLANK → NaN
+    try testing.expectEqual(@as(f32, 3.0), out[2]);
+}
+
+test "no ZBLANK control: every pixel decodes to its value (no substitution)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const spec = ZSpec{
+        .ztype = "GZIP_1",
+        .zbitpix = 16,
+        .znaxisn = &.{3},
+        .ztilen = &.{3},
+        .nrows = 1,
+        .pcount = 2048,
+        .tforms = &.{"1PB"},
+        .ttypes = &.{"COMPRESSED_DATA"},
+        // no .zblank
+    };
+    const hdu = try fx.f.appendHdu(try buildZHeader(alloc, spec));
+
+    var t = try BinTable.of(&fx.f, hdu);
+    var mgr = try HeapManager.initForTable(&t);
+    try writeTileI16(alloc, &t, &mgr, 0, 0, &[_]i16{ 1, 2, 3 }, false);
+    mgr.deinit(alloc);
+    t.deinit(alloc);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(?i64, null), ti.zblank_kw);
+
+    var out: [3]f32 = undefined;
+    try ti.readAll(f32, &out);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0, 3.0 }, &out); // 2.0 is NOT null here
 }
 
 test "ZNAMEn/ZVALn codec parameters and ZDITHER0 are recorded" {
@@ -1910,22 +2151,131 @@ test "writeCompressed GZIP_2 (default row-strip tiling) round-trips i16" {
     try testing.expectEqualSlices(i16, &src, &out);
 }
 
-test "writeCompressed rejects a non-GZIP codec and a wrong-length buffer" {
+test "writeCompressed rejects an unknown codec, a bad codec/BITPIX pairing, and a wrong-length buffer" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
     defer fx.deinit(alloc);
 
     const src = [_]i32{ 1, 2, 3, 4 };
+    // An unrecognized codec has no canonical name ⇒ UnsupportedCodec.
     try testing.expectError(error.UnsupportedCodec, writeCompressed(i32, &fx.f, .{
         .bitpix = 32,
         .axes = &.{ 2, 2 },
-        .codec = .rice_1,
+        .codec = .unknown,
     }, &src));
+    // RICE_1 on a 64-bit image: bytepix 8 is not a RICE width ⇒ DataConstraintViolated.
+    const src64 = [_]i64{ 1, 2, 3, 4 };
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(i64, &fx.f, .{
+        .bitpix = 64,
+        .axes = &.{ 2, 2 },
+        .codec = .rice_1,
+    }, &src64));
+    // HCOMPRESS_1 on a 1-D image ⇒ BadTiling (it is 2-D only).
+    try testing.expectError(error.BadTiling, writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{4},
+        .codec = .hcompress_1,
+    }, &src));
+    // Wrong-length pixel buffer ⇒ BadDimensions.
     try testing.expectError(error.BadDimensions, writeCompressed(i32, &fx.f, .{
         .bitpix = 32,
         .axes = &.{ 2, 2 },
         .codec = .gzip_1,
     }, src[0..3]));
+}
+
+test "writeCompressed RICE_1 round-trips an integer image" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const src = [_]i16{ 7, 9, 11, 13, 100, 99, 98, 97, -5, -4, -3, -2 };
+    const hdu = try writeCompressed(i16, &fx.f, .{
+        .bitpix = 16,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .rice_1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Codec.rice_1, ti.ztype);
+    // Codec parameters were emitted.
+    try testing.expectEqual(@as(?i64, default_rice_blocksize), ti.paramInt("BLOCKSIZE"));
+    try testing.expectEqual(@as(?i64, 2), ti.paramInt("BYTEPIX"));
+
+    var out: [12]i16 = undefined;
+    try ti.readAll(i16, &out);
+    try testing.expectEqualSlices(i16, &src, &out);
+}
+
+test "writeCompressed PLIO_1 round-trips a mask image" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // PLIO mask values in 0..2^24-1.
+    const src = [_]i32{ 0, 0, 5, 5, 5, 0, 3, 0, 0, 7, 7, 0 };
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .plio_1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Codec.plio_1, ti.ztype);
+
+    var out: [12]i32 = undefined;
+    try ti.readAll(i32, &out);
+    try testing.expectEqualSlices(i32, &src, &out);
+}
+
+test "writeCompressed HCOMPRESS_1 round-trips a 2-D integer image (lossless)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    const src = [_]i32{ 1, 2, 3, 4, 10, 11, 12, 13, -7, -6, -5, -4 };
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .hcompress_1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Codec.hcompress_1, ti.ztype);
+    try testing.expectEqual(@as(?i64, default_hcompress_scale), ti.paramInt("SCALE"));
+
+    var out: [12]i32 = undefined;
+    try ti.readAll(i32, &out);
+    try testing.expectEqualSlices(i32, &src, &out);
+}
+
+test "writeCompressed HCOMPRESS_1 round-trips across multiple 2-D tiles" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // 5×4 image, 2×3 tiling ⇒ 6 tiles, several partial — exercises per-tile nx/ny.
+    var src: [20]i32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(@as(i64, @intCast(i)) * 2 - 9);
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 5, 4 },
+        .tile = &.{ 2, 3 },
+        .codec = .hcompress_1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, 6), ti.tileCount());
+    var out: [20]i32 = undefined;
+    try ti.readAll(i32, &out);
+    try testing.expectEqualSlices(i32, &src, &out);
 }
 
 // ── CMP-7 subtractive dithering on the write→read float path ──────────────────────────────────

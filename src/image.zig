@@ -16,6 +16,7 @@ const endian = @import("endian.zig");
 const limits = @import("limits.zig");
 const Fits = @import("fits.zig").Fits;
 const Hdu = @import("hdu.zig").Hdu;
+const TiledImage = @import("compress/tiled.zig").TiledImage;
 
 /// The quiet-NaN bit pattern emitted for floating null pixels (FR-IMG-8). Any NaN is
 /// recognized as null on read; this specific pattern is written on output. (Byte-for-byte
@@ -62,18 +63,31 @@ const Dir = enum { read, write };
 /// edits header cards and re-lands the geometry through the file handle, so this set also
 /// folds in `HeaderError`/`ValueError`/`Allocator.Error` (it then equals `Fits.FitsError`).
 pub const ImageError = errors.StructError || errors.IoError || errors.ConvError ||
-    errors.LimitError || errors.HeaderError || errors.ValueError || std.mem.Allocator.Error;
+    errors.LimitError || errors.HeaderError || errors.ValueError || errors.TableError ||
+    errors.CompressError || std.mem.Allocator.Error;
 
 /// A typed view over an HDU's image data array.
 pub const ImageView = struct {
     fits: *Fits,
     hdu: *Hdu,
 
-    /// Wrap an image-like HDU (primary, IMAGE, or random groups). `error.WrongHduType` for a
-    /// table HDU.
+    /// Wrap an image-like HDU (primary, IMAGE, or random groups) — or a tile-compressed image,
+    /// a `BINTABLE` carrying `ZIMAGE = T` (§10.1, design §17.1), so callers use one image API
+    /// regardless of compression. A compressed view decodes transparently through `TiledImage` on
+    /// `readAll`. `error.WrongHduType` for any other table HDU.
     pub fn of(fits: *Fits, hdu: *Hdu) errors.StructError!ImageView {
-        if (!hdu.kind.isImageLike()) return error.WrongHduType;
-        return .{ .fits = fits, .hdu = hdu };
+        if (hdu.kind.isImageLike()) return .{ .fits = fits, .hdu = hdu };
+        if (hdu.kind == .binary_table and (hdu.header.getValue(bool, "ZIMAGE") catch false)) {
+            return .{ .fits = fits, .hdu = hdu };
+        }
+        return error.WrongHduType;
+    }
+
+    /// Whether this view wraps a tile-compressed image (`ZIMAGE = T` `BINTABLE`). Such a view
+    /// reports its *uncompressed* geometry from the `Z*` keywords and decodes through `TiledImage`.
+    pub fn isCompressed(self: *const ImageView) bool {
+        if (self.hdu.kind != .binary_table) return false;
+        return self.hdu.header.getValue(bool, "ZIMAGE") catch false;
     }
 
     /// Append a new image HDU to `fits` and return a view over it (FR-TPL-2 convenience).
@@ -131,21 +145,45 @@ pub const ImageView = struct {
         try self.fits.rewriteHeaderInPlace(self.hdu);
     }
 
-    /// `BITPIX` of the underlying array.
+    /// `BITPIX` of the underlying array. For a compressed view this is the *uncompressed* image
+    /// `ZBITPIX`, not the host `BINTABLE`'s `BITPIX = 8`.
     pub fn bitpix(self: *const ImageView) i64 {
+        if (self.isCompressed()) return self.hdu.header.getValue(i64, "ZBITPIX") catch self.hdu.bitpix;
         return self.hdu.bitpix;
     }
 
-    /// Per-axis sizes (most-rapidly-varying first).
+    /// Per-axis sizes (most-rapidly-varying first). For a compressed view the uncompressed
+    /// dimensions live in `ZNAXISn`; use `TiledImage.dims` for the full per-axis vector. This getter
+    /// returns the host table's axes for a compressed HDU (it cannot synthesize a slice without
+    /// storage), so prefer `elementCount`/`TiledImage` when the HDU may be compressed.
     pub fn dims(self: *const ImageView) []const u64 {
         return self.hdu.axes;
     }
 
-    /// Total number of pixels (product of axes; 0 when `NAXIS == 0`).
+    /// Total number of pixels (product of axes; 0 when `NAXIS == 0`). For a compressed view this is
+    /// the product of `ZNAXISn` (the uncompressed pixel count).
     pub fn elementCount(self: *const ImageView) u64 {
+        if (self.isCompressed()) return self.compressedElementCount();
         if (self.hdu.naxis == 0) return 0;
         var n: u64 = 1;
         for (self.hdu.axes) |a| n *= a;
+        return n;
+    }
+
+    // Product of `ZNAXISn` for a compressed image (its uncompressed pixel count); 0 if the geometry
+    // keywords are missing or malformed (the subsequent `TiledImage.of` reports the precise error).
+    fn compressedElementCount(self: *const ImageView) u64 {
+        const znaxis = self.hdu.header.getValue(i64, "ZNAXIS") catch return 0;
+        if (znaxis <= 0 or znaxis > 999) return 0;
+        var n: u64 = 1;
+        var buf: [16]u8 = undefined;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(znaxis))) : (i += 1) {
+            const kw = std.fmt.bufPrint(&buf, "ZNAXIS{d}", .{i + 1}) catch unreachable;
+            const v = self.hdu.header.getValue(i64, kw) catch return 0;
+            if (v < 0) return 0;
+            n *= @intCast(v);
+        }
         return n;
     }
 
@@ -159,10 +197,23 @@ pub const ImageView = struct {
         };
     }
 
-    /// Read the entire array into `out` (exactly `elementCount()` elements) (FR-IMG-3/9).
+    /// Read the entire array into `out` (exactly `elementCount()` elements) (FR-IMG-3/9). A
+    /// tile-compressed view (`isCompressed`) decodes transparently through `TiledImage`, which
+    /// applies its own per-tile `ZSCALE`/`ZZERO` and `ZBLANK`; the `opts` scaling/sentinel overrides
+    /// apply only to the uncompressed path.
     pub fn readAll(self: *ImageView, comptime T: type, out: []T, opts: ReadOpts(T)) ImageError!void {
+        if (self.isCompressed()) return self.readAllCompressed(T, out);
         if (out.len != self.elementCount()) return error.BadDimensions;
         try self.readLinear(T, 0, out, self.scalingOf(opts.scaling), opts.null_sentinel);
+    }
+
+    // Decode a tile-compressed image through `TiledImage` (design §17.1). The whole image is decoded
+    // into `out` (row-major, first axis fastest); `out.len` must equal the uncompressed pixel count.
+    fn readAllCompressed(self: *ImageView, comptime T: type, out: []T) ImageError!void {
+        var ti = try TiledImage.of(self.fits, self.hdu);
+        defer ti.deinit(self.fits.alloc);
+        if (out.len != ti.elementCount()) return error.BadDimensions;
+        try ti.readAll(T, out);
     }
 
     /// Read `out.len` contiguous pixels starting at the N-D coordinate `first` (FR-IMG-3).
@@ -880,6 +931,37 @@ test "convert.cast failures surface through writeAll (DoD failure paths)" {
         var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{1} });
         try testing.expectError(error.Overflow, img.writeAll(f64, &.{80000.0}, .{ .scaling = .{ .bscale = 2 } }));
     }
+}
+
+test "ImageView.of transparently reads a tile-compressed image (design §17.1)" {
+    const tiled = @import("compress/tiled.zig");
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary
+
+    const src = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const hdu = try tiled.writeCompressed(i32, &f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .gzip_1,
+    }, &src);
+
+    // The compressed HDU is a BINTABLE, yet ImageView.of accepts it and reports image geometry.
+    var img = try ImageView.of(&f, hdu);
+    try testing.expect(img.isCompressed());
+    try testing.expectEqual(@as(i64, 32), img.bitpix()); // ZBITPIX, not the host BITPIX=8
+    try testing.expectEqual(@as(u64, 12), img.elementCount()); // ∏ ZNAXISn
+
+    var out: [12]i32 = undefined;
+    try img.readAll(i32, &out, .{});
+    try testing.expectEqualSlices(i32, &src, &out);
+
+    // A plain (uncompressed) image view still reports not-compressed.
+    var pimg = try ImageView.of(&f, try f.select(1));
+    try testing.expect(!pimg.isCompressed());
 }
 
 test "multi-chunk transfer stays correct across the chunk boundary" {
