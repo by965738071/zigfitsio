@@ -105,6 +105,20 @@ pub fn parseComment(field: []const u8) ?[]const u8 {
     return trimmed;
 }
 
+/// Extract the units string from the leading `[unit]` comment convention (FR-HDR-10,
+/// FITS 4.0 §4.3.2), e.g. `1200. / [s] exposure time` → `"s"`. Returns a borrowed slice into
+/// `field`, or `null` when the comment does not begin with a `[unit]` group. Non-unit bracket
+/// text elsewhere in the comment is not misread (only a leading `[...]` counts).
+pub fn parseUnits(field: []const u8) ?[]const u8 {
+    const comment = parseComment(field) orelse return null;
+    const c = std.mem.trimStart(u8, comment, " ");
+    if (c.len == 0 or c[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, c, ']') orelse return null;
+    const unit = std.mem.trim(u8, c[1..close], " ");
+    if (unit.len == 0) return null;
+    return unit;
+}
+
 /// Format `v` into `w`. Numeric and logical values are written **fixed format**
 /// (right-justified within the 20-column value field) as required for mandatory keywords
 /// (`FR-HDR-4`); strings, complex values, and `.undefined` use the natural free-format
@@ -424,6 +438,16 @@ test "formatValue undefined writes a blank value field" {
     var w = std.Io.Writer.fixed(&buf);
     try formatValue(&w, .undefined);
     try testing.expectEqual(@as(usize, 0), w.buffered().len);
+}
+
+test "parseUnits: leading [unit] comment convention (FR-HDR-10)" {
+    try testing.expectEqualStrings("s", parseUnits("1200. / [s] exposure time").?);
+    try testing.expectEqualStrings("Angstrom", parseUnits("5000.0 / [Angstrom] wavelength").?);
+    // No leading bracket ⇒ no units; a bracket later in the comment is not misread.
+    try testing.expectEqual(@as(?[]const u8, null), parseUnits("42 / plain comment"));
+    try testing.expectEqual(@as(?[]const u8, null), parseUnits("42 / see table [3]"));
+    try testing.expectEqual(@as(?[]const u8, null), parseUnits("42 / [] empty"));
+    try testing.expectEqual(@as(?[]const u8, null), parseUnits("42")); // no comment
 }
 
 test "deinit frees only strings (no leaks under the testing allocator)" {

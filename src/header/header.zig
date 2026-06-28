@@ -25,6 +25,9 @@ const Allocator = std.mem.Allocator;
 /// The ordered cards of one HDU header and the API to read and build them.
 pub const Header = struct {
     cards: std.ArrayList(Card) = .empty,
+    /// Opt-in `INHERIT` fall-through to the primary header (FR-HDR-14); `null` disables it.
+    /// Set via `setInherit`. Never changes the bytes written — it only affects lookups.
+    inherit: ?*const Header = null,
 
     /// An empty header (no cards). Add cards with `append`/`appendValue` or fill via `parse`.
     pub fn initEmpty() Header {
@@ -64,16 +67,52 @@ pub const Header = struct {
         return &self.cards.items[n];
     }
 
-    /// Borrow the first card whose keyword name matches `name` (case-insensitive). Returns
-    /// `error.KeywordNotFound` when there is none. `END` is not matchable by name here.
-    pub fn get(self: *const Header, name: []const u8) ValueError!*const Card {
-        const idx = self.findFirst(name) orelse return error.KeywordNotFound;
-        return &self.cards.items[idx];
+    /// Enable `INHERIT` fall-through to `parent` (the primary header), or pass `null` to
+    /// disable. Opt-in and read-only in effect (FR-HDR-14); serialization is unaffected.
+    pub fn setInherit(self: *Header, parent: ?*const Header) void {
+        self.inherit = parent;
     }
 
-    /// Whether a keyword named `name` exists (case-insensitive).
+    /// Borrow the first card whose keyword name matches `name` (case-insensitive). Returns
+    /// `error.KeywordNotFound` when there is none. `END` is not matchable by name here. When
+    /// `INHERIT` is enabled and `name` is inheritable, a local miss falls through to the parent.
+    pub fn get(self: *const Header, name: []const u8) ValueError!*const Card {
+        if (self.findFirst(name)) |idx| return &self.cards.items[idx];
+        if (self.inherit) |parent| {
+            if (isInheritable(name)) return parent.get(name);
+        }
+        return error.KeywordNotFound;
+    }
+
+    /// Whether a keyword named `name` exists (case-insensitive), honoring `INHERIT`.
     pub fn has(self: *const Header, name: []const u8) bool {
-        return self.findFirst(name) != null;
+        if (self.findFirst(name) != null) return true;
+        if (self.inherit) |parent| {
+            if (isInheritable(name)) return parent.has(name);
+        }
+        return false;
+    }
+
+    // Whether `name` may be inherited from the primary header (FR-HDR-14, Appendix K): the
+    // structural keywords, SIMPLE/COMMENT/HISTORY/blank, and the table column keywords are
+    // excluded (they are HDU-specific and must not fall through).
+    fn isInheritable(name: []const u8) bool {
+        const n = std.mem.trimEnd(u8, name, " ");
+        if (n.len == 0) return false; // blank
+        const exact = [_][]const u8{
+            "SIMPLE",  "XTENSION", "BITPIX", "NAXIS",  "PCOUNT", "GCOUNT",
+            "TFIELDS", "EXTEND",   "END",    "COMMENT", "HISTORY", "GROUPS",
+        };
+        for (exact) |e| if (std.ascii.eqlIgnoreCase(n, e)) return false;
+        // Indexed structural/column keywords: NAXISn and the T* per-column keywords.
+        const indexed = [_][]const u8{
+            "NAXIS", "TFORM", "TTYPE", "TUNIT", "TSCAL", "TZERO", "TNULL", "TDIM", "TBCOL", "TDISP",
+        };
+        for (indexed) |p| {
+            if (n.len > p.len and std.ascii.eqlIgnoreCase(n[0..p.len], p) and std.ascii.isDigit(n[p.len]))
+                return false;
+        }
+        return true;
     }
 
     fn findFirst(self: *const Header, name: []const u8) ?usize {
@@ -395,6 +434,40 @@ test "edit ops: update/modify/insert/delete/rename preserve order and index" {
     try h.delete("GROUPS");
     try testing.expect(!h.has("GROUPS"));
     try testing.expectError(error.KeywordNotFound, h.delete("GROUPS"));
+}
+
+test "INHERIT: extension falls through to primary except structural/column keywords (FR-HDR-14)" {
+    var primary = Header.initEmpty();
+    defer primary.deinit(testing.allocator);
+    try primary.appendValue(testing.allocator, "SIMPLE", .{ .logical = true }, null);
+    try primary.appendValue(testing.allocator, "BITPIX", .{ .int = 8 }, null);
+    try primary.appendValue(testing.allocator, "OBSERVER", .{ .string = "Hubble" }, null);
+    try primary.appendValue(testing.allocator, "EQUINOX", .{ .float = 2000.0 }, null);
+    try primary.ensureEnd(testing.allocator);
+
+    var ext = Header.initEmpty();
+    defer ext.deinit(testing.allocator);
+    try ext.appendValue(testing.allocator, "XTENSION", .{ .string = "IMAGE" }, null);
+    try ext.appendValue(testing.allocator, "BITPIX", .{ .int = -32 }, null);
+    try ext.ensureEnd(testing.allocator);
+
+    // Without inheritance: only the extension's own keywords are visible.
+    try testing.expect(!ext.has("OBSERVER"));
+    ext.setInherit(&primary);
+
+    // Inheritable keywords fall through.
+    const obs = try ext.getString(testing.allocator, "OBSERVER");
+    defer testing.allocator.free(obs);
+    try testing.expectEqualStrings("Hubble", obs);
+    try testing.expectEqual(@as(f64, 2000.0), try ext.getValue(f64, "EQUINOX"));
+
+    // Structural keywords are NOT inherited: the extension's own BITPIX wins, and SIMPLE /
+    // NAXISn from the primary are not visible.
+    try testing.expectEqual(@as(i64, -32), try ext.getValue(i64, "BITPIX"));
+    try testing.expect(!ext.has("SIMPLE"));
+
+    ext.setInherit(null);
+    try testing.expect(!ext.has("OBSERVER")); // disabled again
 }
 
 test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)" {
