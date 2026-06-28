@@ -48,6 +48,20 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run throughput benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    // `zig build fitsverify` — CLI demo over the structural validation pass (X-TOOL).
+    const fv_mod = b.createModule(.{
+        .root_source_file = b.path("tools/fitsverify.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fv_mod.addImport("zigfitsio", mod);
+    const fitsverify = b.addExecutable(.{ .name = "fitsverify", .root_module = fv_mod });
+    b.installArtifact(fitsverify);
+    const run_fv = b.addRunArtifact(fitsverify);
+    if (b.args) |args| run_fv.addArgs(args);
+    const fv_step = b.step("fitsverify", "Run the fitsverify CLI demo");
+    fv_step.dependOn(&run_fv.step);
+
     // `zig build fuzz` — header/table fuzz harnesses (X-FUZZ). Run as a test artifact so
     // `--fuzz` engages the in-tree fuzzer; without it the seeded corpus runs as unit tests.
     const fuzz_mod = b.createModule(.{

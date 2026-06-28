@@ -576,6 +576,24 @@ test "out-of-range coordinates and wrong-length buffers are typed errors" {
     try testing.expectError(error.BadDimensions, img.readAll(i16, &wrong, .{}));
 }
 
+test "signed-byte convention: BITPIX=8 + BZERO=-128 round-trips as i8 (IMG-6)" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    var img = try ImageView.append(&f, .{ .bitpix = 8, .axes = &.{5} });
+    const sc: Scaling = .{ .bscale = 1, .bzero = -128 }; // signed-byte convention
+    const vals = [_]i8{ -128, -1, 0, 1, 127 };
+    try img.writeAll(i8, &vals, .{ .scaling = sc });
+    // Raw stored bytes are the unsigned biased values 0..255.
+    var raw: [5]u8 = undefined;
+    try img.readAll(u8, &raw, .{ .scaling = .{ .mode = .raw } });
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 127, 128, 129, 255 }, &raw);
+    var out: [5]i8 = undefined;
+    try img.readAll(i8, &out, .{ .scaling = sc });
+    try testing.expectEqualSlices(i8, &vals, &out); // full i8 range round-trips
+}
+
 test "multi-chunk transfer stays correct across the chunk boundary" {
     var mem = MemoryDevice.init(testing.allocator);
     defer mem.deinit();
