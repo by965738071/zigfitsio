@@ -34,14 +34,23 @@
 //! the free opcode **1** and keep `PN = 5`; this is the only deviation from the literal table and
 //! is required for interoperability with the reference implementation.
 //!
+//! ## Line-list header (CFITSIO/IRAF)
+//! A real CFITSIO/IRAF line list is prefixed by a **7-word header** (`pl_p2li`): word[0] is 0,
+//! word[1] is the header length (7), word[2] a version sentinel (`-100`), and words[3..4] hold
+//! the total list length in words as `(hi << 15) | lo`; words[5..6] are reserved. The instruction
+//! stream begins at word `header_len`. Both `compress` (emit) and `decompress` (skip) honour this
+//! header, so zigfitsio reads genuine CFITSIO PLIO tiles and writes tiles CFITSIO/`funpack` read
+//! back. (Earlier revisions omitted the header — self-consistent but not CFITSIO-interoperable.)
+//!
 //! ## Constraints & errors
 //! PLIO_1 only supports integer image masks with values in `0..2^24-1`; a pixel outside that
 //! range is a `DataConstraintViolated`. An odd byte length, a truncated `SH` (no following
 //! word), a high value that escapes `0..2^24-1`, a run that overruns/under-fills the declared
 //! `nelem`, are all a `CorruptTile`.
 //!
-//! Byte-exact parity against a committed CFITSIO PLIO tile is tracked as an X-FIXTURES item;
-//! the contract verified here is round-trip fidelity and full opcode coverage.
+//! Cross-tool parity is verified by `test/golden.zig` decoding a committed CFITSIO `fpack -p` tile
+//! to the exact pixels (and the interop CI opening a zigfitsio-written PLIO tile with `funpack`);
+//! the unit tests here verify round-trip fidelity and full opcode coverage.
 const std = @import("std");
 const endian = @import("../endian.zig");
 
@@ -67,6 +76,12 @@ const op_pn: u16 = 5; // zero data-1 pixels then one high-value pixel
 const op_is: u16 = 6; // increment high value, then emit one high-value pixel
 const op_ds: u16 = 7; // decrement high value, then emit one high-value pixel
 
+// CFITSIO/IRAF line-list header (FITS 4.0 §10.4.3; `pl_p2li`/`pl_l2pi`): 7 words precede the
+// instruction stream — word[1] = header length, word[2] = version sentinel, words[3..4] = total
+// list length in words.
+const header_words: usize = 7;
+const version_word: u16 = @bitCast(@as(i16, -100)); // CFITSIO's `lldst[3] = -100` (0xFF9C)
+
 /// Decompress a PLIO_1 line list (`src`, big-endian 16-bit words) into exactly `nelem` mask
 /// values in `0..2^24-1`. Caller owns the returned slice. `nelem == 0` with empty `src` yields
 /// an empty (still owned) slice.
@@ -76,11 +91,27 @@ pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize) PlioError![]i
     const out = try alloc.alloc(i32, nelem);
     errdefer alloc.free(out);
 
+    // Parse the 7-word IRAF/CFITSIO header (CFITSIO `pl_l2pi`): word[1] is the header length and
+    // words[3..4] the total list length in words; the instruction stream is words
+    // `[header_len, list_len)`. Empty `src` is the empty line (CFITSIO writes no header for it).
+    var ip: usize = 0;
+    var end: usize = 0;
+    if (src.len != 0) {
+        if (src.len < header_words * 2) return error.CorruptTile;
+        const header_len: usize = endian.read(u16, src[2..][0..2]); // word[1]
+        if (header_len < header_words) return error.CorruptTile;
+        const len_lo: usize = endian.read(u16, src[6..][0..2]); // word[3]
+        const len_hi: usize = endian.read(u16, src[8..][0..2]); // word[4]
+        const list_len: usize = (len_hi << 15) | len_lo; // CFITSIO `(ll[5]<<15)|ll[4]`
+        ip = header_len * 2;
+        end = list_len * 2;
+        if (end < ip or end > src.len) return error.CorruptTile;
+    }
+
     var high: i64 = 1; // running high value, reset to 1 at the start of every line
     var pos: usize = 0; // pixels written so far
 
-    var ip: usize = 0;
-    while (ip + 2 <= src.len) {
+    while (ip + 2 <= end) {
         const word = endian.read(u16, src[ip..][0..2]);
         ip += 2;
         const op = (word >> 12) & 0x7;
@@ -104,7 +135,7 @@ pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize) PlioError![]i
                 pos += data;
             },
             op_sh => {
-                if (ip + 2 > src.len) return error.CorruptTile; // truncated SH (no following word)
+                if (ip + 2 > end) return error.CorruptTile; // truncated SH (no following word)
                 const w2 = endian.read(u16, src[ip..][0..2]);
                 ip += 2;
                 const hi: i64 = w2 & 0x7FFF; // high 15 bits live in the following word
@@ -149,6 +180,18 @@ pub fn compress(alloc: Allocator, data: []const i32) PlioError![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(alloc);
 
+    if (data.len == 0) return list.toOwnedSlice(alloc); // empty line ⇒ empty list (matches CFITSIO)
+
+    // Reserve the 7-word CFITSIO/IRAF line-list header; words[3..4] (total length in words) are
+    // back-patched after the instruction stream is laid down (`pl_p2li`).
+    try emitRawWord(&list, alloc, 0); // word[0]
+    try emitRawWord(&list, alloc, @intCast(header_words)); // word[1] = header length
+    try emitRawWord(&list, alloc, version_word); // word[2] = version sentinel (-100)
+    try emitRawWord(&list, alloc, 0); // word[3] = list length lo (patched below)
+    try emitRawWord(&list, alloc, 0); // word[4] = list length hi (patched below)
+    try emitRawWord(&list, alloc, 0); // word[5] reserved
+    try emitRawWord(&list, alloc, 0); // word[6] reserved
+
     var high: i64 = 1; // mirror the decoder's initial high value
 
     var i: usize = 0;
@@ -178,6 +221,10 @@ pub fn compress(alloc: Allocator, data: []const i32) PlioError![]u8 {
         }
     }
 
+    // Back-patch the total list length (in words) as CFITSIO encodes it (`ll[4]`/`ll[5]`).
+    const total_words: usize = list.items.len / 2;
+    endian.write(u16, @intCast(total_words % 32768), list.items[6..][0..2]);
+    endian.write(u16, @intCast(total_words / 32768), list.items[8..][0..2]);
     return list.toOwnedSlice(alloc);
 }
 
@@ -268,7 +315,7 @@ fn expectRoundTrip(line: []const i32) !void {
 /// Walk a line list opcode by opcode, correctly skipping each SH's following raw word, invoking
 /// `f` with every instruction opcode.
 fn forEachOpcode(enc: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), u16) void) void {
-    var ip: usize = 0;
+    var ip: usize = if (enc.len >= header_words * 2) header_words * 2 else 0; // skip the 7-word header
     while (ip + 2 <= enc.len) {
         const op = (endian.read(u16, enc[ip..][0..2]) >> 12) & 0x7;
         ip += 2;

@@ -1087,7 +1087,20 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     var mgr = try HeapManager.initForTable(&bt);
     defer mgr.deinit(alloc);
     for (enc_list.items, 0..) |enc, r| {
-        try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, u8, enc);
+        if (spec.codec == .plio_1) {
+            // COMPRESSED_DATA is a `1PI` (16-bit word) VLA for PLIO_1. `plio.compress` always emits
+            // whole big-endian words, so `enc.len` is even; the descriptor's element count must be
+            // the *word* count (`enc.len / 2`), not the byte count. Decode each big-endian word to a
+            // native `i16` and write it through the I-typed column, which re-encodes it big-endian —
+            // the on-disk heap bytes stay byte-identical to `enc`, only the declared count changes.
+            std.debug.assert(enc.len % 2 == 0);
+            const words = try alloc.alloc(i16, enc.len / 2);
+            defer alloc.free(words);
+            for (words, 0..) |*word, i| word.* = std.mem.readInt(i16, enc[i * 2 ..][0..2], .big);
+            try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, i16, words);
+        } else {
+            try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, u8, enc);
+        }
     }
     if (do_dither) {
         try bt.writeColumn(f64, .{ .index = 1 }, 0, zscales.items, .{});
@@ -1109,7 +1122,12 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     try h.appendValue(alloc, "PCOUNT", .{ .int = @intCast(total_bytes) }, null);
     try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
     try h.appendValue(alloc, "TFIELDS", .{ .int = if (do_dither) 3 else 1 }, null);
-    try h.appendValue(alloc, "TFORM1", .{ .string = "1PB" }, null);
+    // PLIO_1's COMPRESSED_DATA is a list of 16-bit words: CFITSIO stores it as `1PI` (signed
+    // 16-bit VLA) so the big-endian on-disk words are byte-swapped to native on read. The other
+    // codecs (GZIP/RICE/HCOMPRESS) produce an opaque byte stream stored as `1PB`. Emitting `1PB`
+    // for PLIO mis-decodes on little-endian readers (the words are read unswapped) — see the write
+    // loop in `writeCompressed`, which stores the descriptor length in word units to match.
+    try h.appendValue(alloc, "TFORM1", .{ .string = if (spec.codec == .plio_1) "1PI" else "1PB" }, null);
     try h.appendValue(alloc, "TTYPE1", .{ .string = "COMPRESSED_DATA" }, null);
     if (do_dither) {
         try h.appendValue(alloc, "TFORM2", .{ .string = "1D" }, null);

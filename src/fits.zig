@@ -41,6 +41,7 @@ const block = @import("io/block.zig");
 const Header = @import("header/header.zig").Header;
 const hdu_mod = @import("hdu.zig");
 const Hdu = hdu_mod.Hdu;
+const checksum = @import("checksum.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -201,6 +202,10 @@ pub const Fits = struct {
             .limits = opts.limits,
             .diag = opts.diag,
             .checksum_on_close = opts.checksum_on_close,
+            // Register the checksum module's flush hook unconditionally; `flush` only invokes it
+            // when `checksum_on_close` is set (FR-SUM-3). This is the wiring the field's doc-comment
+            // promised but that was missing, which made `checksum_on_close` a silent no-op.
+            .checksum_hook = &checksum.updateAll,
             .reader = reader,
         };
     }
@@ -358,6 +363,11 @@ pub const Fits = struct {
         // records itself, so rather than relocate the region we refuse the append with a typed
         // error (the file must be rewritten without the trailing records first).
         if (try self.dev.getSize() > self.scan_off) return error.WrongHduType;
+
+        // When `checksum_on_close` is set, reserve the DATASUM/CHECKSUM cards now — before the
+        // header size (and thus the data offset) is fixed below — so the flush-time `update`
+        // rewrites them in place and never has to grow the header or shift the following HDUs.
+        if (self.checksum_on_close) try checksum.ensureCards(&header, self.alloc);
         try header.ensureEnd(self.alloc);
 
         const is_primary = self.hdus.items.len == 0;

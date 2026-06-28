@@ -23,6 +23,7 @@ const errors = @import("errors.zig");
 const endian = @import("endian.zig");
 const block = @import("io/block.zig");
 const Fits = @import("fits.zig").Fits;
+const FitsError = @import("fits.zig").FitsError;
 const Hdu = @import("hdu.zig").Hdu;
 const Header = @import("header/header.zig").Header;
 const Card = @import("header/card.zig").Card;
@@ -263,6 +264,34 @@ pub fn update(fits: *Fits, hdu: *Hdu) UpdateError!void {
     try hdu.header.writeTo(&bw);
 }
 
+/// Reserve the `DATASUM`/`CHECKSUM` placeholder cards on `header` (idempotent). `checksum_on_close`
+/// calls this at HDU-build time — before the header size, and thus the data offset, is fixed — so
+/// the flush-time `update` only ever rewrites the two cards *in place* (a card is a fixed 80 bytes)
+/// and never has to grow the header or shift the HDUs that follow.
+pub fn ensureCards(header: *Header, alloc: Allocator) (errors.HeaderError || Allocator.Error)!void {
+    if (findCardIndex(header, "DATASUM") == null)
+        try header.update(alloc, "DATASUM", .{ .string = "0" }, "data unit checksum");
+    if (findCardIndex(header, "CHECKSUM") == null)
+        try header.update(alloc, "CHECKSUM", .{ .string = ZERO_CHECKSUM }, "HDU checksum");
+}
+
+/// The body of `Fits.checksum_hook`: invoked by `flush` when `checksum_on_close` is set (FR-SUM-3).
+/// Recompute the integrity cards of every HDU that carries them — the HDUs `appendHdu` reserved via
+/// `ensureCards`. An HDU lacking the cards (e.g. one read from an existing file rather than
+/// appended) is skipped rather than forcing a header reflow on flush. The return type is the wider
+/// `FitsError` (not `update`'s `UpdateError`) so `&updateAll` matches the hook's
+/// `*const fn (*Fits) FitsError!void` pointer type exactly.
+pub fn updateAll(fits: *Fits) FitsError!void {
+    const n = try fits.hduCount();
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        const hdu = try fits.select(i);
+        if (findCardIndex(&hdu.header, "DATASUM") == null) continue;
+        if (findCardIndex(&hdu.header, "CHECKSUM") == null) continue;
+        try update(fits, hdu);
+    }
+}
+
 /// Verify `hdu`'s integrity keywords (FR-SUM-2), reporting `match`/`mismatch`/`not_present` for
 /// each.
 ///
@@ -481,6 +510,39 @@ test "verify after reopen: persisted DATASUM/CHECKSUM round-trip through the dev
         try f.dev.writeAll(&data, hdu.data_off);
         try update(&f, hdu);
         try f.flush();
+    }
+
+    var f = try Fits.open(alloc, mem.device(), .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1);
+    const r = try verify(&f, hdu);
+    try testing.expectEqual(Verify.match, r.data);
+    try testing.expectEqual(Verify.match, r.sum);
+}
+
+// Regression (FR-SUM-3): `checksum_on_close` must actually write verifiable integrity cards on
+// `flush`, with no manual `update` call. Before the hook was registered this silently did nothing
+// and `verify` returned `not_present` — this test would have caught that.
+test "checksum_on_close: flush reserves and writes verifiable DATASUM/CHECKSUM (no manual update)" {
+    const alloc = testing.allocator;
+    const mem = try alloc.create(MemoryDevice);
+    mem.* = MemoryDevice.init(alloc);
+    defer {
+        mem.deinit();
+        alloc.destroy(mem);
+    }
+
+    {
+        var f = try Fits.create(alloc, mem.device(), .{ .checksum_on_close = true });
+        defer f.deinit();
+        const hdu = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+        // The cards were reserved at append time (before the data offset was fixed).
+        try testing.expect(findCardIndex(&hdu.header, "DATASUM") != null);
+        try testing.expect(findCardIndex(&hdu.header, "CHECKSUM") != null);
+        var data: [24]u8 = undefined;
+        for (&data, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+        try f.dev.writeAll(&data, hdu.data_off);
+        try f.flush(); // the hook fires here: DATASUM/CHECKSUM computed and written in place
     }
 
     var f = try Fits.open(alloc, mem.device(), .read_only, .{});
