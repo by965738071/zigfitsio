@@ -1433,6 +1433,17 @@ section for the mechanism; this table is the completeness check.)
 | **Checksum parity (golden)** | committed vector: a CFITSIO-written ASCII table with `DATASUM = 628729719`; the suite recomputes and must match, **and** must differ under zero-fill — locking the `FR-SUM-1` space-fill rule (§16). | `NFR-TEST-1`, `NFR-INTEROP-1` |
 | **API regression (Zig 0.16)** | compile-fixtures asserting the corrected snippets build and the three original defects do **not** (field/method collision, method-on-error-union, removed `std.BoundedArray`). | `GC-3`, `GC-4` |
 
+**Realized (this branch).** The cross-validation, conformance, both interop legs, and the
+checksum-golden layers above are now implemented against a committed **CFITSIO 4.6.4 + `fpack`**
+golden corpus (`test/golden/`, generators under `interop/`): `test/e2e.zig` is the in-house
+full-feature "`testprog.c`-equivalent" round-trip (every BITPIX/TFORM, all four tile codecs, VLA,
+WCS, CONTINUE/HIERARCH, checksums, a byte-snapshot tripwire), `test/golden.zig` decodes the
+reference goldens hermetically on every cell (including big-endian s390x), and the `interop` CI
+job opens every zigfitsio-written file with `funpack`/Astropy/`fitsverify`. Authoring the corpus
+closed two real interop bugs the prior self-round-trips could not catch — the PLIO line-list
+header + `COMPRESSED_DATA` `1PB`→`1PI`, and the unregistered `checksum_on_close` flush hook (see
+`CAVEATS.md §1`).
+
 The fuzzers specifically target the `NFR-SAFE-1` invariant: declared sizes (`NAXISn`
 product, `PCOUNT`, VLA descriptor length+offset) are fed hostile values to confirm
 validation-before-allocation and typed-error (not panic) behavior.

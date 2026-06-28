@@ -586,7 +586,7 @@ Every task must satisfy all of these before it is `done`:
 ## Milestone M3 — Extended (P3)
 
 ### CMP-4 — RICE_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/rice.zig` · **Size:** L · **Status:** done (round-trip; byte-exact X-FIXTURES pending)
+- **Milestone:** M3 · **Module:** `src/compress/rice.zig` · **Size:** L · **Status:** done (round-trip + CFITSIO golden decode inbound & `funpack` outbound)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.1, Table 37
 - **Goal:** Integer-only Rice (de)compression honoring `BLOCKSIZE`/`BYTEPIX`, plugged into the CMP-3a
@@ -595,7 +595,7 @@ Every task must satisfy all of these before it is `done`:
   `DataConstraintViolated`.
 
 ### CMP-5 — PLIO_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/plio.zig` · **Size:** L · **Status:** done (round-trip; byte-exact X-FIXTURES pending)
+- **Milestone:** M3 · **Module:** `src/compress/plio.zig` · **Size:** L · **Status:** done (round-trip + CFITSIO interop verified both ways; fixed missing IRAF 7-word header + `COMPRESSED_DATA` `1PB`→`1PI`)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.3, Table 38
 - **Goal:** IRAF PLIO run-length mask codec (16-bit instructions), values `0…2^24`.
@@ -603,7 +603,7 @@ Every task must satisfy all of these before it is `done`:
   tile; out-of-range ⇒ `DataConstraintViolated`.
 
 ### CMP-6 — HCOMPRESS_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` · **Size:** XL · **Status:** done (lossless round-trip; byte-exact X-FIXTURES pending)
+- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` · **Size:** XL · **Status:** done (lossless round-trip + CFITSIO golden decode inbound & `funpack` outbound; lossy `hsmooth` still N/A)
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.4, Table 39
 - **Goal:** H-transform + quantization + quadtree coding, 2-D tiles only, `SCALE` from `ZVAL1`.
@@ -703,8 +703,8 @@ Every task must satisfy all of these before it is `done`:
   the LE-only `{x86_64, aarch64}` matrix cannot, by itself, prove endian-neutrality.
 
 ### X-FIXTURES — Corpus & golden-file provenance
-- **Milestone:** X · **Module:** `test/corpus/`, `test/golden/`, CI config · **Size:** L · **Status:** blocked
-- **Note:** externally blocked — authoring the CFITSIO 4.6.4 / Astropy golden corpus needs that toolchain; a self-authored sample corpus (`test/corpus/`) is committed in the meantime.
+- **Milestone:** X · **Module:** `test/golden/`, `interop/`, CI config · **Size:** L · **Status:** done
+- **Note:** done — committed CFITSIO 4.6.4 + `fpack` golden corpus under `test/golden/` (generators under `interop/`, `MANIFEST.json` with sha256), consumed hermetically by `test/golden.zig` and cross-checked by the `interop` CI job. (The earlier self-authored `test/corpus/` sample set remains.)
 - **Depends on:** SETUP-1
 - **Req:** NFR-TEST-2, NFR-TEST-3, NFR-INTEROP-1 · **Design:** §23
 - **Goal:** Author/commit the externally-produced fixtures every other test consumes, and declare the
@@ -768,8 +768,8 @@ Every task must satisfy all of these before it is `done`:
   where the format permits; compressed members read (CMP-3b) and round-trip (CMP-8).
 
 ### X-XVAL — Cross-validation vs CFITSIO/Astropy
-- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** blocked
-- **Note:** externally blocked — comparing output against CFITSIO/Astropy needs that toolchain provisioned in CI (depends on X-FIXTURES).
+- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** done
+- **Note:** done — the `interop` CI job (`interop/xval.py`, `interop/verify_outbound.py`) cross-validates zigfitsio output and the committed goldens against CFITSIO/Astropy.
 - **Depends on:** X-CORPUS, SUM-1, X-FIXTURES
 - **Req:** NFR-TEST-3 · **Design:** §23
 - **Goal:** Compare `zigfitsio` output against CFITSIO/Astropy for the same inputs (goldens from
@@ -777,8 +777,8 @@ Every task must satisfy all of these before it is `done`:
 - **Acceptance:** outputs agree on the committed golden set.
 
 ### X-CONF — Conformance fixtures runner (valid + malformed)
-- **Milestone:** X · **Module:** `test/` · **Size:** M · **Status:** blocked
-- **Note:** externally blocked — runs over the valid/malformed corpus authored in X-FIXTURES, which needs the external CFITSIO/Astropy toolchain.
+- **Milestone:** X · **Module:** `test/` · **Size:** M · **Status:** done
+- **Note:** done — `test/golden.zig` runs `validate.verify` over the committed `conformance/{valid,malformed}` goldens and asserts the expected findings.
 - **Depends on:** VLD-1, X-FIXTURES
 - **Req:** NFR-TEST-4 · **Design:** §23 · **Spec:** §3, §4, §7
 - **Goal:** Run `validate.zig` over the valid/malformed fixtures **authored in X-FIXTURES** (the fixtures
@@ -795,8 +795,8 @@ Every task must satisfy all of these before it is `done`:
   on `Fits`.
 
 ### X-INTEROP — Inbound & outbound interoperability
-- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** blocked
-- **Note:** externally blocked — reading CFITSIO/Astropy-written files and opening zigfitsio output with them needs that toolchain in CI.
+- **Milestone:** X · **Module:** CI job · **Size:** M · **Status:** done
+- **Note:** done — inbound: `test/golden.zig` reads the committed CFITSIO goldens; outbound: the `interop` CI job opens every `zig build emit-fixtures` file with `funpack`/Astropy/`fitsverify`. Authoring the corpus surfaced + fixed two real interop bugs (PLIO line-list header + `1PB`→`1PI`; `checksum_on_close` no-op).
 - **Depends on:** X-CORPUS, X-FIXTURES
 - **Req:** NFR-TEST-5 (b), NFR-INTEROP-1 · **Design:** §23
 - **Goal:** Read CFITSIO/Astropy-written files (inbound) **and** open every `zigfitsio`-written corpus
@@ -805,8 +805,8 @@ Every task must satisfy all of these before it is `done`:
   silently mis-read.
 
 ### X-SUM — Checksum golden parity fixture
-- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** blocked
-- **Note:** externally blocked — the committed-file recompute needs the CFITSIO-written checksum fixture (the algorithmic golden is already covered by SUM-1's own unit test).
+- **Milestone:** X · **Module:** `test/` · **Size:** S · **Status:** done
+- **Note:** done — `test/golden.zig` recomputes `DATASUM` over the committed CFITSIO ASCII-table golden and verifies it (`checksum.verify` → match).
 - **Depends on:** SUM-1, X-FIXTURES
 - **Req:** NFR-TEST-1, NFR-INTEROP-1 · **Design:** §16, §23 · **Spec:** Appendix J
 - **Goal:** Run the committed CFITSIO ASCII-table vector and the Appendix J example as locked fixtures

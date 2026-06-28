@@ -61,9 +61,31 @@ All notable changes to `zigfitsio` are documented here. The format follows
   download when the server lacks range support; excluded from the freestanding build graph.
 - A transparent `.fits.gz` open path and a committed sample FITS corpus.
 
+### Added (e2e & interop batch)
+- **In-house end-to-end harness (`test/e2e.zig`):** a CFITSIO `testprog.c`-equivalent that builds a
+  maximal multi-HDU file exercising every `BITPIX`/`TFORM`, all four tile codecs, VLA, WCS,
+  `CONTINUE`/`HIERARCH`, and checksums, then reopens and asserts — plus a deterministic
+  byte-snapshot regression tripwire. New `zig build e2e` step.
+- **CFITSIO 4.6.4 golden corpus (`test/golden/`, `X-FIXTURES`):** reference tiles
+  (RICE/GZIP/PLIO/HCOMPRESS), a checksum vector, images, tables, WCS, and conformance fixtures,
+  authored by `fpack` + a CFITSIO C generator under `interop/` (`MANIFEST.json` with sha256),
+  consumed hermetically by `test/golden.zig` on every cell (incl. big-endian s390x).
+- **`interop` CI job (`X-XVAL`/`X-INTEROP`/`X-CONF`):** opens every zigfitsio-written file with
+  CFITSIO `funpack`, Astropy, and `fitsverify` (`tools/emit_fixtures.zig`, `zig build
+  emit-fixtures`); path-gated and toolchain-isolated from the hermetic matrix.
+
+### Fixed (interop bugs caught by the golden corpus)
+- **`PLIO_1` was not CFITSIO-interoperable in either direction:** the codec omitted the IRAF/CFITSIO
+  7-word line-list header and stored `COMPRESSED_DATA` as `1PB` instead of `1PI`. Both fixed —
+  zigfitsio now reads genuine CFITSIO PLIO tiles and writes tiles `funpack`/Astropy decode to the
+  exact pixels.
+- **`checksum_on_close` was a silent no-op:** the `flush` hook was declared but never registered, so
+  no `DATASUM`/`CHECKSUM` was written. Now wired (`src/fits.zig` reserves the cards at HDU-build
+  time; `src/checksum.zig` registers `updateAll`).
+
 ### Notes
 - The HTTP(S) range-GET backend (`RMT-2`) is **done**.
-- The still-pending item is **byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity** for the
-  tile codecs (RICE/PLIO/HCOMPRESS), checksum, and WCS — the `X-FIXTURES`/`X-SUM` golden corpus
-  needs a CFITSIO 4.6.4 + Astropy environment. Meanwhile the codecs/checksum are verified by
-  lossless self round-trip and WCS by `CRPIX`→`CRVAL` + pixel→world→pixel round-trip.
+- **Byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity is now done** (`X-FIXTURES`/`X-SUM`/
+  `X-XVAL`/`X-CONF`/`X-INTEROP`): the tile codecs and checksum are verified against committed CFITSIO
+  tiles both inbound and outbound. The one remaining codec limit is `HCOMPRESS_1` lossy `hsmooth`
+  (lossless only); see `CAVEATS.md §1`.

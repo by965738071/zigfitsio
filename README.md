@@ -38,7 +38,8 @@ exe.root_module.addImport("zigfitsio", fits.module("zigfitsio"));
 
 ## Status
 
-Feature-complete and tested (429 tests green). Implemented end to end:
+Feature-complete and tested (459 tests green), with cross-tool interoperability verified against
+**CFITSIO 4.6.4 + Astropy** (see below). Implemented end to end:
 
 - **Foundation:** I/O layer (in-memory, file, stream/gzip, and HTTP backends), typed
   error sets, big-endian access, numeric-conversion policy, resource limits.
@@ -57,9 +58,15 @@ Feature-complete and tested (429 tests green). Implemented end to end:
 - **Convenience:** CFITSIO-style extended filenames, ASCII header templates, hierarchical
   grouping tables, and a transparent `.fits.gz` open path.
 
-The only remaining gap is **byte-exact CFITSIO 4.6.4 / Astropy golden-corpus parity** for
-the codecs, checksum, and WCS (verified by lossless self round-trip in the meantime); it
-needs an external CFITSIO/Astropy toolchain. See `tasks.md` for the milestone breakdown.
+**Cross-tool interoperability is verified**, not just self-consistent: a committed
+**CFITSIO 4.6.4 + `fpack`** golden corpus (`test/golden/`, generators under `interop/`) is decoded
+hermetically by `test/golden.zig` on every CI cell (including big-endian s390x), an in-house
+full-feature round-trip (`test/e2e.zig`) mirrors CFITSIO's `testprog.c`, and a dedicated `interop`
+CI job opens every zigfitsio-written file with CFITSIO `funpack`, Astropy, and `fitsverify`.
+Authoring this corpus closed two real interop bugs that self-round-trips could not catch (the PLIO
+line-list header + `COMPRESSED_DATA` `1PB`→`1PI`, and an unregistered `checksum_on_close` hook).
+The one remaining codec limit is `HCOMPRESS_1` lossy smoothing (`hsmooth`) — lossless only. See
+`CAVEATS.md` and `tasks.md`.
 
 ## Examples
 
