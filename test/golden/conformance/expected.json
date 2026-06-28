@@ -1,0 +1,15 @@
+{
+  "_comment": "Expected outcomes of fits.validate.verify over the conformance goldens. Consumed by test/golden.zig. 'valid' files must produce zero .err findings; each 'malformed' entry must produce the listed finding (hdu is 1-based, matching validate.Finding.hdu).",
+  "valid": [
+    { "file": "conformance/valid/image.fits", "max_err": 0 }
+  ],
+  "malformed": [
+    {
+      "file": "conformance/malformed/blank_on_float.fits",
+      "hdu": 1,
+      "severity": "err",
+      "kw": "BLANK",
+      "why": "BLANK keyword is only meaningful for a positive (integer) BITPIX (FITS 4.0 §4.4.2.5); this image is BITPIX -32."
+    }
+  ]
+}

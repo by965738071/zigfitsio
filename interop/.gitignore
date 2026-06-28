@@ -1,0 +1,4 @@
+# Ephemeral C-generator build output (the committed goldens live under ../test/golden).
+build/
+# Intermediate uncompressed tile sources (fpacked, then removed by `make golden`).
+../test/golden/compress/src_*.fits

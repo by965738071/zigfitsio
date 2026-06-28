@@ -1,0 +1,109 @@
+{
+  "_comment": "Provenance + integrity manifest for the externally-authored golden corpus. Every .fits is authored by CFITSIO 4.6.4 (the interop/c/gen_sources.c program and/or fpack 1.7.0); the .csv is an Astropy 5.3.x cross-check sidecar. Regeneration is byte-deterministic (interop/README.md). test/golden.zig hashes each entry's bytes (sha256, relative to test/golden/) and decodes each through the public fits API to the expected values. Do not edit by hand: run `make -C interop golden`.",
+  "toolchain": {
+    "cfitsio": "4.6.4",
+    "fpack": "1.7.0 (CFITSIO 4.060)",
+    "astropy": "5.3.4 (numpy 1.26.4) — cross-check sidecar only, never authors .fits bytes",
+    "regenerate": "make -C interop golden"
+  },
+  "files": [
+    {
+      "path": "compress/tile_rice.fits",
+      "sha256": "bf8d9b6c8d964436cac3493433eea5d8fcc42ad2f361ccbc62d639fe3964cdf3",
+      "generator": "fpack -C -r (RICE_1) over a CFITSIO 16x16 BITPIX-32 identity ramp",
+      "consumer": "CMP-4 / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/RICE_1; TiledImage.readAll(i32) yields pixel[i] == i for i in 0..255"
+    },
+    {
+      "path": "compress/tile_gzip.fits",
+      "sha256": "fa34dd554671994ffe5cb1cf418e3a9801465c29320f1e0798469b2e95fdf039",
+      "generator": "fpack -C -g1 (GZIP_1) over a CFITSIO 16x16 BITPIX-32 identity ramp",
+      "consumer": "CMP / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/GZIP_1; TiledImage.readAll(i32) yields pixel[i] == i for i in 0..255"
+    },
+    {
+      "path": "compress/tile_hcompress.fits",
+      "sha256": "09754426eb8ebc9c888fa7147e40284e8e531894911b1c12098538e1952b48af",
+      "generator": "fpack -C -h -s 0 (HCOMPRESS_1, lossless) over a CFITSIO 16x16 BITPIX-32 identity ramp",
+      "consumer": "CMP-6 / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1; TiledImage.readAll(i32) yields pixel[i] == i for i in 0..255 (lossless)"
+    },
+    {
+      "path": "compress/tile_plio.fits",
+      "sha256": "076c41db5eeb9448fe5dc42b179fc1057ca6b8476fabbd8f5e96fbae04fb4776",
+      "generator": "fpack -C -p (PLIO_1) over a CFITSIO 16x16 BITPIX-16 positive identity ramp",
+      "consumer": "CMP-5 / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/PLIO_1; TiledImage.readAll(i32) yields pixel[i] == i for i in 0..255"
+    },
+    {
+      "path": "checksum/cfitsio_ascii_checksum.fits",
+      "sha256": "626b9334b451d989c58e46833855d7f7fc23c71dc7572f3a7bf29f544b5fadb3",
+      "generator": "CFITSIO gen_sources.c: 26-byte-row ASCII TABLE (I10,E15.7) + deterministic DATASUM/CHECKSUM",
+      "consumer": "X-SUM",
+      "expected": "HDU 2 DATASUM card == 1837006711; checksum.datasum() recomputes 1837006711; checksum.verify() == {data: match, sum: match}"
+    },
+    {
+      "path": "images/img_i16.fits",
+      "sha256": "06996b35f06d080338268afd123f798bb45612c1b67ef7c3aebe6af0d5517065",
+      "generator": "CFITSIO gen_sources.c: 8x4 BITPIX-16 primary image",
+      "consumer": "X-INTEROP inbound",
+      "expected": "HDU 1 image; ImageView.readAll(i16) yields value[i] == i - 8 for i in 0..31"
+    },
+    {
+      "path": "images/img_f32.fits",
+      "sha256": "d60bbb6d464cd5f23abdfcdce32c1eaa0c7a6cbc9d767205ba5b798685a6103f",
+      "generator": "CFITSIO gen_sources.c: 5x3 BITPIX-32 (float) primary image with an IEEE-NaN null at index 7",
+      "consumer": "X-INTEROP inbound / IMG null",
+      "expected": "HDU 1 image; raw read isNaN at index 7; value[i] == i*0.25 elsewhere; null_sentinel read maps index 7 to the sentinel"
+    },
+    {
+      "path": "tables/bintable.fits",
+      "sha256": "19169f28c5796d08774459bea4e4cad944cca0ffdd714b172dd531a6353dd08b",
+      "generator": "CFITSIO gen_sources.c: 3-row BINTABLE (1J INDEX, 1E FLUX, 1D DVAL, 8A NAME)",
+      "consumer": "X-INTEROP inbound",
+      "expected": "HDU 2 BINTABLE; INDEX=[10,20,30], FLUX=[1.5,2.5,3.5], DVAL=[0.25,0.5,0.75], NAME=[alpha,beta,gamma]"
+    },
+    {
+      "path": "tables/ascii.fits",
+      "sha256": "534143254aab9a0f9b7b4bb8c43fbca73809919dbc22dbed23e10bc0f175d8c1",
+      "generator": "CFITSIO gen_sources.c: 3-row ASCII TABLE (I6 ID, F12.4 FLUX, A5 NOTE)",
+      "consumer": "X-INTEROP inbound",
+      "expected": "HDU 2 ASCII TABLE; ID=[100,200,300], FLUX=[3.1416,2.7183,1.4142], NOTE=[aaa,bbb,ccc]"
+    },
+    {
+      "path": "wcs/wcs_tan.fits",
+      "sha256": "ce1ab2552a5fcefc001be5f1a04b42fb99fd3334629a17dc72acc2f184397f26",
+      "generator": "CFITSIO gen_sources.c: 64x64 BITPIX-16 image with a RA---TAN/DEC--TAN celestial WCS (CRPIX 32,32; CRVAL 150.0,2.5; CDELT -6e-4,6e-4)",
+      "consumer": "WCS",
+      "expected": "Wcs.fromHeader + Celestial.fromWcs; pixelToWorld matches wcs_refpoints.csv rows within 1e-6 deg"
+    },
+    {
+      "path": "wcs/wcs_refpoints.csv",
+      "sha256": "1a0f50cd19239c33566989bdb2c47b7d00146d74678e5a736dcee839f3c04a04",
+      "generator": "Astropy 5.3.4 wcs_pix2world(..., 1) over wcs_tan.fits (cross-check sidecar; NOT a .fits)",
+      "consumer": "WCS",
+      "expected": "header 'px,py,ra_deg,dec_deg'; 1-based pixels; reference pixel (32,32) -> (150.0, 2.5)"
+    },
+    {
+      "path": "conformance/valid/image.fits",
+      "sha256": "aab40b531fbdc73eb1758a08170cd100878c31b8bd379893acb4a42fcf8630eb",
+      "generator": "CFITSIO gen_sources.c: clean 4x4 BITPIX-16 primary image",
+      "consumer": "X-CONF",
+      "expected": "validate.verify yields zero .err findings"
+    },
+    {
+      "path": "conformance/malformed/blank_on_float.fits",
+      "sha256": "05fec40d52fab913c06128030ce5ec7a4b669b68556b60b8df03255379b8d0b1",
+      "generator": "CFITSIO gen_sources.c: 4x4 BITPIX-32 (float) image carrying an illegal BLANK keyword",
+      "consumer": "X-CONF",
+      "expected": "validate.verify yields a finding (hdu 1, severity err, kw BLANK); fitsverify also reports 1 error"
+    },
+    {
+      "path": "conformance/expected.json",
+      "sha256": "d342002b17060ac067931fcf9973354464c9546c23d30477e3e4254e96c06d34",
+      "generator": "hand-written conformance expectation spec (mirrors the consumer asserts)",
+      "consumer": "X-CONF",
+      "expected": "documents the valid/malformed expectations the consumer enforces"
+    }
+  ]
+}

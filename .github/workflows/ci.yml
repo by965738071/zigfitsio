@@ -107,3 +107,69 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build fuzz   # runs the seeded harnesses once (use --fuzz for the fuzzer)
+
+  interop:
+    # External cross-tool interop & golden-corpus parity (X-FIXTURES/X-XVAL/X-INTEROP/X-SUM).
+    # The ONLY job that installs a toolchain (CFITSIO 4.6.x + fpack/funpack + Astropy); the
+    # hermetic `test` matrix stays pure-Zig and runs the committed-golden consumer (test/golden.zig)
+    # everywhere. Path-gated with dorny/paths-filter so the heavy work runs only when
+    # interop-relevant files change, while the job always reports a result (safe as a required
+    # check). The committed goldens are authored by CFITSIO 4.6.4 (see interop/README.md); this job
+    # proves cross-tool interop semantically (version-tolerant) and byte-checks regeneration as an
+    # informational guard.
+    name: external interop & golden parity (X-INTEROP/X-XVAL/X-SUM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            relevant:
+              - 'interop/**'
+              - 'test/golden/**'
+              - 'src/compress/**'
+              - 'src/checksum.zig'
+              - 'src/wcs/**'
+              - 'tools/emit_fixtures.zig'
+              - 'build.zig'
+              - '.github/workflows/ci.yml'
+      - if: steps.f.outputs.relevant == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - if: steps.f.outputs.relevant == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CFITSIO + fpack/funpack + Astropy
+        if: steps.f.outputs.relevant == 'true'
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y libcfitsio-dev libcfitsio-bin pkg-config
+          python -m pip install --upgrade pip
+          python -m pip install -r interop/requirements.txt
+      - name: Inbound — Astropy reads & cross-validates every committed CFITSIO golden (X-XVAL)
+        if: steps.f.outputs.relevant == 'true'
+        run: |
+          set -e
+          python interop/verify_outbound.py test/golden   # conformance (skips conformance/malformed)
+          python interop/xval.py test/golden               # pixel/cell values match the ramp/formulas
+      - name: Outbound — funpack/Astropy read every zigfitsio-written file (X-INTEROP outbound)
+        if: steps.f.outputs.relevant == 'true'
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/outbound"
+          zig build emit-fixtures -- "$OUT"
+          python interop/check_funpack.py "$OUT"           # CFITSIO funpack decodes every codec to the ramp
+          python interop/verify_outbound.py "$OUT"         # Astropy opens/verifies every emitted file
+          for f in "$OUT"/*.fits; do fitsverify -q "$f" || true; done   # informational structural report
+      - name: Golden drift-guard — regenerate & byte-diff (informational; needs CFITSIO 4.6.4)
+        if: steps.f.outputs.relevant == 'true'
+        continue-on-error: true
+        run: |
+          make -C interop golden
+          git diff --stat -- test/golden
+          git diff --exit-code -- test/golden \
+            || echo "::warning::regenerated goldens differ from committed bytes (likely a CFITSIO version skew vs 4.6.4); the semantic interop checks above are authoritative"
