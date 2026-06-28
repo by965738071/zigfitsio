@@ -35,6 +35,8 @@ pub const Matches = @import("header/name.zig").Matches;
 pub const KeywordValue = @import("header/value.zig").KeywordValue;
 /// An 80-byte header card with byte-exact round-trip (FR-HDR-1).
 pub const Card = @import("header/card.zig").Card;
+/// HIERARCH long-keyword convention helpers (FR-HDR-9).
+pub const hierarch = @import("header/hierarch.zig");
 /// The ordered cards of one HDU header (FR-HDR-5/7/11).
 pub const Header = @import("header/header.zig").Header;
 
@@ -113,6 +115,7 @@ test {
     _ = @import("header/card.zig");
     _ = @import("header/header.zig");
     _ = @import("header/continue.zig");
+    _ = @import("header/hierarch.zig");
     _ = @import("hdu.zig");
     _ = @import("fits.zig");
     _ = @import("image.zig");
