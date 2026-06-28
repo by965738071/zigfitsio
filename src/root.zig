@@ -81,9 +81,25 @@ pub const ColumnRef = @import("table/binary.zig").ColumnRef;
 /// Variable-length-array heap access (FR-VLA-*).
 pub const heap = @import("table/heap.zig");
 
+// ── Random groups (§15) ────────────────────────────────────────────────────────────────
+/// Random-groups structure access (FR-RG-*).
+pub const RandomGroups = @import("groups.zig").RandomGroups;
+
 // ── Data integrity (§16) ───────────────────────────────────────────────────────────────
 /// DATASUM/CHECKSUM computation and verification (FR-SUM-*).
 pub const checksum = @import("checksum.zig");
+
+// ── Tiled compression (§17) ────────────────────────────────────────────────────────────
+/// Tiled-compressed-image read view (FR-CMP-1/2).
+pub const TiledImage = @import("compress/tiled.zig").TiledImage;
+
+// ── Iterator (§19.2) ───────────────────────────────────────────────────────────────────
+/// High-level work-function iterator over columns/pixels (FR-ITR-*).
+pub const Iterator = @import("iterator.zig").Iterator;
+
+// ── Structural validation (§19.3) ──────────────────────────────────────────────────────
+/// fitsverify-style conformance pass (FR-VAL-*).
+pub const validate = @import("validate.zig");
 
 // ── World Coordinate System (§18) ──────────────────────────────────────────────────────
 /// The WCS keyword set parse/serialize (FR-WCS-1).
@@ -136,6 +152,10 @@ test {
     _ = @import("table/ascii.zig");
     _ = @import("table/heap.zig");
     _ = @import("checksum.zig");
+    _ = @import("groups.zig");
+    _ = @import("iterator.zig");
+    _ = @import("validate.zig");
+    _ = @import("compress/tiled.zig");
 }
 
 test "version is non-empty" {
