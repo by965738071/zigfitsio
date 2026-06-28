@@ -58,8 +58,11 @@ const CHUNK_ELEMS: usize = 4096; // elements per streamed chunk
 /// Transfer direction for the section walk.
 const Dir = enum { read, write };
 
-/// Errors produced by image operations.
-pub const ImageError = errors.StructError || errors.IoError || errors.ConvError || errors.LimitError;
+/// Errors produced by image operations. The structural-redefinition path (`reshape`, IMG-7)
+/// edits header cards and re-lands the geometry through the file handle, so this set also
+/// folds in `HeaderError`/`ValueError`/`Allocator.Error` (it then equals `Fits.FitsError`).
+pub const ImageError = errors.StructError || errors.IoError || errors.ConvError ||
+    errors.LimitError || errors.HeaderError || errors.ValueError || std.mem.Allocator.Error;
 
 /// A typed view over an HDU's image data array.
 pub const ImageView = struct {
@@ -77,6 +80,55 @@ pub const ImageView = struct {
     pub fn append(fits: *Fits, spec: @import("fits.zig").ImageSpec) (@import("fits.zig").FitsError)!ImageView {
         const hdu = try fits.appendImageHdu(spec);
         return of(fits, hdu) catch unreachable;
+    }
+
+    /// Resize / redefine this image's data array in place (IMG-7, FR-IMG-7; §4.4.1.1, §3.3.2).
+    ///
+    /// Rewrites the structural keywords `BITPIX`/`NAXIS`/`NAXISn` on the HDU's header to the
+    /// requested `new_bitpix` and `new_axes` (most-rapidly-varying first), then re-lands the new
+    /// geometry on disk through the Phase-1 file-handle API: the header block count is re-aligned,
+    /// the data unit is grown or shrunk to the new `|BITPIX|/8 · Π NAXISn` byte count, any growth
+    /// is zero-filled (the FITS data fill, §3.3.2), and every following HDU is shifted and has its
+    /// offsets patched. Surviving pixels keep their stored byte values; a `BITPIX` change therefore
+    /// *reinterprets* the bytes rather than converting them (use a fresh write to convert).
+    ///
+    /// `new_bitpix` must be one of 8/16/32/64/-32/-64 (`error.BadBitpix`) and `new_axes.len`
+    /// must be ≤ 999 (`error.BadNaxis`). After a successful call the view is fully usable: its
+    /// `bitpix()`/`dims()`/`elementCount()` read the HDU's refreshed structural fields.
+    pub fn reshape(self: *ImageView, new_bitpix: i64, new_axes: []const u64) ImageError!void {
+        if (!validBitpix(new_bitpix)) return error.BadBitpix;
+        if (new_axes.len > 999) return error.BadNaxis;
+
+        const alloc = self.fits.alloc;
+        const h = &self.hdu.header;
+        const old_naxis: usize = self.hdu.naxis;
+
+        // Rewrite the structural keywords. `update` replaces in place when present and
+        // creates-if-absent (before END) otherwise, so growing the dimensionality appends the
+        // new `NAXISn` cards — a header-card-count change that `rewriteHeaderInPlace` re-aligns.
+        try h.update(alloc, "BITPIX", .{ .int = new_bitpix }, null);
+        try h.update(alloc, "NAXIS", .{ .int = @intCast(new_axes.len) }, null);
+        var name_buf: [16]u8 = undefined;
+        for (new_axes, 0..) |ax, i| {
+            const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{i + 1}) catch unreachable;
+            try h.update(alloc, kw, .{ .int = @intCast(ax) }, null);
+        }
+        // Drop the now-surplus `NAXISn` cards when the dimensionality shrank.
+        var n: usize = new_axes.len + 1;
+        while (n <= old_naxis) : (n += 1) {
+            const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{n}) catch unreachable;
+            h.delete(kw) catch {}; // absent is fine (already not there)
+        }
+
+        // Land the new geometry. `refreshGeometry` recomputes bitpix/naxis/axes/data_bytes from
+        // the edited header (no byte move). It also overwrites `data_bytes` with the NEW size,
+        // but `rewriteHeaderInPlace` derives its grow/shrink delta from the *on-disk* (old) size
+        // it finds in `data_bytes`, so we restore that old value before calling it — otherwise the
+        // data resize (and its zero-fill) would be skipped.
+        const on_disk_bytes = self.hdu.data_bytes;
+        _ = try self.fits.refreshGeometry(self.hdu);
+        self.hdu.data_bytes = on_disk_bytes;
+        try self.fits.rewriteHeaderInPlace(self.hdu);
     }
 
     /// `BITPIX` of the underlying array.
@@ -318,6 +370,15 @@ pub const ImageView = struct {
 
 fn isIntegral(f: f64) bool {
     return std.math.isFinite(f) and @floor(f) == f;
+}
+
+// The six legal `BITPIX` values (§4.4.1.1): unsigned-byte, two's-complement 16/32/64-bit
+// integers, and IEEE 32/64-bit floats.
+fn validBitpix(b: i64) bool {
+    return switch (b) {
+        8, 16, 32, 64, -32, -64 => true,
+        else => false,
+    };
 }
 
 fn transformRead(comptime Stored: type, comptime T: type, s: Stored, sc: Scaling, sentinel: ?T) errors.ConvError!T {
@@ -592,6 +653,141 @@ test "signed-byte convention: BITPIX=8 + BZERO=-128 round-trips as i8 (IMG-6)" {
     var out: [5]i8 = undefined;
     try img.readAll(i8, &out, .{ .scaling = sc });
     try testing.expectEqualSlices(i8, &vals, &out); // full i8 range round-trips
+}
+
+test "reshape (IMG-7): grow, shrink, change dimensionality and BITPIX; trailing HDU survives" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+
+    {
+        var f = try Fits.create(testing.allocator, mem.device(), .{});
+        defer f.deinit();
+
+        // Primary: a 1-D i32 image of 1000 pixels = 4000 bytes → 2 blocks.
+        const primary = try f.appendImageHdu(.{ .bitpix = 32, .axes = &.{1000} });
+        // Trailing IMAGE extension with a small, recognizable payload.
+        const ext = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+
+        const src = try testing.allocator.alloc(i32, 1000);
+        defer testing.allocator.free(src);
+        for (src, 0..) |*s, i| s.* = @intCast(i);
+        var pimg = try ImageView.of(&f, primary);
+        try pimg.writeAll(i32, src, .{});
+
+        var ext_vals: [12]i16 = undefined;
+        for (&ext_vals, 0..) |*v, i| v.* = @intCast(100 + i);
+        var eimg = try ImageView.of(&f, ext);
+        try eimg.writeAll(i16, &ext_vals, .{});
+
+        // Helper expectations after each reshape: trailing HDU stays selectable, sits exactly
+        // after the primary, and reads back byte-intact.
+        const checkExt = struct {
+            fn run(ff: *Fits, prim: *Hdu, ex: *Hdu, want: []const i16) !void {
+                try testing.expectEqual(prim.nextOff(), ex.header_off);
+                try testing.expectEqual(ex, try ff.select(2));
+                var out: [12]i16 = undefined;
+                var ev = try ImageView.of(ff, ex);
+                try ev.readAll(i16, &out, .{});
+                try testing.expectEqualSlices(i16, want, &out);
+            }
+        }.run;
+
+        // ── A) GROW (1-D → 1-D), crossing a block boundary: 1000 → 3000 pixels (5 blocks). ──
+        try pimg.reshape(32, &.{3000});
+        try testing.expectEqual(@as(i64, 32), pimg.bitpix());
+        try testing.expectEqualSlices(u64, &.{3000}, pimg.dims());
+        try testing.expectEqual(@as(u64, 3000), pimg.elementCount());
+        try checkExt(&f, primary, ext, &ext_vals);
+        {
+            const out = try testing.allocator.alloc(i32, 3000);
+            defer testing.allocator.free(out);
+            try pimg.readAll(i32, out, .{});
+            for (out, 0..) |v, i| {
+                const want: i32 = if (i < 1000) @intCast(i) else 0; // grown pixels read as zero
+                try testing.expectEqual(want, v);
+            }
+        }
+
+        // ── B) SHRINK + add an axis (1-D → 2-D): 3000 → 200 pixels (10×20), 1 block. ──
+        try pimg.reshape(32, &.{ 10, 20 });
+        try testing.expectEqualSlices(u64, &.{ 10, 20 }, pimg.dims());
+        try testing.expectEqual(@as(u64, 200), pimg.elementCount());
+        try checkExt(&f, primary, ext, &ext_vals);
+        {
+            var out: [200]i32 = undefined;
+            try pimg.readAll(i32, &out, .{});
+            for (&out, 0..) |v, i| try testing.expectEqual(@as(i32, @intCast(i)), v); // first 200 survive
+        }
+
+        // ── C) Change BITPIX + drop an axis (2-D → 1-D): i32 → f32, 200 pixels (800 bytes). ──
+        try pimg.reshape(-32, &.{200});
+        try testing.expectEqual(@as(i64, -32), pimg.bitpix());
+        try testing.expectEqualSlices(u64, &.{200}, pimg.dims());
+        try checkExt(&f, primary, ext, &ext_vals);
+        try testing.expect(!primary.header.has("NAXIS2")); // surplus NAXISn card removed
+
+        try f.flush();
+    }
+
+    // ── D) Reopen and confirm the scan sees consistent geometry after the reshapes. ──
+    {
+        var f = try Fits.open(testing.allocator, mem.device(), .read_only, .{});
+        defer f.deinit();
+        try testing.expectEqual(@as(usize, 2), try f.hduCount());
+        const p = try f.select(1);
+        try testing.expectEqual(@as(i64, -32), p.bitpix);
+        try testing.expectEqualSlices(u64, &.{200}, p.axes);
+        const e = try f.select(2);
+        try testing.expectEqual(@as(i64, 16), e.bitpix);
+        try testing.expectEqualSlices(u64, &.{ 4, 3 }, e.axes);
+        try testing.expectEqual(p.nextOff(), e.header_off);
+        // The trailing payload is still readable after the reopen.
+        var out: [12]i16 = undefined;
+        var ev = try ImageView.of(&f, e);
+        try ev.readAll(i16, &out, .{});
+        for (&out, 0..) |v, i| try testing.expectEqual(@as(i16, @intCast(100 + i)), v);
+    }
+}
+
+test "reshape rejects bad BITPIX and too many axes (IMG-7 validation)" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    var img = try ImageView.append(&f, .{ .bitpix = 16, .axes = &.{4} });
+
+    try testing.expectError(error.BadBitpix, img.reshape(7, &.{4}));
+    try testing.expectError(error.BadBitpix, img.reshape(0, &.{4}));
+    const too_many = [_]u64{1} ** 1000;
+    try testing.expectError(error.BadNaxis, img.reshape(16, &too_many));
+
+    // The HDU geometry is unchanged after the rejected calls.
+    try testing.expectEqual(@as(i64, 16), img.bitpix());
+    try testing.expectEqualSlices(u64, &.{4}, img.dims());
+}
+
+test "reshape to NAXIS=0 (scalar) drops all NAXISn and zeroes the data unit" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{});
+    defer f.deinit();
+    const primary = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+    const ext = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{5} });
+    const payload = [_]u8{ 0x33, 0x44, 0x55, 0x66, 0x77 };
+    try f.dev.writeAll(&payload, ext.data_off);
+
+    var img = try ImageView.of(&f, primary);
+    try img.reshape(16, &.{});
+    try testing.expectEqual(@as(u16, 0), primary.naxis);
+    try testing.expectEqual(@as(u64, 0), primary.data_bytes);
+    try testing.expect(!primary.header.has("NAXIS1"));
+    try testing.expect(!primary.header.has("NAXIS2"));
+
+    // Trailing HDU moved with the now-headers-only primary and stayed intact.
+    try testing.expectEqual(primary.nextOff(), ext.header_off);
+    var rb: [5]u8 = undefined;
+    try f.dev.readAll(&rb, ext.data_off);
+    try testing.expectEqualSlices(u8, &payload, &rb);
 }
 
 test "multi-chunk transfer stays correct across the chunk boundary" {
