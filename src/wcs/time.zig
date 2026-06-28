@@ -185,6 +185,108 @@ pub fn jdToMjd(jd: f64) f64 {
     return jd - MJD_OFFSET;
 }
 
+// ── Time coordinates (WCS-4, FR-WCS-4; FITS 4.0 §9, Tables 30–35) ─────────────────────────
+
+const Header = @import("../header/header.zig").Header;
+const Allocator = std.mem.Allocator;
+
+/// Recognized time reference scales (`TIMESYS`, Table 30).
+pub const TimeSys = enum {
+    utc,
+    tai,
+    tt,
+    tdb,
+    tcg,
+    tcb,
+    ut1,
+    gps,
+    unknown,
+
+    pub fn parse(s: []const u8) TimeSys {
+        const t = std.mem.trim(u8, s, " ");
+        const map = .{
+            .{ "UTC", TimeSys.utc }, .{ "TAI", TimeSys.tai }, .{ "TT", TimeSys.tt },
+            .{ "TDB", TimeSys.tdb }, .{ "TCG", TimeSys.tcg }, .{ "TCB", TimeSys.tcb },
+            .{ "UT1", TimeSys.ut1 }, .{ "GPS", TimeSys.gps },
+        };
+        inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
+        return .unknown;
+    }
+};
+
+/// Recognized time reference positions (`TREFPOS`, Table 31).
+pub const RefPos = enum {
+    topocenter,
+    geocenter,
+    barycenter,
+    heliocenter,
+    relocatable,
+    unknown,
+
+    pub fn parse(s: []const u8) RefPos {
+        const t = std.mem.trim(u8, s, " ");
+        const map = .{
+            .{ "TOPOCENTER", RefPos.topocenter }, .{ "GEOCENTER", RefPos.geocenter },
+            .{ "BARYCENTER", RefPos.barycenter }, .{ "HELIOCENTER", RefPos.heliocenter },
+            .{ "RELOCATABLE", RefPos.relocatable },
+        };
+        inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
+        return .unknown;
+    }
+};
+
+/// The global time-coordinate keywords of a header (FITS 4.0 §9.2).
+pub const TimeCoords = struct {
+    timesys: TimeSys = .unknown,
+    trefpos: RefPos = .unknown,
+    /// Time unit string (`TIMEUNIT`), default `s` per §9.2.2 (owned).
+    timeunit: ?[]u8 = null,
+    /// Reference epoch as an MJD, from `MJDREF` or `MJDREFI`+`MJDREFF` (Table 32).
+    mjdref: ?f64 = null,
+    /// `DATE-OBS` parsed (Table 33).
+    date_obs: ?DateTime = null,
+    /// `MJD-OBS`.
+    mjd_obs: ?f64 = null,
+    /// Exposure window relative to `MJDREF` (`TSTART`/`TSTOP`).
+    tstart: ?f64 = null,
+    tstop: ?f64 = null,
+
+    /// Parse the global time keywords from `h`.
+    pub fn fromHeader(a: Allocator, h: *const Header) std.mem.Allocator.Error!TimeCoords {
+        var self: TimeCoords = .{};
+        errdefer self.deinit(a);
+        if (h.getString(a, "TIMESYS")) |s| {
+            defer a.free(s);
+            self.timesys = TimeSys.parse(s);
+        } else |_| {}
+        if (h.getString(a, "TREFPOS")) |s| {
+            defer a.free(s);
+            self.trefpos = RefPos.parse(s);
+        } else |_| {}
+        self.timeunit = h.getString(a, "TIMEUNIT") catch null;
+        // MJDREF, or MJDREFI + MJDREFF (the split integer/fraction form for precision).
+        if (h.getValue(f64, "MJDREF")) |v| {
+            self.mjdref = v;
+        } else |_| {
+            const mi = h.getValue(f64, "MJDREFI") catch null;
+            const mf = h.getValue(f64, "MJDREFF") catch null;
+            if (mi != null or mf != null) self.mjdref = (mi orelse 0) + (mf orelse 0);
+        }
+        self.mjd_obs = h.getValue(f64, "MJD-OBS") catch null;
+        self.tstart = h.getValue(f64, "TSTART") catch null;
+        self.tstop = h.getValue(f64, "TSTOP") catch null;
+        if (h.getString(a, "DATE-OBS")) |s| {
+            defer a.free(s);
+            self.date_obs = DateTime.parse(s) catch null;
+        } else |_| {}
+        return self;
+    }
+
+    pub fn deinit(self: *TimeCoords, a: Allocator) void {
+        if (self.timeunit) |u| a.free(u);
+    }
+};
+
 const testing = std.testing;
 
 test "ISO-8601 parse + round-trip including fractional seconds" {
@@ -256,4 +358,39 @@ test "malformed dates are rejected" {
 test "mjd/jd conversions" {
     try testing.expect(@abs(mjdToJd(0.0) - MJD_OFFSET) < 1e-9);
     try testing.expect(@abs(jdToMjd(MJD_OFFSET) - 0.0) < 1e-9);
+}
+
+test "TimeCoords parses the global time keyword set" {
+    const blk = @import("../io/block.zig");
+    const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
+    const a = testing.allocator;
+    var buf: [blk.BLOCK]u8 = [_]u8{' '} ** blk.BLOCK;
+    const cards = [_][]const u8{
+        "TIMESYS = 'TT'",
+        "TREFPOS = 'GEOCENTER'",
+        "TIMEUNIT= 's'",
+        "MJDREFI =                58000",
+        "MJDREFF =                  0.5",
+        "DATE-OBS= '2018-08-13T09:30:15'",
+        "TSTART  =                  0.0",
+        "TSTOP   =               1200.0",
+    };
+    for (cards, 0..) |c, i| @memcpy(buf[i * 80 ..][0..c.len], c);
+    @memcpy(buf[cards.len * 80 ..][0..3], "END");
+    var mem = try MemoryDevice.initBytes(a, &buf);
+    defer mem.deinit();
+    var reader = try blk.BlockReader.init(a, mem.device(), 0);
+    defer reader.deinit();
+    const res = try Header.parse(a, &reader, 0, 36);
+    var h = res.header;
+    defer h.deinit(a);
+
+    var tc = try TimeCoords.fromHeader(a, &h);
+    defer tc.deinit(a);
+    try testing.expectEqual(TimeSys.tt, tc.timesys);
+    try testing.expectEqual(RefPos.geocenter, tc.trefpos);
+    try testing.expectEqualStrings("s", tc.timeunit.?);
+    try testing.expect(@abs(tc.mjdref.? - 58000.5) < 1e-9); // I + F combined
+    try testing.expect(@abs(tc.tstop.? - 1200.0) < 1e-9);
+    try testing.expectEqual(@as(i32, 2018), tc.date_obs.?.year);
 }

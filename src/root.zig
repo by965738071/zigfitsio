@@ -90,6 +90,10 @@ pub const checksum = @import("checksum.zig");
 pub const Wcs = @import("wcs/keys.zig").Wcs;
 /// Celestial pixel<->world transforms (FR-WCS-2).
 pub const Celestial = @import("wcs/celestial.zig").Celestial;
+/// Spectral coordinate keywords (FR-WCS-3).
+pub const Spectral = @import("wcs/spectral.zig").Spectral;
+/// Global time-coordinate keywords (FR-WCS-4).
+pub const TimeCoords = @import("wcs/time.zig").TimeCoords;
 
 // ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
 /// FITS date/time + Julian-Date helpers (FR-UTL-1).
@@ -123,6 +127,7 @@ test {
     _ = @import("image.zig");
     _ = @import("wcs/keys.zig");
     _ = @import("wcs/celestial.zig");
+    _ = @import("wcs/spectral.zig");
     _ = @import("wcs/time.zig");
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
