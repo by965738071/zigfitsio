@@ -383,7 +383,7 @@ pub const Limits = struct {
     max_string_value:  u32   = 1 << 20,        // assembled CONTINUE length
     max_tile_bytes:    u64   = 1 << 30,
     max_open_alloc:    u64   = 1 << 32,        // single-call allocation ceiling
-    max_matches:       u32   = 4096,           // inline capacity of a wildcard Matches (§19.1)
+    max_matches:       u32   = 4096,           // runtime ceiling for a wildcard Matches; must be ≤ name.MAX_MATCHES (the comptime inline capacity, §19.1)
 };
 ```
 
@@ -981,7 +981,8 @@ pub fn verify(hdu: *Hdu, fits: *Fits) ChecksumError!struct { sum: Verify, data: 
 ```
 
 **Accumulation.** The 32-bit sum is the CFITSIO `ff_csum` form: walk the (padded) unit in
-4-byte groups, add each group's big-endian high 16-bit half into `hi` and its low half into
+4-byte groups (each group read big-endian through `endian.read`, per §7.1 — never a raw
+bitcast off disk), add each group's high 16-bit half into `hi` and its low half into
 `lo`, then fold the carries until both fit in 16 bits → `(hi << 16) + lo`. `DATASUM` stores
 that value as an unsigned decimal string; `CHECKSUM` stores the 16-character ASCII encoding
 of its one's-complement, so the complete HDU sums to all-ones.
@@ -1121,8 +1122,14 @@ helpers of `FR-UTL-1` (`FR-WCS-4`). All `SHOULD`-tier; unsupported projections �
 
   ```zig
   // name.zig — fixed-capacity match accumulator; no allocation on the common path.
+  // The inline buffer length MUST be a top-level constant: a struct's *runtime* field
+  // (`Limits.max_matches`) cannot serve as a type-name-qualified comptime array bound on
+  // Zig 0.16 (`error: struct 'Limits' has no member named 'max_matches'`). So the comptime
+  // capacity lives here as MAX_MATCHES, and `Limits.max_matches` (§7.2) is the *runtime*
+  // ceiling, constrained to `<= MAX_MATCHES`.
+  pub const MAX_MATCHES: usize = 4096;
   pub const Matches = struct {
-      buf: [Limits.max_matches]u32 = undefined, // 0-based indices; columns ≤ TFIELDS ≤ 999
+      buf: [MAX_MATCHES]u32 = undefined,        // 0-based indices; columns ≤ TFIELDS ≤ 999
       len: usize = 0,
       overflow: bool = false,                   // set when more matches existed than fit
       pub fn slice(self: *const Matches) []const u32 { return self.buf[0..self.len]; }
@@ -1130,7 +1137,7 @@ helpers of `FR-UTL-1` (`FR-WCS-4`). All `SHOULD`-tier; unsupported projections �
   };
   ```
 
-  Column lookups (`columnByName`) cannot overflow (`TFIELDS ≤ 999 < max_matches`) so they
+  Column lookups (`columnByName`) cannot overflow (`TFIELDS ≤ 999 < MAX_MATCHES`) so they
   stay `void`-returning with an out-param. `Header.find` over an unbounded card list sets
   `overflow = true` on truncation; an allocating `Header.findAlloc(allocator, …)` variant
   returns the complete list when a caller needs every match.
@@ -1139,8 +1146,10 @@ helpers of `FR-UTL-1` (`FR-WCS-4`). All `SHOULD`-tier; unsupported projections �
 
 ### 19.2 Iterator (`FR-ITR-1/2`, P2)
 
-`iterator.zig` drives a caller-supplied work function over image pixels or table columns in
-block-aligned chunks, handling buffering, datatype conversion, and null substitution
+`iterator.zig` drives a caller-supplied work function over image pixels or **binary-table**
+columns (the `Cols`/`ColumnRef` model is binary-table-specific; ASCII-table iteration is a
+documented follow-up) in block-aligned chunks, handling buffering, datatype conversion, and
+null substitution
 (`FR-ITR-1`), with per-column **input / output / input-output** roles and per-call
 element-grouping control (`FR-ITR-2`). Chunk sizing satisfies `NFR-PERF-1` (block-aligned,
 no per-element syscalls) and `NFR-PERF-3` (bounded memory).
@@ -1423,6 +1432,12 @@ fixtures above:
   (confirming the `anyerror` leak is gone). The three original defects fail to compile with
   the expected diagnostics (`duplicate struct member name 'current'`; `no field or member
   function named 'z' in 'error{…}!B'`; `'std' has no member named 'BoundedArray'`).
+  **Two corrections were required to make these literally build on 0.16, and the snippets
+  above already incorporate them:** (1) `Matches` must size its inline buffer from the
+  top-level `MAX_MATCHES` constant (§19.1), not the runtime field `Limits.max_matches` — a
+  struct's instance field cannot be a type-name-qualified comptime array bound; (2) the
+  `build.zig.zon` `fingerprint` (§24.2) must be the value `zig build` emits on first run, as
+  the printed literal is rejected until regenerated (its low 32 bits checksum `.name`).
 - **CFITSIO 4.6.4.** The §16 checksum reproduces CFITSIO's authoritative ASCII-table
   `DATASUM` only when the `0x20` space fill is summed (golden vector above), and CFITSIO's
   own `fits_verify_chksum` confirms the generated HDU.
@@ -1463,7 +1478,9 @@ pub fn build(b: *std.Build) void {
     .name = .zigfitsio,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .fingerprint = 0x1d3e9c7a2b5f0846, // emitted once by 'zig build' on first run; never 0x0 (reserved)
+    // .fingerprint is REQUIRED but MUST be the value `zig build` prints on first run — its
+    // low 32 bits checksum `.name`, so a hand-picked literal is rejected (and 0x0 is reserved).
+    .fingerprint = 0x0, // PLACEHOLDER: run `zig build` once and paste the value it reports here
     .dependencies = .{},           // none — std only (GC-2)
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },
 }
@@ -1471,12 +1488,15 @@ pub fn build(b: *std.Build) void {
 
 ### 24.3 Portability & CI (`NFR-PORT-1/3`)
 
-- CI matrix: {Linux, macOS, Windows} × {x86_64, aarch64}, `zig build test` (`NFR-PORT-1`).
+- CI matrix: {Linux, macOS, Windows} × {x86_64, aarch64}, `zig build test` (`NFR-PORT-1`),
+  **plus a big-endian cell** (`s390x-linux` or `powerpc64-linux` under QEMU) running
+  `zig build test`.
 - A `wasm32-freestanding` build **compiles the core** (excluding `io/file.zig`,
   `io/stream.zig`, `io/http.zig`; the memory backend is the freestanding I/O path) and is
   exercised in CI (`NFR-PORT-3`).
-- Endian-independence is asserted by forcing the swap path in unit tests and by the
-  aarch64/x86_64 matrix (`NFR-PORT-2`).
+- Endian-independence is asserted by forcing the swap path in unit tests **and** by the
+  big-endian CI cell above — the `{x86_64, aarch64}` hosts are all little-endian and cannot,
+  by themselves, exercise a native big-endian read path (`NFR-PORT-2`).
 - SemVer + changelog; public API changes bump the version (`NFR-API-1`). Every public decl
   carries a doc comment, and a usage guide with the §21 examples ships in `README.md`
   (`NFR-DOC-1`).

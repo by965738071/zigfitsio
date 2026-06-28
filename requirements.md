@@ -213,15 +213,15 @@ application needing to consume or produce FITS data without linking a C library.
 | FR-ERR-1 | All fallible operations **MUST** return Zig error unions over well-defined error sets categorized by area (I/O, header syntax, keyword type/value, HDU structure, table/column, compression, checksum, conversion). |
 | FR-ERR-2 | The library **MUST NOT** use the CFITSIO integer-status / inherited-status pattern in its public API; equivalent fail-fast behavior is provided naturally by `try`/error propagation. |
 | FR-ERR-3 | The library **MUST** offer an optional diagnostic context object that records human-readable detail (file offset, keyword, card text) for the most recent failure, as a replacement for the CFITSIO error-message stack. |
-| FR-ERR-4 | A stable mapping from `zigfitsio` errors to CFITSIO numeric status codes **SHOULD** be provided for tooling that reports compatible codes. |
+| FR-ERR-4 | A stable mapping from `zigfitsio` errors to CFITSIO numeric status codes **SHOULD** be provided for tooling that reports compatible codes. *(The one **P3-deferred** item in the otherwise-P0 error model: a tooling-compatibility convenience that sits on no read/write path; see §6.)* |
 
-### 3.16 Alternate & Remote Access — P3
+### 3.16 Alternate & Remote Access — P0–P3
 
-| ID | Requirement |
-|----|-------------|
-| FR-RMT-1 | The library **MUST** support reading/writing via in-memory buffers and standard input/output streams. |
-| FR-RMT-2 | The library **SHOULD** support transparently reading and writing whole-file gzip-compressed FITS (`.fits.gz`) using `std.compress`. |
-| FR-RMT-3 | Remote read over HTTP/HTTPS via `std.http` **MAY** be supported (note: `std`'s TLS is TLS-1.3-only); FTP, if offered, requires a separate client, as `std` has no FTP module. |
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR-RMT-1 | The library **MUST** support reading/writing via in-memory buffers and standard input/output streams. This is **foundational**, not remote: the in-memory buffer is the freestanding I/O path and ships with the I/O layer (§3.1), so it is built in M0, not deferred. | P0/P1 |
+| FR-RMT-2 | The library **SHOULD** support transparently reading and writing whole-file gzip-compressed FITS (`.fits.gz`) using `std.compress`. | P3 |
+| FR-RMT-3 | Remote read over HTTP/HTTPS via `std.http` **MAY** be supported (note: `std`'s TLS is TLS-1.3-only); FTP, if offered, requires a separate client, as `std` has no FTP module. | P3 |
 
 ### 3.17 Template-Based Creation — P3
 
@@ -234,7 +234,7 @@ application needing to consume or produce FITS data without linking a C library.
 
 | ID | Requirement |
 |----|-------------|
-| FR-VAL-1 | The library **MUST** provide a verification pass that checks structural conformance to FITS 4.0: block sizing, mandatory keyword presence/order/type, value ranges, table geometry (binary tables: `NAXIS1` equals the summed `TFORM` field widths; ASCII tables: each `TBCOLn`+field width fits within `NAXIS1`, which **MAY** exceed the field extent), declared-vs-actual data sizes, and `END`/padding correctness. |
+| FR-VAL-1 | The library **MUST** provide a verification pass that checks structural conformance to FITS 4.0: block sizing, mandatory keyword presence/order/type, **no duplicate mandatory keyword** (FITS 4.0 §4.2.1.1), value ranges (including **`BLANK` only with positive `BITPIX`**, FITS 4.0 §4.4.2.5/§5.3), table geometry (binary tables: `NAXIS1` equals the summed `TFORM` field widths; ASCII tables: each `TBCOLn`+field width fits within `NAXIS1`, which **MAY** exceed the field extent), declared-vs-actual data sizes, `END`/padding correctness, and correct handling of trailing **special records** (FITS 4.0 §3.5). |
 | FR-VAL-2 | Verification **MUST** report all findings (not just the first) classified as error vs warning, suitable for a `fitsverify`-style report. |
 
 ### 3.19 Numeric Conversion & Rounding — P1
@@ -361,8 +361,13 @@ application needing to consume or produce FITS data without linking a C library.
 | `M` | double complex | `[2]f64` |
 | `P` | array descriptor (32-bit) | `{ len: i32, off: i32 }` (signed two's-complement; negatives rejected) |
 | `Q` | array descriptor (64-bit) | `{ len: i64, off: i64 }` (signed two's-complement; negatives rejected) |
-| `U`/`V`/`W` | unsigned 16/32/64 (CFITSIO ext.) | `u16`/`u32`/`u64` (stored as `I`/`J`/`K` + `TZERO`) |
-| `S` | signed byte (CFITSIO ext.) | `i8` (stored as `B` + `TZERO=-128`) |
+| `U`/`V`/`W` † | unsigned 16/32/64 (CFITSIO type tag) | `u16`/`u32`/`u64` (stored on disk as `I`/`J`/`K` + `TZERO`) |
+| `S` † | signed byte (CFITSIO type tag) | `i8` (stored on disk as `B` + `TZERO=-128`) |
+
+> † `U`/`V`/`W`/`S` are **CFITSIO-convention type tags surfaced by the API**, *not* FITS
+> `TFORMn` letters. The only valid BINTABLE `TFORMn` codes are `L X B I J K A E D C M P Q`
+> (FITS 4.0 Table 18); unsigned and signed-byte values are written on disk with the standard
+> `I`/`J`/`K`/`B` code plus the appropriate `TZEROn` (FITS 4.0 Table 19).
 
 ### 5.3 ASCII-table `TFORM` ↔ Zig
 
@@ -392,10 +397,10 @@ application needing to consume or produce FITS data without linking a C library.
 
 | Tier | Areas |
 |------|-------|
-| **P0** | GC-* constraints; 3.1 Low-level I/O; 3.2 Headers (core); 3.3 HDU management; 3.4 Images (core types & full/partial pixel I/O); 3.15 Error model. |
+| **P0** | GC-* constraints; 3.1 Low-level I/O (incl. the in-memory & stdio back-ends, FR-RMT-1); 3.2 Headers (core); 3.3 HDU management; 3.4 Images (core types & full/partial pixel I/O); 3.15 Error model (except the P3-deferred FR-ERR-4 status map). |
 | **P1** | 3.2 Headers (CONTINUE, full edit ops); 3.4 Images (scaling, unsigned, nulls, subsets); 3.5 ASCII tables; 3.6 Binary tables; 3.7 Variable-length arrays; 3.10 Checksum; 3.14 Utilities; 3.19 Numeric conversion. |
 | **P2** | 3.2 HIERARCH/units/header-space/INHERIT; 3.4 Images (signed-byte, resize/redefine); 3.8 Random groups; 3.9 WCS; 3.11 Compression (read, GZIP); 3.13 Iterator; 3.14 TDISP formatting; 3.18 Validation. |
-| **P3** | 3.11 Compression (Rice/PLIO/HCOMPRESS/write, tiled tables); 3.12 Extended filename syntax; 3.16 Remote/gzip access; 3.17 Templates; 3.20 Hierarchical grouping. |
+| **P3** | 3.11 Compression (Rice/PLIO/HCOMPRESS/write, tiled tables); 3.12 Extended filename syntax; 3.16 whole-file gzip + remote HTTP (FR-RMT-2/3 only — FR-RMT-1 is P0); 3.15 FR-ERR-4 CFITSIO status map; 3.17 Templates; 3.20 Hierarchical grouping. |
 
 ---
 
