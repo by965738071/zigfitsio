@@ -50,6 +50,51 @@ pub fn build(b: *std.Build) void {
     const run_corpus = b.addRunArtifact(corpus_tests);
     test_step.dependOn(&run_corpus.step);
 
+    // `test/e2e.zig` — in-house comprehensive end-to-end harness (testprog.c-equivalent,
+    // Deliverable 1). Hermetic, pure-Zig: builds a maximal multi-HDU file, reopens, asserts the
+    // full feature matrix, and checks a byte-snapshot digest tripwire. Wired into `test` and
+    // also runnable alone via `zig build e2e`.
+    const e2e_mod = b.createModule(.{
+        .root_source_file = b.path("test/e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    e2e_mod.addImport("zigfitsio", mod);
+    const e2e_tests = b.addTest(.{ .root_module = e2e_mod });
+    const run_e2e = b.addRunArtifact(e2e_tests);
+    test_step.dependOn(&run_e2e.step);
+    const e2e_step = b.step("e2e", "Run the in-house comprehensive e2e harness");
+    e2e_step.dependOn(&run_e2e.step);
+
+    // `test/golden.zig` — hermetic consumer of the externally-authored CFITSIO/Astropy golden
+    // corpus under `test/golden/` (X-FIXTURES). Reads committed bytes only and graceful-skips
+    // when the corpus is absent, so it is safe to wire into `test` on every cell (and decodes
+    // reference bytes on the big-endian cell).
+    const golden_mod = b.createModule(.{
+        .root_source_file = b.path("test/golden.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    golden_mod.addImport("zigfitsio", mod);
+    const golden_tests = b.addTest(.{ .root_module = golden_mod });
+    const run_golden = b.addRunArtifact(golden_tests);
+    test_step.dependOn(&run_golden.step);
+
+    // `zig build emit-fixtures -- <outdir>` — emit the zigfitsio-authored outbound interop
+    // corpus the toolchain-gated `interop` CI job opens with Astropy/CFITSIO (X-INTEROP
+    // outbound). Pure-Zig; deliberately NOT wired into `test`.
+    const emit_mod = b.createModule(.{
+        .root_source_file = b.path("tools/emit_fixtures.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    emit_mod.addImport("zigfitsio", mod);
+    const emit = b.addExecutable(.{ .name = "emit-fixtures", .root_module = emit_mod });
+    const run_emit = b.addRunArtifact(emit);
+    if (b.args) |args| run_emit.addArgs(args);
+    const emit_step = b.step("emit-fixtures", "Emit the zigfitsio-authored outbound interop corpus");
+    emit_step.dependOn(&run_emit.step);
+
     // `zig build bench` — throughput benchmarks against the ~2× CFITSIO goal (X-BENCH).
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench.zig"),

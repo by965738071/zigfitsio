@@ -1,0 +1,6 @@
+# Committed FITS goldens/corpus and raw expected-pixel buffers are binary: no platform
+# (notably the Windows CI cell) may apply EOL or text/encoding conversion on checkout, which
+# would corrupt the bytes the corpus/golden harnesses assert against.
+*.fits    binary
+*.fits.gz binary
+*.bin     binary
