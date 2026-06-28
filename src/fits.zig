@@ -233,21 +233,21 @@ pub const Fits = struct {
 
     // ── mutation / builders (FR-HDU-4, FR-TPL-2) ───────────────────────────────────────────
 
-    /// Append a programmatically-built image HDU (primary if the file is empty, else an
-    /// `IMAGE` extension), reserve and zero-fill its data unit, make it current, and return
-    /// it. Pixels are written via the image view (`image.zig`). This is the primary, complete
-    /// HDU-construction path — no template required (FR-TPL-2).
-    pub fn appendImageHdu(self: *Fits, spec: ImageSpec) FitsError!*Hdu {
+    /// Append a caller-built HDU: write `header_in` (ownership transferred) after all existing
+    /// HDUs, validate it, reserve and zero-fill its data unit, make it current, and return the
+    /// `*Hdu`. The header must carry the mandatory keywords for its kind (e.g. `XTENSION`,
+    /// `NAXISn`, `PCOUNT`, `GCOUNT`, `TFIELDS` for a table); `END` is appended if absent. This
+    /// is the general programmatic-builder primitive (FR-HDU-4, FR-TPL-2) that the typed
+    /// `appendImageHdu` and the table builders use.
+    pub fn appendHdu(self: *Fits, header_in: Header) FitsError!*Hdu {
         if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
-        if (!validBitpix(spec.bitpix)) return error.BadBitpix;
-        if (spec.axes.len > 999) return error.BadNaxis;
-        try self.ensureScannedAll(); // append after all existing HDUs
-
-        const is_primary = self.hdus.items.len == 0;
-        var header = try self.buildImageHeader(spec, is_primary);
+        var header = header_in;
         var header_owned = true;
         errdefer if (header_owned) header.deinit(self.alloc);
+        try self.ensureScannedAll(); // append after all existing HDUs
+        try header.ensureEnd(self.alloc);
 
+        const is_primary = self.hdus.items.len == 0;
         const offset = self.scan_off;
         var bw = try block.BlockWriter.init(self.alloc, self.dev, offset, 0);
         defer bw.deinit();
@@ -260,7 +260,7 @@ pub const Fits = struct {
         hdu_ptr.* = try Hdu.init(self.alloc, header, is_primary, offset, cards, self.limits);
         errdefer hdu_ptr.deinit(self.alloc);
 
-        // Reserve & zero-fill the data unit so the file is structurally valid before pixels land.
+        // Reserve & zero-fill the data unit so the file is structurally valid before data lands.
         const data_end = try limits.add(hdu_ptr.data_off, block.roundUpBlocks(hdu_ptr.data_bytes));
         if (data_end > try self.dev.getSize()) try self.dev.setSize(data_end);
 
@@ -269,6 +269,19 @@ pub const Fits = struct {
         self.fully_scanned = true;
         self.chdu = self.hdus.items.len - 1;
         return hdu_ptr;
+    }
+
+    /// Append a programmatically-built image HDU (primary if the file is empty, else an
+    /// `IMAGE` extension). Pixels are written via the image view (`image.zig`). The primary,
+    /// complete image-construction path — no template required (FR-TPL-2).
+    pub fn appendImageHdu(self: *Fits, spec: ImageSpec) FitsError!*Hdu {
+        if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
+        if (!validBitpix(spec.bitpix)) return error.BadBitpix;
+        if (spec.axes.len > 999) return error.BadNaxis;
+        try self.ensureScannedAll();
+        const is_primary = self.hdus.items.len == 0;
+        const header = try self.buildImageHeader(spec, is_primary);
+        return self.appendHdu(header);
     }
 
     fn buildImageHeader(self: *Fits, spec: ImageSpec, is_primary: bool) FitsError!Header {
