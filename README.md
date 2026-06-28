@@ -44,5 +44,41 @@ milestone breakdown.
 
 ## Examples
 
-Usage examples (read an image, create an image, read a table column, verify checksums)
-appear here as the corresponding APIs land.
+### Read an image into `[]f32`
+
+```zig
+const fits = @import("zigfitsio");
+
+var f = try fits.openFile(allocator, "img.fits", .read_only, .{});
+defer f.deinit();
+
+var img = try fits.ImageView.of(&f, f.current());
+const buf = try allocator.alloc(f32, @intCast(img.elementCount()));
+defer allocator.free(buf);
+
+// BSCALE/BZERO applied, NaN → 0 substituted, stored → f32 converted, in bounded chunks.
+try img.readAll(f32, buf, .{ .null_sentinel = 0.0 });
+```
+
+### Create an image (the programmatic builder is the primary path)
+
+```zig
+var f = try fits.createFile(allocator, "out.fits", .{});
+defer f.deinit();
+
+var img = try fits.ImageView.append(&f, .{ .bitpix = -32, .axes = &.{ 256, 256 } });
+try img.writeAll(f32, pixels, .{});
+try f.flush();
+```
+
+### Navigate HDUs and read a strided section
+
+```zig
+const n = try f.hduCount();
+var img = try fits.ImageView.of(&f, try f.select(2)); // 1-based HDU number
+var tile: [256 * 256]f32 = undefined;
+try img.readSection(f32, &.{ 0, 0 }, &.{ 511, 511 }, &.{ 2, 2 }, &tile, .{});
+```
+
+In-memory and stdin/stdout back-ends are first-class: build a `fits.MemoryDevice` and pass
+`mem.device()` to `fits.open`/`fits.create` for a freestanding-capable, file-less path.
