@@ -28,6 +28,10 @@ pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 pub const FileDevice = @import("io/file.zig").FileDevice;
 pub const block = @import("io/block.zig");
 
+// ── Utilities (§19.1) ──────────────────────────────────────────────────────────────────
+/// FITS date/time + Julian-Date helpers (FR-UTL-1).
+pub const DateTime = @import("wcs/time.zig").DateTime;
+
 test {
     // Pull every module's tests into the suite (`zig build test`). Each module is listed
     // explicitly: `_ = @import(...)` makes its tests reachable from the root. New modules
@@ -43,6 +47,8 @@ test {
     _ = @import("io/file.zig");
     _ = @import("io/stream.zig");
     _ = @import("io/block.zig");
+    _ = @import("wcs/time.zig");
+    _ = @import("compress/shuffle.zig");
 }
 
 test "version is non-empty" {
