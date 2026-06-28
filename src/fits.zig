@@ -24,6 +24,19 @@ const FileDevice = if (freestanding) struct {
         return error.NotWritable;
     }
 } else @import("io/file.zig").FileDevice;
+const MemoryDevice = @import("io/memory.zig").MemoryDevice;
+// `io/stream.zig` is the same kind of OS-adjacent leaf as `io/file.zig` (whole-file gzip over
+// `std.Io.Reader`/`Writer`); it is excluded from the wasm32-freestanding build graph. Under
+// freestanding it degrades to stubs so the gzip open/save helpers still type-check while never
+// pulling the leaf into the freestanding graph (GC-7).
+const stream = if (freestanding) struct {
+    pub fn inflateGzipToDevice(_: Allocator, _: []const u8, _: u64) FitsError!MemoryDevice {
+        return error.ReadFailed;
+    }
+    pub fn compressDeviceToGzip(_: Allocator, _: Device, _: *std.Io.Writer, _: u64) FitsError!void {
+        return error.NotWritable;
+    }
+} else @import("io/stream.zig");
 const block = @import("io/block.zig");
 const Header = @import("header/header.zig").Header;
 const hdu_mod = @import("hdu.zig");
@@ -75,6 +88,10 @@ pub const Fits = struct {
     fully_scanned: bool = false,
     /// Whether `deinit` closes the device (true when the handle created it, e.g. `openFile`).
     owns_device: bool = false,
+    /// Heap-allocated in-memory device that backs a transparently-decompressed (`*.fits.gz`)
+    /// handle (FR-RMT-2). When set, `deinit` frees both it and its buffer; the `Device` view
+    /// stored in `dev` points into it.
+    backing_mem: ?*MemoryDevice = null,
     /// Hook registered by the checksum module; invoked by `flush` when `checksum_on_close`.
     checksum_hook: ?*const fn (*Fits) FitsError!void = null,
 
@@ -95,8 +112,21 @@ pub const Fits = struct {
         return self;
     }
 
-    /// Open an on-disk file by path (the handle owns and closes the device).
+    /// Whether `path` names a whole-file gzip stream (`*.gz`, e.g. `*.fits.gz`), matched
+    /// case-insensitively (FR-RMT-2).
+    fn hasGzipSuffix(path: []const u8) bool {
+        return std.ascii.endsWithIgnoreCase(path, ".gz");
+    }
+
+    /// Open an on-disk file by path (the handle owns and closes the device). A `*.gz` path is
+    /// transparently decompressed in memory and opened read-only (FR-RMT-2); a non-gzip path
+    /// opens the file directly. Creating into a `*.gz` path is rejected (`error.NotWritable`):
+    /// build the file uncompressed, then `saveGzipFile`.
     pub fn openFile(alloc: Allocator, path: []const u8, mode: Mode, opts: OpenOpts) FitsError!Fits {
+        if (!freestanding and hasGzipSuffix(path)) {
+            if (mode == .create) return error.NotWritable;
+            return openGzipFile(alloc, path, opts);
+        }
         const access: file.Access = switch (mode) {
             .read_only => .read_only,
             .read_write => .read_write,
@@ -115,6 +145,51 @@ pub const Fits = struct {
     /// Create a new on-disk file by path (the handle owns and closes the device).
     pub fn createFile(alloc: Allocator, path: []const u8, opts: OpenOpts) FitsError!Fits {
         return openFile(alloc, path, .create, opts);
+    }
+
+    /// Open a whole-file gzip-compressed FITS image already in memory (`compressed` holds the raw
+    /// `*.fits.gz` bytes): inflate it into a fresh in-memory device the handle owns and open it
+    /// read-only (FR-RMT-2). A corrupt/truncated container is reported as `error.ReadFailed` and a
+    /// payload that inflates past `opts.limits.max_open_alloc` as `error.LimitExceeded`
+    /// (NFR-SAFE-1). The handle owns the decompression buffer and frees it on `deinit`.
+    pub fn openGzip(alloc: Allocator, compressed: []const u8, opts: OpenOpts) FitsError!Fits {
+        const mem = try alloc.create(MemoryDevice);
+        errdefer alloc.destroy(mem);
+        mem.* = try stream.inflateGzipToDevice(alloc, compressed, opts.limits.max_open_alloc);
+        errdefer mem.deinit();
+        var self = try open(alloc, mem.device(), .read_only, opts);
+        // Ownership of `mem` transfers to the handle here; `deinit` frees it. The earlier errdefers
+        // (which only fire if `open` failed) are now superseded.
+        self.backing_mem = mem;
+        return self;
+    }
+
+    // Read an on-disk `*.gz` file fully and hand the compressed bytes to `openGzip`.
+    fn openGzipFile(alloc: Allocator, path: []const u8, opts: OpenOpts) FitsError!Fits {
+        const cdev = try FileDevice.openPath(alloc, path, .read_only);
+        defer cdev.close(); // the compressed file is only the source; the handle keeps the inflated copy
+        const csize64 = try cdev.getSize();
+        if (csize64 > opts.limits.max_open_alloc) return error.LimitExceeded;
+        const csize: usize = @intCast(csize64);
+        const cbuf = try alloc.alloc(u8, csize);
+        defer alloc.free(cbuf);
+        try cdev.readAll(cbuf, 0);
+        return openGzip(alloc, cbuf, opts);
+    }
+
+    /// Export this handle's current on-device bytes as a whole-file gzip stream written to `path`
+    /// (the `*.fits.gz` save side of FR-RMT-2). The device is read in full, gzip-compressed, and
+    /// written to a freshly created file; the handle itself is unchanged. Sizes above
+    /// `self.limits.max_open_alloc` are rejected with `error.LimitExceeded` (NFR-SAFE-1).
+    pub fn saveGzipFile(self: *Fits, path: []const u8) FitsError!void {
+        var aw: std.Io.Writer.Allocating = try .initCapacity(self.alloc, 4096);
+        defer aw.deinit();
+        try stream.compressDeviceToGzip(self.alloc, self.dev, &aw.writer, self.limits.max_open_alloc);
+
+        const out = try FileDevice.openPath(self.alloc, path, .create);
+        defer out.close();
+        try out.writeAll(aw.written(), 0);
+        try out.sync();
     }
 
     fn initHandle(alloc: Allocator, dev: Device, mode: Mode, opts: OpenOpts) FitsError!Fits {
@@ -143,6 +218,12 @@ pub const Fits = struct {
         self.hdus.deinit(self.alloc);
         self.reader.deinit();
         if (close_device) self.dev.close();
+        // Free the gzip-decompression buffer last: `dev` aliases into it, so nothing above may
+        // touch the device after this point.
+        if (self.backing_mem) |m| {
+            m.deinit();
+            self.alloc.destroy(m);
+        }
     }
 
     // ── scanning ─────────────────────────────────────────────────────────────────────────
@@ -698,7 +779,6 @@ fn applyDelta(off: u64, delta: i64) u64 {
 
 // ── tests ──────────────────────────────────────────────────────────────────────────────
 const testing = std.testing;
-const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 
 // Write a two-HDU file (primary NAXIS=0 + an IMAGE extension) into a memory device.
 fn twoHduFile(alloc: Allocator) !*MemoryDevice {
@@ -784,6 +864,68 @@ test "read-only device rejects appends" {
     defer f.deinit();
     // The memory device is writable, but read_only mode forbids mutation.
     try testing.expectError(error.NotWritable, f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }));
+}
+
+// ── W13: whole-file gzip open (FR-RMT-2) ──────────────────────────────────────────────────
+const stream_mod = @import("io/stream.zig");
+
+test "openGzip round-trips a real .fits.gz through the actual Fits reader" {
+    var b = try newHandle(testing.allocator);
+    const f = &b.f;
+    // A real single-HDU image file with known pixels, built in memory.
+    const h = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } }); // 24 data bytes
+    try writePattern(f.dev, h.data_off, 24, 0xC3);
+    try f.flush();
+
+    // gzip the on-device bytes through the real codec, then drop the builder handle/device.
+    var aw: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer aw.deinit();
+    try stream_mod.compressToGzip(testing.allocator, &aw.writer, b.mem.bytes());
+    const data_off = h.data_off;
+    b.deinit(testing.allocator); // free the original file entirely — only the gzip bytes remain
+
+    // Open the gzipped bytes through the gzip-open path and read the image straight back.
+    var fg = try Fits.openGzip(testing.allocator, aw.written(), .{});
+    defer fg.deinit();
+    try testing.expectEqual(@as(usize, 1), try fg.hduCount());
+    const hg = try fg.select(1);
+    try testing.expectEqual(hdu_mod.HduKind.primary, hg.kind);
+    try testing.expectEqual(@as(i64, 16), hg.bitpix);
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, hg.axes);
+    try testing.expectEqual(data_off, hg.data_off); // same on-disk layout after a clean inflate
+    try expectPattern(fg.dev, hg.data_off, 24, 0xC3); // pixels survived the gzip round-trip
+}
+
+test "openGzip rejects a corrupt container with a typed error (no panic)" {
+    try testing.expectError(
+        error.ReadFailed,
+        Fits.openGzip(testing.allocator, "this is not a gzip stream, padded well past ten bytes", .{}),
+    );
+}
+
+test "saveGzipFile then openFile('.fits.gz') round-trips on disk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/img.fits.gz", .{tmp.sub_path});
+
+    {
+        var b = try newHandle(testing.allocator);
+        defer b.deinit(testing.allocator);
+        const h = try b.f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+        try writePattern(b.f.dev, h.data_off, 24, 0x5A);
+        try b.f.flush();
+        try b.f.saveGzipFile(path); // gzip-export the device bytes to a real .fits.gz
+    }
+
+    // openFile must sniff the .gz suffix, inflate transparently, and read the image back.
+    var fg = try Fits.openFile(testing.allocator, path, .read_only, .{});
+    defer fg.deinit();
+    const hg = try fg.select(1);
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, hg.axes);
+    try expectPattern(fg.dev, hg.data_off, 24, 0x5A);
+    // Creating into a .gz path is refused (build uncompressed, then saveGzipFile).
+    try testing.expectError(error.NotWritable, Fits.openFile(testing.allocator, path, .create, .{}));
 }
 
 

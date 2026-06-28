@@ -72,6 +72,10 @@ pub const ParseError = error{
     DuplicateSelector,
     /// Non-bracket junk after the final `]`.
     TrailingChars,
+    /// A `MAY`-but-unimplemented CFITSIO filter bracket (a row/column filter expression such as
+    /// `[col X > 5]` or `[#row < 3]`). Rejected explicitly rather than silently mis-parsed as an
+    /// `EXTNAME` (NFR-INTEROP-1).
+    UnsupportedFilter,
 } || Allocator.Error;
 
 /// A rectangular image section, **0-based and inclusive**, ready for `ImageView.readSection`
@@ -202,6 +206,11 @@ fn applyGroup(alloc: Allocator, spec: *FileSpec, content_raw: []const u8) ParseE
     const content = std.mem.trim(u8, content_raw, " ");
     if (content.len == 0) return error.EmptyBracket;
 
+    // Row/column filter expressions (FR-EFN-3/4, a `MAY` we do not implement) would otherwise fall
+    // through to `applyExtname` and be silently absorbed as a bogus `EXTNAME`. Detect their
+    // signatures up front and reject them with a typed error (NFR-INTEROP-1).
+    if (looksLikeFilter(content)) return error.UnsupportedFilter;
+
     var n: usize = 1;
     for (content) |c| {
         if (c == ',') n += 1;
@@ -331,6 +340,22 @@ fn hasHduSelector(spec: *const FileSpec) bool {
 
 fn hasColon(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, ':') != null;
+}
+
+// True for the CFITSIO row/column filter-bracket shapes we do not implement. The signatures are
+// disjoint from every supported group (HDU index, `EXTNAME[,EXTVER]`, image section): a leading
+// `#` introduces a row filter (`[#row < 3]`), and the relational/boolean operators below only ever
+// appear in a filter expression (`[col X > 5]`) — never in a valid extension name, version, or
+// pixel-section field. Pure-wildcard/numeric image sections (e.g. `[*,*]`, `[1:512,1:512]`) carry
+// none of these characters and so remain valid sections.
+fn looksLikeFilter(content: []const u8) bool {
+    if (content.len == 0) return false;
+    if (content[0] == '#') return true; // row filter
+    for (content) |c| switch (c) {
+        '<', '>', '=', '&', '|', '!' => return true,
+        else => {},
+    };
+    return false;
 }
 
 fn isInteger(s: []const u8) bool {
@@ -466,6 +491,29 @@ test "malformed brackets and unsupported constructs are typed errors" {
     try testing.expectError(error.DuplicateSelector, parse(testing.allocator, "a.fits[1][2]"));
     try testing.expectError(error.DuplicateSelector, parse(testing.allocator, "a.fits[SCI,1][2]"));
     try testing.expectError(error.DuplicateSelector, parse(testing.allocator, "a.fits[1:2][3:4]"));
+}
+
+test "CFITSIO filter brackets are UnsupportedFilter, not a mis-parsed EXTNAME" {
+    // A column filter expression and a row filter would previously be absorbed as an EXTNAME of
+    // "col X > 5" / "#row < 3"; they must now be rejected with a typed error.
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[col X > 5]"));
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[#row < 3]"));
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[FLUX > 0.5 && X < 10]"));
+
+    // Valid neighbours are unaffected: a plain EXTNAME, an EXTNAME+EXTVER, and pure-wildcard or
+    // numeric image sections remain supported (no filter operators present).
+    {
+        var spec = try parse(testing.allocator, "file.fits[SCI]");
+        defer spec.deinit(testing.allocator);
+        try testing.expectEqualStrings("SCI", spec.extname.?);
+    }
+    {
+        var spec = try parse(testing.allocator, "file.fits[*,*]");
+        defer spec.deinit(testing.allocator);
+        const sec = spec.section.?;
+        try testing.expectEqualSlices(u64, &.{ 0, 0 }, sec.lower);
+        try testing.expectEqualSlices(u64, &.{ open_end, open_end }, sec.upper);
+    }
 }
 
 test "parse failure leaks nothing (path/extname/section freed on error)" {

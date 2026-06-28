@@ -26,6 +26,9 @@ pub const cfitsioStatus = errors.cfitsioStatus;
 pub const Device = @import("io/device.zig").Device;
 pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 pub const FileDevice = @import("io/file.zig").FileDevice;
+/// Read-only `Device` over HTTP(S) Range GETs (FR-RMT-3). OS/network leaf; not in the
+/// freestanding graph.
+pub const HttpDevice = @import("io/http.zig").HttpDevice;
 pub const block = @import("io/block.zig");
 /// Sequential-stream + whole-file gzip backend helpers (FR-IO-3, FR-RMT-1).
 pub const stream = @import("io/stream.zig");
@@ -64,8 +67,11 @@ pub const HduKind = @import("hdu.zig").HduKind;
 pub const open = Fits.open;
 /// Create a new FITS file over a device.
 pub const create = Fits.create;
-/// Open an on-disk FITS file by path (the handle owns the device).
+/// Open an on-disk FITS file by path (the handle owns the device). A `*.gz` path is
+/// transparently decompressed (FR-RMT-2).
 pub const openFile = Fits.openFile;
+/// Open a whole-file gzip-compressed FITS image already in memory (FR-RMT-2).
+pub const openGzip = Fits.openGzip;
 /// Create a new on-disk FITS file by path.
 pub const createFile = Fits.createFile;
 
@@ -175,6 +181,7 @@ test {
     _ = @import("io/device.zig");
     _ = @import("io/memory.zig");
     _ = @import("io/file.zig");
+    _ = @import("io/http.zig");
     _ = @import("io/stream.zig");
     _ = @import("io/block.zig");
     _ = @import("header/name.zig");

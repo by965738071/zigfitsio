@@ -262,6 +262,24 @@ const Validator = struct {
                 complete = false;
                 continue;
             };
+            // TSCALn/TZEROn define a linear scale for the numeric codes only; on A (char), L
+            // (logical), or X (bit) columns they have no defined meaning (FITS 4.0 §7.3.2). Flag
+            // their presence as a warning rather than silently applying a no-op scale
+            // (btb-no-tscal-validation-on-alx).
+            switch (tf.type) {
+                .char, .logical, .bit => {
+                    var sbuf: [16]u8 = undefined;
+                    const scal_kw = std.fmt.bufPrint(&sbuf, "TSCAL{d}", .{n}) catch unreachable;
+                    if (hdu.header.has(scal_kw)) {
+                        try self.add(.warning, idx, scal_kw, "TSCALn has no defined meaning on an A/L/X-format column");
+                    }
+                    const zero_kw = std.fmt.bufPrint(&sbuf, "TZERO{d}", .{n}) catch unreachable;
+                    if (hdu.header.has(zero_kw)) {
+                        try self.add(.warning, idx, zero_kw, "TZEROn has no defined meaning on an A/L/X-format column");
+                    }
+                },
+                else => {},
+            }
             const fb = tf.fieldBytes() catch {
                 try self.add(.err, idx, kw, "TFORMn declares an invalid field width");
                 complete = false;
@@ -686,4 +704,75 @@ test "deinitFindings frees owned keyword strings with no leak" {
     try testing.expectEqualStrings("NAXIS3", findings.items[0].kw.?);
     try testing.expectEqual(@as(?[]const u8, null), findings.items[1].kw);
     deinitFindings(alloc, &findings); // testing.allocator asserts no leak
+}
+
+test "TSCAL/TZERO on an A/L/X column is a warning, not an error" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary
+
+    var h = Header.initEmpty();
+    {
+        errdefer h.deinit(alloc);
+        try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+        try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+        try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "NAXIS1", .{ .int = 6 }, null); // 4A + 1L + 1X(1byte) = 6
+        try h.appendValue(alloc, "NAXIS2", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "PCOUNT", .{ .int = 0 }, null);
+        try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "TFIELDS", .{ .int = 3 }, null);
+        try h.appendValue(alloc, "TFORM1", .{ .string = "4A" }, null);
+        try h.appendValue(alloc, "TZERO1", .{ .float = 10.0 }, null); // meaningless on A
+        try h.appendValue(alloc, "TFORM2", .{ .string = "1L" }, null);
+        try h.appendValue(alloc, "TSCAL2", .{ .float = 2.0 }, null); // meaningless on L
+        try h.appendValue(alloc, "TFORM3", .{ .string = "8X" }, null);
+        try h.appendValue(alloc, "TSCAL3", .{ .float = 3.0 }, null); // meaningless on X
+    }
+    _ = try f.appendHdu(h);
+    try f.flush();
+
+    var findings = try verify(alloc, &f);
+    defer deinitFindings(alloc, &findings);
+
+    // Warnings, never errors, and never on a numeric column.
+    try testing.expect(hasFinding(&findings, 2, .warning, "TZERO1"));
+    try testing.expect(hasFinding(&findings, 2, .warning, "TSCAL2"));
+    try testing.expect(hasFinding(&findings, 2, .warning, "TSCAL3"));
+    try testing.expectEqual(@as(usize, 0), countSeverity(&findings, .err));
+}
+
+test "block-aligned trailing special records yield no false-positive findings" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+
+    {
+        var f = try Fits.create(alloc, mem.device(), .{});
+        defer f.deinit();
+        _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+        try f.flush();
+
+        // Append one 2880-byte special-records block (§3.5): parses as a header (ends with END) but
+        // is not a valid extension, so the scanner stops there and the file stays block-aligned.
+        const eof = try f.dev.getSize();
+        var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+        const comment = "COMMENT trailing special records, not an HDU";
+        @memcpy(blk[0..comment.len], comment);
+        @memcpy(blk[80..83], "END");
+        try f.dev.writeAll(&blk, eof);
+    }
+
+    var f = try Fits.open(alloc, mem.device(), .read_only, .{});
+    defer f.deinit();
+    try testing.expectEqual(@as(usize, 1), try f.hduCount()); // records not counted as an HDU
+
+    var findings = try verify(alloc, &f);
+    defer deinitFindings(alloc, &findings);
+    // No block-sizing error (still a 2880 multiple) and no spurious HDU/data-extent finding.
+    try testing.expectEqual(@as(usize, 0), findings.items.len);
 }

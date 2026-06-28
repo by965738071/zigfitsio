@@ -1367,3 +1367,47 @@ test "HeapManager alloc/free/coalesce bookkeeping" {
     // Overflow guard.
     try testing.expectError(error.HeapOverflow, mgr.alloc(1000));
 }
+
+test "a typeless P descriptor column (1P, no element type) is BadTform" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // `1P` parses as a `P` descriptor with no element type; following it into the heap cannot know
+    // the payload type, so `VlaSpec.of` (via `readVlaCell`) must reject it with `error.BadTform`
+    // rather than guess.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1P", 1, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    try testing.expectError(error.BadTform, readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32));
+}
+
+test "read-only handle rejects all heap writes (NotWritable)" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+
+    // Build a valid VLA table, flush it, then reopen read-only. Every write entry point
+    // (`setDescriptor`, `writeVlaCell`, `freeVlaCell`) must refuse the read-only handle before
+    // touching the device.
+    {
+        var f = try Fits.create(alloc, mem.device(), .{});
+        defer f.deinit();
+        _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary
+        const h = try vlaHeader(alloc, "1PJ", 1, 64, .{});
+        _ = try f.appendHdu(h);
+        try f.flush();
+    }
+
+    var f = try Fits.open(alloc, mem.device(), .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try testing.expectError(error.NotWritable, setDescriptor(&t, .{ .index = 0 }, 0, .{ .len = 1, .off = 0 }));
+    try testing.expectError(error.NotWritable, writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2, 3 }));
+    try testing.expectError(error.NotWritable, freeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0));
+}

@@ -132,3 +132,15 @@ test "file device create→write→reopen→read round-trip; read-only rejects w
         try testing.expectEqual(@as(u64, 2880), try dev.getSize());
     }
 }
+
+test "opening a missing path is error.ReadFailed (and leaks nothing)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A read-only open of a path that does not exist must surface the typed I/O error rather than
+    // a panic, and the half-built `FileDevice` must be freed (errdefer covers the allocation).
+    try testing.expectError(
+        error.ReadFailed,
+        FileDevice.open(testing.allocator, tmp.dir, "does-not-exist.fits", .read_only),
+    );
+}

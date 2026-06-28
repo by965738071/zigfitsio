@@ -11,6 +11,7 @@ const std = @import("std");
 const IoError = @import("../errors.zig").IoError;
 const LimitError = @import("../errors.zig").LimitError;
 const MemoryDevice = @import("memory.zig").MemoryDevice;
+const Device = @import("device.zig").Device;
 
 /// Read every remaining byte of a sequential `reader` into a fresh in-memory `Device`,
 /// bounded by `max_bytes` (NFR-SAFE-1). The returned `MemoryDevice` owns its buffer; call
@@ -109,6 +110,44 @@ pub fn compressToGzip(
     compress.writer.writeAll(bytes) catch return error.WriteFailed;
     compress.finish() catch return error.WriteFailed; // drains the body + writes the footer
     writer.flush() catch return error.WriteFailed; // push the assembled stream to the real sink
+}
+
+// --- Fits-facing whole-file gzip open/save (FR-RMT-2) ----------------------------------------
+
+/// Inflate in-memory whole-file gzip bytes (`compressed`) into a fresh seekable `MemoryDevice` —
+/// the random-access form the upper FITS layers require (§8.1, FR-RMT-2). This is the wiring used
+/// by `Fits.openGzip`: a corrupt or truncated container is mapped to `error.ReadFailed` so callers
+/// receive a typed `IoError` instead of the codec-local `GzipError`. The *decompressed* size is
+/// bounded by `max_bytes` (NFR-SAFE-1). The returned device owns its buffer; call `deinit`.
+pub fn inflateGzipToDevice(
+    allocator: std.mem.Allocator,
+    compressed: []const u8,
+    max_bytes: u64,
+) (IoError || LimitError || std.mem.Allocator.Error)!MemoryDevice {
+    var reader = std.Io.Reader.fixed(compressed);
+    return materializeGzip(allocator, &reader, max_bytes) catch |err| switch (err) {
+        error.Corrupt => error.ReadFailed,
+        else => |e| e,
+    };
+}
+
+/// Gzip-compress every byte of `src` (a random-access `Device`) into `writer`, producing a
+/// whole-file gzip container (the export side of FR-RMT-2, used by `Fits.saveGzipFile`). The whole
+/// device is read into a bounded scratch buffer (`max_bytes`, NFR-SAFE-1) and handed to
+/// `compressToGzip`. `writer` must be a buffered sink (see `compressToGzip`).
+pub fn compressDeviceToGzip(
+    allocator: std.mem.Allocator,
+    src: Device,
+    writer: *std.Io.Writer,
+    max_bytes: u64,
+) (IoError || LimitError || std.mem.Allocator.Error)!void {
+    const size64 = try src.getSize();
+    if (size64 > max_bytes) return error.LimitExceeded;
+    const size: usize = @intCast(size64);
+    const buf = try allocator.alloc(u8, size);
+    defer allocator.free(buf);
+    try src.readAll(buf, 0); // a zero-length read is a no-op
+    try compressToGzip(allocator, writer, buf);
 }
 
 const testing = std.testing;
@@ -231,4 +270,37 @@ test "gzip round-trips an empty payload" {
     var mem = try materializeGzip(testing.allocator, &reader, 1 << 20);
     defer mem.deinit();
     try testing.expectEqual(@as(u64, 0), try mem.device().getSize());
+}
+
+test "compressDeviceToGzip + inflateGzipToDevice round-trip a Device end to end" {
+    var src = MemoryDevice.init(testing.allocator);
+    defer src.deinit();
+    const payload = "SIMPLE  =                    T" ** 24 ++ ("\x00" ** 1024);
+    try src.device().writeAll(payload, 0);
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer aw.deinit();
+    try compressDeviceToGzip(testing.allocator, src.device(), &aw.writer, 1 << 20);
+    try testing.expect(aw.written().len < payload.len); // the repetitive payload actually shrank
+
+    var dev = try inflateGzipToDevice(testing.allocator, aw.written(), 1 << 20);
+    defer dev.deinit();
+    try testing.expectEqualSlices(u8, src.bytes(), dev.bytes());
+}
+
+test "inflateGzipToDevice maps a corrupt container to a typed ReadFailed" {
+    try testing.expectError(
+        error.ReadFailed,
+        inflateGzipToDevice(testing.allocator, "plainly not a gzip stream, padded past ten bytes", 1 << 20),
+    );
+}
+
+test "inflateGzipToDevice enforces the decompressed-size ceiling" {
+    const plain = [_]u8{0} ** 8192;
+    const compressed = try gzipToOwned(&plain);
+    defer testing.allocator.free(compressed);
+    try testing.expectError(
+        error.LimitExceeded,
+        inflateGzipToDevice(testing.allocator, compressed, 1024),
+    );
 }

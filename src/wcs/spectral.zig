@@ -219,6 +219,26 @@ test "spectral type and frame recognition" {
     try testing.expectEqual(RefFrame.unknown, RefFrame.parse("NOPE"));
 }
 
+test "pixelAt with zero cdelt is NonInvertible" {
+    // A degenerate spectral axis (CDELT=0) maps every pixel to the same value, so the inverse
+    // pixel-from-value map has no solution and must surface error.NonInvertible rather than divide
+    // by zero. The forward valueAt is still well-defined (the constant CRVAL).
+    var p = try headerFrom(testing.allocator, &.{
+        "WCSAXES =                    1",
+        "CTYPE1  = 'FREQ'",
+        "CRPIX1  =                  1.0",
+        "CRVAL1  =                  5.0",
+        "CDELT1  =                  0.0",
+    });
+    defer cleanup(testing.allocator, p);
+    var s = try Spectral.fromHeader(testing.allocator, &p.h);
+    defer s.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(f64, 0), s.cdelt);
+    try testing.expectError(error.NonInvertible, s.pixelAt(5.0));
+    try testing.expectEqual(@as(f64, 5.0), s.valueAt(42.0)); // forward map stays constant
+}
+
 test "no spectral axis is BadWcs" {
     var p = try headerFrom(testing.allocator, &.{
         "WCSAXES =                    2",

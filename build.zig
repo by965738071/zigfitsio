@@ -35,6 +35,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the unit/integration test suite");
     test_step.dependOn(&run_tests.step);
 
+    // The on-disk sample-corpus harness (NFR-TEST-2) lives under `test/` (outside the module
+    // path), so it is its own test artifact importing the public `zigfitsio` module. It reads
+    // the committed `test/corpus/*.fits` files from the build root and asserts header + data
+    // round-trip through `openFile`. Wired into `test` so the single command covers it.
+    const corpus_mod = b.createModule(.{
+        .root_source_file = b.path("test/corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    corpus_mod.addImport("zigfitsio", mod);
+    const corpus_tests = b.addTest(.{ .root_module = corpus_mod });
+    const run_corpus = b.addRunArtifact(corpus_tests);
+    test_step.dependOn(&run_corpus.step);
+
     // `zig build bench` — throughput benchmarks against the ~2× CFITSIO goal (X-BENCH).
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench.zig"),

@@ -1335,6 +1335,79 @@ test "integer TNULL read/write with sentinel" {
     try testing.expectEqualSlices(i32, &[_]i32{ 5, 999, 7 }, &out);
 }
 
+test "unsigned u32 over 1J via integer-space TZERO=2^31" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+    const two31: f64 = 2147483648.0; // 2^31
+    const specs = [_]ColSpec{.{ .tform = "1J", .ttype = "U32", .tzero = two31 }};
+    const hdu = try buildBinTable(&f, alloc, &specs, 3, null);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+
+    const two31_int: u32 = @as(u32, 1) << 31;
+    const umax32: u32 = std.math.maxInt(u32);
+    try t.writeColumn(u32, .{ .index = 0 }, 0, &[_]u32{ 0, two31_int, umax32 }, .{});
+    // Stored i32 spans the full signed range (0→min, 2^31→0, 2^32-1→max); reading back over u32
+    // is the round-trip we assert.
+    var out: [3]u32 = undefined;
+    try t.readColumn(u32, .{ .index = 0 }, 0, &out, .{});
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, two31_int, umax32 }, &out);
+}
+
+test "signed i8 over 1B via integer-space TZERO=-128" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+    const specs = [_]ColSpec{.{ .tform = "1B", .ttype = "I8", .tzero = -128.0 }};
+    const hdu = try buildBinTable(&f, alloc, &specs, 3, null);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+
+    try t.writeColumn(i8, .{ .index = 0 }, 0, &[_]i8{ -128, 0, 127 }, .{});
+    // Stored u8 spans the full unsigned range (-128→0, 0→128, 127→255).
+    var raw: [3]u8 = undefined;
+    try f.dev.readAll(&raw, hdu.data_off);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 128, 255 }, &raw);
+
+    var out: [3]i8 = undefined;
+    try t.readColumn(i8, .{ .index = 0 }, 0, &out, .{});
+    try testing.expectEqualSlices(i8, &[_]i8{ -128, 0, 127 }, &out);
+}
+
+test "1B column with TNULL sentinel round-trips" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+
+    // A `B` (u8-stored) column whose null is 255, read over i16 so the sentinel fits.
+    const specs = [_]ColSpec{.{ .tform = "1B", .ttype = "V", .tnull = 255 }};
+    const hdu = try buildBinTable(&f, alloc, &specs, 3, null);
+    var t = try BinTable.of(&f, hdu);
+    defer t.deinit(alloc);
+
+    try t.writeColumn(i16, .{ .index = 0 }, 0, &[_]i16{ 5, 999, 7 }, .{ .null_sentinel = 999 });
+    // The sentinel stored as TNULL (255) is visible without a read sentinel.
+    var raw: [3]i16 = undefined;
+    try t.readColumn(i16, .{ .index = 0 }, 0, &raw, .{});
+    try testing.expectEqual(@as(i16, 255), raw[1]);
+
+    var out: [3]i16 = undefined;
+    try t.readColumn(i16, .{ .index = 0 }, 0, &out, .{ .null_sentinel = 999 });
+    try testing.expectEqualSlices(i16, &[_]i16{ 5, 999, 7 }, &out);
+}
+
 test "FR-CONV-1: single-cell precision-losing read errors, column read does not" {
     const alloc = testing.allocator;
     var mem = MemoryDevice.init(alloc);
