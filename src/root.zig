@@ -112,6 +112,7 @@ test {
     _ = @import("header/value.zig");
     _ = @import("header/card.zig");
     _ = @import("header/header.zig");
+    _ = @import("header/continue.zig");
     _ = @import("hdu.zig");
     _ = @import("fits.zig");
     _ = @import("image.zig");

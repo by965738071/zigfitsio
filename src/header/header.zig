@@ -182,6 +182,77 @@ pub const Header = struct {
         try self.cards.append(alloc, try Card.parse(&raw));
     }
 
+    /// Index of the `END` card, if present (edits insert before it).
+    fn endIndex(self: *const Header) ?usize {
+        for (self.cards.items, 0..) |*c, i| if (c.kind == .end) return i;
+        return null;
+    }
+
+    /// Update keyword `name`'s value (and comment): replace it in place if present, else insert
+    /// a new value card just before `END` — create-if-absent (FR-HDR-11). When `comment_text`
+    /// is null and the keyword exists, its current comment is preserved.
+    pub fn update(self: *Header, alloc: Allocator, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
+        if (self.findFirst(name)) |i| {
+            const keep = comment_text orelse value.parseComment(self.cards.items[i].valueField());
+            self.cards.items[i] = try Card.buildValue(name, v, keep);
+        } else {
+            const card = try Card.buildValue(name, v, comment_text);
+            // Prefer filling a reserved blank card in place (FR-HDR-12) over inserting, so the
+            // following HDUs need not shift.
+            if (self.firstBlankBeforeEnd()) |bi| {
+                self.cards.items[bi] = card;
+            } else {
+                try self.cards.insert(alloc, self.endIndex() orelse self.cards.items.len, card);
+            }
+        }
+    }
+
+    fn firstBlankBeforeEnd(self: *const Header) ?usize {
+        for (self.cards.items, 0..) |*c, i| {
+            if (c.kind == .end) return null;
+            if (c.kind == .blank) return i;
+        }
+        return null;
+    }
+
+    /// Replace an existing keyword's value in place, preserving its position (FR-HDR-11
+    /// modify-in-place). `error.KeywordNotFound` if absent.
+    pub fn modify(self: *Header, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || ValueError)!void {
+        const i = self.findFirst(name) orelse return error.KeywordNotFound;
+        const keep = comment_text orelse value.parseComment(self.cards.items[i].valueField());
+        self.cards.items[i] = try Card.buildValue(name, v, keep);
+    }
+
+    /// Insert a pre-built card at position `index` (0-based).
+    pub fn insert(self: *Header, alloc: Allocator, index: usize, card: Card) Allocator.Error!void {
+        try self.cards.insert(alloc, index, card);
+    }
+
+    /// Delete the first card named `name`. `error.KeywordNotFound` if absent.
+    pub fn delete(self: *Header, name: []const u8) ValueError!void {
+        const i = self.findFirst(name) orelse return error.KeywordNotFound;
+        _ = self.cards.orderedRemove(i);
+    }
+
+    /// Rename keyword `old` to `new`, preserving its value/comment and position. The new name
+    /// is normalized and validated (`error.BadKeywordName` on a bad alphabet).
+    pub fn rename(self: *Header, old: []const u8, new: []const u8) (ValueError || HeaderError)!void {
+        const i = self.findFirst(old) orelse return error.KeywordNotFound;
+        const new_name = try Name.parse(new);
+        var raw = self.cards.items[i].raw;
+        @memcpy(raw[0..8], &new_name.bytes);
+        self.cards.items[i] = try Card.parse(&raw);
+    }
+
+    /// Reserve `n` blank cards just before `END` so later `update` calls can fill them in
+    /// place without rewriting following HDUs (FR-HDR-12, header-space pre-allocation).
+    pub fn reserveSpace(self: *Header, alloc: Allocator, n: usize) (HeaderError || Allocator.Error)!void {
+        const pos = self.endIndex() orelse self.cards.items.len;
+        const blank: [80]u8 = [_]u8{' '} ** 80;
+        var k: usize = 0;
+        while (k < n) : (k += 1) try self.cards.insert(alloc, pos, try Card.parse(&blank));
+    }
+
     /// Serialize all cards into `writer` (80 bytes each), padding the header unit to a block
     /// boundary with spaces (FR-IO-2). The header must already contain an `END` card.
     pub fn writeTo(self: *const Header, writer: *block.BlockWriter) errors.IoError!void {
@@ -292,4 +363,49 @@ test "build, ensureEnd, write, and re-parse round-trips" {
     try testing.expectEqual(true, try h2.getValue(bool, "SIMPLE"));
     try testing.expectEqual(@as(u8, 8), try h2.getValue(u8, "BITPIX"));
     try testing.expectEqual(@as(u16, 0), try h2.getValue(u16, "NAXIS"));
+}
+
+test "edit ops: update/modify/insert/delete/rename preserve order and index" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendValue(testing.allocator, "SIMPLE", .{ .logical = true }, null);
+    try h.appendValue(testing.allocator, "BITPIX", .{ .int = 8 }, "bits");
+    try h.appendValue(testing.allocator, "NAXIS", .{ .int = 0 }, null);
+    try h.ensureEnd(testing.allocator);
+    const n0 = h.count();
+
+    // update existing in place (preserve comment when null), and create-if-absent before END.
+    try h.update(testing.allocator, "BITPIX", .{ .int = 16 }, null);
+    try testing.expectEqual(@as(i64, 16), try h.getValue(i64, "BITPIX"));
+    try testing.expectEqualStrings("bits", h.comment("BITPIX").?); // comment preserved
+    try h.update(testing.allocator, "EXTEND", .{ .logical = true }, "new");
+    try testing.expectEqual(n0 + 1, h.count());
+    try testing.expectEqual(true, try h.getValue(bool, "EXTEND"));
+    try testing.expect(h.at(h.count() - 1).kind == .end); // END still last
+
+    // modify requires existence.
+    try testing.expectError(error.KeywordNotFound, h.modify("MISSING", .{ .int = 1 }, null));
+    try h.modify("NAXIS", .{ .int = 2 }, "axes");
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "NAXIS"));
+
+    // rename and delete.
+    try h.rename("EXTEND", "GROUPS");
+    try testing.expect(!h.has("EXTEND"));
+    try testing.expectEqual(true, try h.getValue(bool, "GROUPS"));
+    try h.delete("GROUPS");
+    try testing.expect(!h.has("GROUPS"));
+    try testing.expectError(error.KeywordNotFound, h.delete("GROUPS"));
+}
+
+test "reserveSpace inserts blank cards before END for in-place fill (FR-HDR-12)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendValue(testing.allocator, "SIMPLE", .{ .logical = true }, null);
+    try h.ensureEnd(testing.allocator);
+    try h.reserveSpace(testing.allocator, 5);
+    try testing.expect(h.at(h.count() - 1).kind == .end); // END remains last
+    // Filling a keyword uses a reserved slot without growing past the reserved block.
+    const before = h.count();
+    try h.update(testing.allocator, "BITPIX", .{ .int = 8 }, null);
+    try testing.expectEqual(before, h.count()); // filled a blank, no net growth
 }
