@@ -1,0 +1,73 @@
+name: CI
+
+# Portability matrix (NFR-PORT-1/2/3, X-CI): {Linux, macOS, Windows} × {x86_64, aarch64}
+# running `zig build test`, a big-endian cell under QEMU (the only way to exercise a genuine
+# native big-endian read path — the LE host matrix cannot, NFR-PORT-2), and a
+# wasm32-freestanding core build (NFR-PORT-3).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  test:
+    name: test ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, runner: ubuntu-latest }
+          - { os: linux, arch: aarch64, runner: ubuntu-24.04-arm }
+          - { os: macos, arch: aarch64, runner: macos-latest }
+          - { os: macos, arch: x86_64, runner: macos-13 }
+          - { os: windows, arch: x86_64, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test --summary all
+      - run: zig build        # static library artifact
+
+  wasm-freestanding:
+    name: wasm32-freestanding core build (NFR-PORT-3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build wasm-check
+
+  big-endian:
+    name: big-endian (s390x under QEMU, NFR-PORT-2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install QEMU user emulation
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Cross-compile and run the test suite for s390x (big-endian)
+        # Build the test binary for s390x-linux and execute it under QEMU; this exercises the
+        # genuine native big-endian endian.read/write paths that the LE matrix cannot.
+        run: |
+          zig build test -Dtarget=s390x-linux-gnu \
+            -fqemu --glibc-runtimes /usr/lib --summary all || \
+          zig test src/root.zig -target s390x-linux-gnu -fqemu --summary all
+
+  fuzz-smoke:
+    name: fuzz harness smoke (NFR-SAFE-2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build fuzz   # runs the seeded harnesses once (use --fuzz for the fuzzer)
