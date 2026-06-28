@@ -69,6 +69,20 @@ pub const ImageView = image_mod.ImageView;
 /// Linear scaling state (BSCALE/BZERO/BLANK).
 pub const Scaling = image_mod.Scaling;
 
+// ── Tables (§12–§14) ───────────────────────────────────────────────────────────────────
+/// Binary-table column view (FR-BTB-*).
+pub const BinTable = @import("table/binary.zig").BinTable;
+/// ASCII-table column view (FR-ATB-*).
+pub const AsciiTable = @import("table/ascii.zig").AsciiTable;
+/// Column reference (by index or name) shared by the table views.
+pub const ColumnRef = @import("table/binary.zig").ColumnRef;
+/// Variable-length-array heap access (FR-VLA-*).
+pub const heap = @import("table/heap.zig");
+
+// ── Data integrity (§16) ───────────────────────────────────────────────────────────────
+/// DATASUM/CHECKSUM computation and verification (FR-SUM-*).
+pub const checksum = @import("checksum.zig");
+
 // ── World Coordinate System (§18) ──────────────────────────────────────────────────────
 /// The WCS keyword set parse/serialize (FR-WCS-1).
 pub const Wcs = @import("wcs/keys.zig").Wcs;
@@ -106,6 +120,10 @@ test {
     _ = @import("compress/shuffle.zig");
     _ = @import("compress/gzip.zig");
     _ = @import("table/common.zig");
+    _ = @import("table/binary.zig");
+    _ = @import("table/ascii.zig");
+    _ = @import("table/heap.zig");
+    _ = @import("checksum.zig");
 }
 
 test "version is non-empty" {
