@@ -22,6 +22,12 @@ pub const errorText = version_mod.errorText;
 /// Map an `Error` to the nearest CFITSIO numeric status code (FR-ERR-4).
 pub const cfitsioStatus = errors.cfitsioStatus;
 
+// ── I/O layer (§8) ─────────────────────────────────────────────────────────────────────
+pub const Device = @import("io/device.zig").Device;
+pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
+pub const FileDevice = @import("io/file.zig").FileDevice;
+pub const block = @import("io/block.zig");
+
 test {
     // Pull every module's tests into the suite (`zig build test`). Each module is listed
     // explicitly: `_ = @import(...)` makes its tests reachable from the root. New modules
@@ -32,6 +38,11 @@ test {
     _ = @import("limits.zig");
     _ = @import("endian.zig");
     _ = @import("convert.zig");
+    _ = @import("io/device.zig");
+    _ = @import("io/memory.zig");
+    _ = @import("io/file.zig");
+    _ = @import("io/stream.zig");
+    _ = @import("io/block.zig");
 }
 
 test "version is non-empty" {
