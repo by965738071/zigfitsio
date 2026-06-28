@@ -27,6 +27,8 @@ pub const Device = @import("io/device.zig").Device;
 pub const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 pub const FileDevice = @import("io/file.zig").FileDevice;
 pub const block = @import("io/block.zig");
+/// Sequential-stream + whole-file gzip backend helpers (FR-IO-3, FR-RMT-1).
+pub const stream = @import("io/stream.zig");
 
 // ── Header layer (§9) ──────────────────────────────────────────────────────────────────
 /// Wildcard match accumulator with the explicit multi-match contract (FR-UTL-4).
@@ -90,8 +92,23 @@ pub const RandomGroups = @import("groups.zig").RandomGroups;
 pub const checksum = @import("checksum.zig");
 
 // ── Tiled compression (§17) ────────────────────────────────────────────────────────────
+const tiled_mod = @import("compress/tiled.zig");
 /// Tiled-compressed-image read view (FR-CMP-1/2).
-pub const TiledImage = @import("compress/tiled.zig").TiledImage;
+pub const TiledImage = tiled_mod.TiledImage;
+/// Build a tiled-compressed image HDU (FR-CMP-4): GZIP write incl. float dithering.
+pub const writeCompressed = tiled_mod.writeCompressed;
+/// Specification for `writeCompressed` (codec/tiling/quantization).
+pub const CompressSpec = tiled_mod.CompressSpec;
+/// Tile-compressed-table (`ZTABLE=T`) read view (FR-CMP-5).
+pub const TileTable = tiled_mod.TileTable;
+/// RICE_1 integer tile codec (FR-CMP-3, §10.4.1).
+pub const rice = @import("compress/rice.zig");
+/// PLIO_1 run-length mask codec (FR-CMP-3, §10.4.3).
+pub const plio = @import("compress/plio.zig");
+/// HCOMPRESS_1 codec (FR-CMP-3, §10.4.4).
+pub const hcompress = @import("compress/hcompress.zig");
+/// Subtractive dithering + the FITS random generator (FR-CMP-4, §10.2).
+pub const dither = @import("compress/dither.zig");
 
 // ── Iterator (§19.2) ───────────────────────────────────────────────────────────────────
 /// High-level work-function iterator over columns/pixels (FR-ITR-*).
@@ -116,6 +133,31 @@ pub const TimeCoords = @import("wcs/time.zig").TimeCoords;
 pub const DateTime = @import("wcs/time.zig").DateTime;
 /// Shared table column model: TFORM/TDISP parsing (FR-UTL-2).
 pub const table_common = @import("table/common.zig");
+
+// ── Extended filenames (§20.1) ─────────────────────────────────────────────────────────
+const filename_mod = @import("filename.zig");
+/// Parsed/programmatic file selection: path + HDU + image section (FR-EFN-1..5).
+pub const FileSpec = filename_mod.FileSpec;
+/// A 0-based inclusive image section (maps to `ImageView.readSection`).
+pub const Section = filename_mod.Section;
+/// Parse a CFITSIO-style extended filename into a `FileSpec`.
+pub const parseFileSpec = filename_mod.parse;
+/// Build a `FileSpec` programmatically (the non-DSL path, FR-EFN-5).
+pub const buildFileSpec = filename_mod.build;
+
+// ── ASCII header templates (§20.3) ─────────────────────────────────────────────────────
+const template_mod = @import("template.zig");
+/// Build a FITS file from a CFITSIO-style ASCII header template (FR-TPL-1).
+pub const buildFromTemplate = template_mod.buildFromTemplate;
+/// Options for the template loader.
+pub const TemplateOpts = template_mod.TemplateOpts;
+
+// ── Hierarchical grouping tables (§20.4) ───────────────────────────────────────────────
+const group_table_mod = @import("group_table.zig");
+/// Read/edit FITS grouping BINTABLEs and resolve membership (FR-GRP-1/2).
+pub const GroupTable = group_table_mod.GroupTable;
+/// Grouping-table convenience namespace (link helpers, `groupsOf`).
+pub const group_table = group_table_mod;
 
 test {
     // Pull every module's tests into the suite (`zig build test`). Each module is listed
@@ -156,6 +198,13 @@ test {
     _ = @import("iterator.zig");
     _ = @import("validate.zig");
     _ = @import("compress/tiled.zig");
+    _ = @import("compress/rice.zig");
+    _ = @import("compress/plio.zig");
+    _ = @import("compress/hcompress.zig");
+    _ = @import("compress/dither.zig");
+    _ = @import("filename.zig");
+    _ = @import("template.zig");
+    _ = @import("group_table.zig");
 }
 
 test "version is non-empty" {
