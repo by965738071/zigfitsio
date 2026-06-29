@@ -40,8 +40,18 @@ pub const Matches = struct {
     buf: [MAX_MATCHES]u32 = undefined,
     /// Number of valid entries in `buf`.
     len: usize = 0,
-    /// Set `true` when more matches existed than fit in `buf` (the list was truncated).
+    /// Set `true` when more matches existed than fit (the list was truncated at `cap`).
     overflow: bool = false,
+    /// Effective ceiling on the accumulated count (≤ `MAX_MATCHES`). Defaults to the full inline
+    /// capacity; set from a handle's `Limits.max_matches` via `withLimit` to enforce a lower
+    /// runtime ceiling (FR-UTL-4 / NFR-SAFE-1).
+    cap: u32 = MAX_MATCHES,
+
+    /// A `Matches` whose effective ceiling is the handle's `Limits.max_matches` (clamped to the
+    /// comptime inline capacity, so it is always safe to index `buf`).
+    pub fn withLimit(lim: limits.Limits) Matches {
+        return .{ .cap = @min(lim.max_matches, @as(u32, MAX_MATCHES)) };
+    }
 
     /// The ordered list of matched indices accumulated so far.
     pub fn slice(self: *const Matches) []const u32 {
@@ -56,7 +66,9 @@ pub const Matches = struct {
     /// Append `idx` to the list, preserving insertion order. If the buffer is full the index
     /// is dropped and `overflow` is set `true`; existing entries are never disturbed.
     pub fn add(self: *Matches, idx: u32) void {
-        if (self.len >= MAX_MATCHES) {
+        // Bound by the runtime ceiling `cap` (≤ MAX_MATCHES); `@min` is belt-and-suspenders so a
+        // stale/over-large `cap` can never index past the inline buffer.
+        if (self.len >= @min(self.cap, @as(u32, MAX_MATCHES))) {
             self.overflow = true;
             return;
         }
@@ -230,6 +242,19 @@ test "Matches: overflow set past MAX_MATCHES, earlier entries intact" {
     try testing.expectEqual(MAX_MATCHES, m.len); // length did not grow
     try testing.expectEqual(@as(u32, 0), m.at(0)); // earliest entry untouched
     try testing.expectEqual(@as(u32, MAX_MATCHES - 1), m.at(MAX_MATCHES - 1));
+}
+
+test "Matches.withLimit enforces a lowered runtime ceiling (max_matches)" {
+    // Regression: Limits.max_matches was never read, so a lowered ceiling had no effect.
+    var m = Matches.withLimit(.{ .max_matches = 8 });
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) m.add(i);
+    try testing.expectEqual(@as(usize, 8), m.len); // capped at the configured ceiling
+    try testing.expect(m.overflow);
+    try testing.expectEqual(@as(u32, 7), m.at(7)); // first 8 retained in order
+    // An over-large override is clamped to the comptime inline capacity (no OOB).
+    const big = Matches.withLimit(.{ .max_matches = 1_000_000 });
+    try testing.expectEqual(@as(u32, MAX_MATCHES), big.cap);
 }
 
 test "Name.parse normalizes case and pads, text trims" {

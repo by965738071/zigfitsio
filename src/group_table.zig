@@ -171,15 +171,11 @@ pub const GroupTable = struct {
         _ = try fits.hduCount(); // membership only resolves against a fully-scanned file
 
         // An inter-file member (non-blank MEMBER_LOCATION) lives in another file; following it is
-        // out of scope here, so never let MEMBER_POSITION/EXTNAME resolve it against the local file.
+        // out of scope here, so never let MEMBER_POSITION/EXTNAME resolve it against the local
+        // file. The cell is inspected at ANY column width — a MEMBER_LOCATION wider than a stack
+        // buffer must not be skipped (that silently mis-resolved an inter-file row to a local HDU).
         if (self.col_location) |ci| {
-            const col = &self.table.columns[ci];
-            const w: usize = @intCast(col.tform.repeat);
-            var lbuf: [256]u8 = undefined;
-            if (w > 0 and w <= lbuf.len) {
-                try self.table.readColumn(u8, .{ .index = ci }, row, lbuf[0..w], .{});
-                if (std.mem.trimEnd(u8, lbuf[0..w], " ").len > 0) return null;
-            }
+            if (try self.cellNonBlank(ci, row)) return null;
         }
 
         if (self.col_position) |ci| {
@@ -189,19 +185,33 @@ pub const GroupTable = struct {
             }
         }
         if (self.col_name) |ci| {
-            const col = &self.table.columns[ci];
-            const w: usize = @intCast(col.tform.repeat);
-            var nbuf: [256]u8 = undefined;
-            if (w > 0 and w <= nbuf.len) {
-                try self.table.readColumn(u8, .{ .index = ci }, row, nbuf[0..w], .{});
-                const nm = std.mem.trimEnd(u8, nbuf[0..w], " ");
-                if (nm.len > 0) {
-                    const ver: i64 = if (self.col_version) |vi| try self.readIntCell(vi, row) else 1;
-                    return matchByNameVer(fits, nm, ver);
-                }
+            const alloc = self.table.fits.alloc;
+            const nm = try self.readStrCell(alloc, ci, row); // handles any column width
+            defer alloc.free(nm);
+            if (nm.len > 0) {
+                const ver: i64 = if (self.col_version) |vi| try self.readIntCell(vi, row) else 1;
+                return matchByNameVer(fits, nm, ver);
             }
         }
         return null;
+    }
+
+    // True if the cell at (col_idx, row) has any non-blank content, inspected at the column's full
+    // width: a stack buffer for the common case, the handle allocator for wider columns.
+    fn cellNonBlank(self: *GroupTable, col_idx: u16, row: u64) GroupError!bool {
+        const col = &self.table.columns[col_idx];
+        const w: usize = @intCast(col.tform.repeat);
+        if (w == 0) return false;
+        var stack: [256]u8 = undefined;
+        if (w <= stack.len) {
+            try self.table.readColumn(u8, .{ .index = col_idx }, row, stack[0..w], .{});
+            return std.mem.trimEnd(u8, stack[0..w], " ").len > 0;
+        }
+        const alloc = self.table.fits.alloc;
+        const buf = try alloc.alloc(u8, w);
+        defer alloc.free(buf);
+        try self.table.readColumn(u8, .{ .index = col_idx }, row, buf, .{});
+        return std.mem.trimEnd(u8, buf, " ").len > 0;
     }
 
     /// Resolve every member row to a `*Hdu`, returning an owned slice (caller frees) of the
@@ -633,6 +643,48 @@ test "resolveMember returns null for a non-blank MEMBER_LOCATION (inter-file) ro
     try testing.expectEqual(@as(?*Hdu, null), try grp.resolveMember(0));
 
     // Clearing MEMBER_LOCATION re-enables local resolution by position.
+    try grp.writeStrCell(grp.col_location.?, 0, "");
+    try testing.expectEqual(@as(?*Hdu, f.hdus.items[1]), try grp.resolveMember(0));
+}
+
+test "resolveMember inspects a MEMBER_LOCATION wider than the stack buffer (no mis-resolve)" {
+    const alloc = testing.allocator;
+    var b = try newHandle(alloc);
+    defer b.deinit(alloc);
+    const f = &b.f;
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // HDU1 primary
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{3} }); // HDU2 (a valid local target)
+
+    // A grouping BINTABLE whose MEMBER_LOCATION column is 300A — wider than the 256-byte stack
+    // buffer the guard used to use (anything wider was skipped → silently mis-resolved locally).
+    var h = Header.initEmpty();
+    {
+        errdefer h.deinit(alloc);
+        try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+        try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+        try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "NAXIS1", .{ .int = 304 }, null); // 1J (4) + 300A
+        try h.appendValue(alloc, "NAXIS2", .{ .int = 0 }, null);
+        try h.appendValue(alloc, "PCOUNT", .{ .int = 0 }, null);
+        try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "TFIELDS", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "TFORM1", .{ .string = "1J" }, null);
+        try h.appendValue(alloc, "TTYPE1", .{ .string = "MEMBER_POSITION" }, null);
+        try h.appendValue(alloc, "TFORM2", .{ .string = "300A" }, null);
+        try h.appendValue(alloc, "TTYPE2", .{ .string = "MEMBER_LOCATION" }, null);
+    }
+    const hdu = try f.appendHdu(h);
+    var grp = try GroupTable.of(f, hdu);
+    defer grp.deinit(alloc);
+    try grp.table.appendRows(1);
+
+    // Valid local position (2) but a non-blank 300-wide MEMBER_LOCATION ⇒ inter-file ⇒ null.
+    try grp.writeIntCell(grp.col_position.?, 0, 2);
+    try grp.writeStrCell(grp.col_location.?, 0, "file://somewhere/very/long/path/to/another/elsewhere.fits");
+    try testing.expectEqual(@as(?*Hdu, null), try grp.resolveMember(0));
+
+    // Clearing it re-enables local resolution by position.
     try grp.writeStrCell(grp.col_location.?, 0, "");
     try testing.expectEqual(@as(?*Hdu, f.hdus.items[1]), try grp.resolveMember(0));
 }

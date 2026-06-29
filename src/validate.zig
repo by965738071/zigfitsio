@@ -369,7 +369,14 @@ const Validator = struct {
     fn checkIntegrity(self: *Validator, hdu: *Hdu, idx: u32) VerifyError!void {
         const rep = checksum.verify(self.fits, hdu) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.EndOfStream => return error.EndOfStream,
+            // A truncated data unit (declared bytes run past EOF) reads back as EndOfStream. That
+            // is a structural problem checkDataExtent already records — not a device failure — so
+            // downgrade it to a non-fatal finding instead of aborting verify() and discarding every
+            // accumulated finding via its top-level errdefer.
+            error.EndOfStream => {
+                try self.add(.warning, idx, "DATASUM", "integrity could not be verified: data unit truncated (extends past end of file)");
+                return;
+            },
             error.ReadFailed => return error.ReadFailed,
             error.WriteFailed => return error.WriteFailed,
             error.SeekFailed => return error.SeekFailed,
@@ -668,6 +675,35 @@ test "DATASUM/CHECKSUM mismatch is reported as findings" {
 
     try testing.expect(hasFinding(&findings, 1, .err, "DATASUM"));
     try testing.expect(hasFinding(&findings, 1, .err, "CHECKSUM"));
+}
+
+test "verify keeps findings when a DATASUM'd HDU's data unit is truncated past EOF" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+
+    var h = Header.initEmpty();
+    {
+        errdefer h.deinit(alloc);
+        try h.appendValue(alloc, "SIMPLE", .{ .logical = true }, null);
+        try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+        try h.appendValue(alloc, "NAXIS", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "NAXIS1", .{ .int = 100 }, null);
+        try h.appendValue(alloc, "DATASUM", .{ .string = "0" }, null); // integrity card present
+    }
+    const hdu = try f.appendHdu(h);
+    try f.flush();
+    try f.dev.setSize(hdu.data_off); // drop the data unit entirely (header block only)
+
+    // Regression: checksum.verify read the absent data unit → EndOfStream, which verify()
+    // re-raised, discarding EVERY accumulated finding. It must now return the findings list with
+    // the structural data-extent error plus a non-fatal integrity note.
+    var findings = try verify(alloc, &f);
+    defer deinitFindings(alloc, &findings);
+    try testing.expect(hasFinding(&findings, 1, .err, null)); // declared data unit extends past EOF
+    try testing.expect(hasFinding(&findings, 1, .warning, "DATASUM")); // integrity could not be verified
 }
 
 test "duplicate non-mandatory keyword is a warning" {

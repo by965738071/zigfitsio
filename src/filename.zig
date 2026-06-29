@@ -342,20 +342,31 @@ fn hasColon(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, ':') != null;
 }
 
-// True for the CFITSIO row/column filter-bracket shapes we do not implement. The signatures are
-// disjoint from every supported group (HDU index, `EXTNAME[,EXTVER]`, image section): a leading
-// `#` introduces a row filter (`[#row < 3]`), and the relational/boolean operators below only ever
-// appear in a filter expression (`[col X > 5]`) — never in a valid extension name, version, or
-// pixel-section field. Pure-wildcard/numeric image sections (e.g. `[*,*]`, `[1:512,1:512]`) carry
-// none of these characters and so remain valid sections.
+// True for the CFITSIO row/column filter-bracket shapes we do not implement, so they are rejected
+// with a typed UnsupportedFilter rather than silently mis-parsed as an EXTNAME (NFR-INTEROP-1).
+// The signatures are disjoint from every supported group (HDU index, `EXTNAME[,EXTVER]`, image
+// section): a leading `#` is a row filter (`[#row < 3]`); the relational/boolean operators are a
+// filter expression (`[col X > 5]`); parentheses are a function-call filter (`gtifilter()`,
+// `regfilter("ds9.reg")`); a leading `bin`/`BIN` token is a binning/histogram specifier
+// (`[bin 4]`). Pure-wildcard/numeric image sections (`[*,*]`, `[1:512,1:512]`) carry none of these
+// and remain valid sections.
 fn looksLikeFilter(content: []const u8) bool {
     if (content.len == 0) return false;
     if (content[0] == '#') return true; // row filter
+    if (startsWithBinKeyword(content)) return true; // binning/histogram specifier
     for (content) |c| switch (c) {
-        '<', '>', '=', '&', '|', '!' => return true,
+        '<', '>', '=', '&', '|', '!', '(', ')' => return true, // operators + gtifilter()/regfilter()
         else => {},
     };
     return false;
+}
+
+// True if `content` begins with the CFITSIO `bin`/`BIN` binning keyword (followed by a space or
+// `(`), e.g. `bin 4`, `bin (X,Y)=...`. A bare extension name like "bins"/"BINTABLE" does not match.
+fn startsWithBinKeyword(content: []const u8) bool {
+    const t = std.mem.trimStart(u8, content, " ");
+    if (t.len < 4 or !std.ascii.eqlIgnoreCase(t[0..3], "bin")) return false;
+    return t[3] == ' ' or t[3] == '(';
 }
 
 fn isInteger(s: []const u8) bool {
@@ -499,6 +510,12 @@ test "CFITSIO filter brackets are UnsupportedFilter, not a mis-parsed EXTNAME" {
     try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[col X > 5]"));
     try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[#row < 3]"));
     try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "file.fits[FLUX > 0.5 && X < 10]"));
+    // Regression: function-call filters and binning specifiers carry no operator char, so they
+    // were silently absorbed as a bogus EXTNAME. They must also be UnsupportedFilter.
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "evt.fits[gtifilter()]"));
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "img.fits[regfilter(\"ds9.reg\")]"));
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "img.fits[bin 4]"));
+    try testing.expectError(error.UnsupportedFilter, parse(testing.allocator, "img.fits[BIN (X,Y)]"));
 
     // Valid neighbours are unaffected: a plain EXTNAME, an EXTNAME+EXTVER, and pure-wildcard or
     // numeric image sections remain supported (no filter operators present).

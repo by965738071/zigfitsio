@@ -171,7 +171,10 @@ pub fn decodeChecksum(card16: *const [16]u8) u32 {
             const m = 4 * jj + ii; // index into the un-rotated `asc` array
             s += card16[(m + 1) % 16]; // asc[m] == card16[(m+1) % 16]
         }
-        bytes[ii] = s - 0xC0;
+        // Wrapping subtract + mask: for encoder-produced input s ∈ [0xC0, 0x1BF] so this is
+        // exactly `byte`; for an arbitrary/blank 16-byte field (s may be < 0xC0 or > 0x1BF) it
+        // avoids the u32 underflow panic and keeps each byte ≤ 0xFF so the `<<24` cannot overflow.
+        bytes[ii] = (s -% 0xC0) & 0xFF;
     }
     return (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
 }
@@ -364,6 +367,14 @@ test "encodeChecksum/decodeChecksum round-trip and produce a clean ASCII alphabe
         }
         try testing.expectEqual(v, decodeChecksum(&buf));
     }
+}
+
+test "decodeChecksum does not panic on a blank / out-of-alphabet 16-byte field" {
+    // Regression: a blank CHECKSUM field sums each byte-column to 4*0x20 = 0x80 < 0xC0, so the
+    // `s - 0xC0` subtraction underflowed u32 and panicked. It must now return a value, not crash.
+    _ = decodeChecksum(&[_]u8{' '} ** 16);
+    _ = decodeChecksum(&[_]u8{0} ** 16);
+    _ = decodeChecksum(&[_]u8{0xFF} ** 16); // high end: must not overflow the <<24 reconstruction
 }
 
 test "encodeChecksum matches the FITS Appendix J.3 reference vector" {
