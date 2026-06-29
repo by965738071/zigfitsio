@@ -1,0 +1,7 @@
+# Every file here is part of a byte-for-byte hashed golden corpus: test/golden.zig verifies each
+# file's sha256 against MANIFEST.json. No platform may rewrite these bytes, so disable all
+# EOL/encoding conversion in this directory. In particular the Windows CI cell runs with
+# core.autocrlf=true, which otherwise rewrites LF->CRLF in the .json/.csv sidecars on checkout and
+# breaks their recorded sha256 (failing "golden: file sha256 matches MANIFEST"). The .fits goldens
+# are additionally marked binary (-diff -merge) by the repo-root .gitattributes.
+* -text
