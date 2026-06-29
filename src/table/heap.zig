@@ -546,12 +546,13 @@ pub const HeapManager = struct {
     /// (FR-VLA-4). Live cells are those with a positive descriptor length; empty/freed cells are
     /// skipped.
     ///
-    /// On hostile input several descriptors may *alias* the same heap extent. Such rows are
-    /// de-aliased: every distinct `(src, len)` extent is moved exactly once and all rows pointing
-    /// at it are remapped to that single packed offset, so a relocation never reads bytes another
-    /// row already moved. `moveBytes` is overlap-safe in both directions, so even a malformed file
-    /// whose distinct extents partially overlap (forcing a `dst > src` move) cannot corrupt data
-    /// or read out of bounds.
+    /// On hostile input several descriptors may *alias* the same heap extent. Rows whose
+    /// `(src, len)` match exactly are de-aliased: the extent is moved once and all rows are
+    /// remapped to that single packed offset, so a relocation never reads bytes another row
+    /// already moved. The cumulative packed size is bounded against `heap_size` before every
+    /// move, so a forged set of overlapping distinct extents (whose double-counted bytes would
+    /// total more than the heap) is rejected with `error.BadDescriptor` instead of writing the
+    /// repacked payload past the data unit.
     pub fn compact(self: *HeapManager, gpa: Allocator, table: *BinTable) CompactError!void {
         const geom = try heapGeometry(table);
 
@@ -591,14 +592,19 @@ pub const HeapManager = struct {
 
         std.mem.sort(Group, groups.items, {}, lessThanGroup);
 
-        // Pack each unique extent to the front, recording its new offset.
+        // Pack each unique extent to the front, recording its new offset. The cumulative packed
+        // size is bounded against heap_size BEFORE each move: distinct extents that overlap
+        // double-count their bytes, so without this check `bump` could exceed heap_size and
+        // moveBytes would write the payload past the data unit (OOB write / next-HDU corruption).
         var bump: u64 = 0;
         for (groups.items) |*g| {
+            const packed_end = std.math.add(u64, bump, g.len) catch return error.BadDescriptor;
+            if (packed_end > geom.heap_size) return error.BadDescriptor;
             if (g.src != bump) {
                 try moveBytes(table, geom.heap_abs_off + g.src, geom.heap_abs_off + bump, g.len);
             }
             g.dst = bump;
-            bump = try limits.add(bump, g.len);
+            bump = packed_end;
         }
 
         // Rewrite each row's descriptor offset to its extent's packed offset (length unchanged).
@@ -1273,6 +1279,27 @@ test "compact tolerates distinct overlapping extents without OOB (overlap-safe m
     const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
     defer alloc.free(r0);
     try testing.expectEqualSlices(i32, &[_]i32{ 11, 22, 33, 44 }, r0);
+}
+
+test "compact rejects forged overlapping extents whose packed size exceeds the heap (no OOB write)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // heap_size = 24 bytes. Row 0 = 5 i32 (20 bytes) at off 0. Row 1 forged to a DISTINCT extent
+    // {off=4,len=5} (20 bytes, end=24 ≤ heap_size, passes the per-row bound). Packing puts row 0
+    // at 0 (bump→20); row 1's distinct src=4 would then move to [20,40) — 16 bytes past the
+    // 24-byte data unit. The cumulative-size guard must reject this with BadDescriptor.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 24, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2, 3, 4, 5 });
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 5, .off = 4 });
+
+    try testing.expectError(error.BadDescriptor, mgr.compact(alloc, &t));
 }
 
 test "max_vla_elems limit is enforced before allocation" {
