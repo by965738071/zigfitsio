@@ -102,7 +102,10 @@ pub const Fits = struct {
         std.debug.assert(mode != .create); // use `create` for new files
         var self = try initHandle(alloc, dev, mode, opts);
         errdefer self.deinitInternal(false);
-        _ = try self.scanOne(); // eagerly parse HDU 1
+        // A valid FITS file must contain a primary HDU. scanOne returns null (no error) for a
+        // sub-block/empty/truncated file; reject it here so the documented-valid current() can
+        // never index an empty HDU list (was an out-of-bounds panic).
+        if ((try self.scanOne()) == null) return error.MissingRequiredKeyword; // eagerly parse HDU 1
         return self;
     }
 
@@ -278,6 +281,9 @@ pub const Fits = struct {
             return err; // errdefer destroys hdu_ptr; Hdu.init already freed res.header
         };
         errdefer hdu_ptr.deinit(self.alloc);
+        // Enforce the documented NFR-SAFE-1 ceiling on scanned HDU count (was never checked, so a
+        // file of many tiny headers could be scanned without bound).
+        if (self.hdus.items.len >= self.limits.max_hdu_count) return error.LimitExceeded;
         try self.hdus.append(self.alloc, hdu_ptr);
 
         self.scan_off = hdu_ptr.nextOff();
@@ -1239,6 +1245,47 @@ fn writeSpecialRecords(dev: Device, off: u64) !void {
     writeCardInto(&blk, 0, "COMMENT trailing special records, not an HDU");
     writeCardInto(&blk, 1, "END");
     try dev.writeAll(&blk, off);
+}
+
+test "open rejects a sub-block / empty file instead of leaving current() out of bounds" {
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    // Empty (0-byte) device: no primary HDU. Must be a typed error, not a 0-HDU "success" whose
+    // documented-valid current() then indexes an empty list (was an out-of-bounds panic).
+    try testing.expectError(error.MissingRequiredKeyword, Fits.open(testing.allocator, mem.device(), .read_only, .{}));
+    try mem.device().writeAll("SIMPLE", 0); // a few bytes, still < 2880
+    try testing.expectError(error.MissingRequiredKeyword, Fits.open(testing.allocator, mem.device(), .read_only, .{}));
+}
+
+test "absurd GCOUNT does not overflow-panic during scan (roundUpBlocks saturates)" {
+    var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    writeCardInto(&blk, 0, "SIMPLE  =                    T");
+    writeCardInto(&blk, 1, "BITPIX  =                   16");
+    writeCardInto(&blk, 2, "NAXIS   =                    1");
+    writeCardInto(&blk, 3, "NAXIS1  =                    1");
+    writeCardInto(&blk, 4, "GCOUNT  =  9223372036854775807");
+    writeCardInto(&blk, 5, "END");
+    var mem = try MemoryDevice.initBytes(testing.allocator, &blk);
+    defer mem.deinit();
+    // data_bytes ≈ 2^64; nextOff()→roundUpBlocks must saturate, not integer-overflow panic.
+    // open succeeds with the single HDU (its declared data unit just lies past EOF).
+    var f = try Fits.open(testing.allocator, mem.device(), .read_only, .{});
+    defer f.deinit();
+    try testing.expectEqual(@as(usize, 1), try f.hduCount());
+}
+
+test "max_hdu_count is enforced during scanning" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 2, 2 } });
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 2, 2 } });
+    try f.flush();
+    // Reopen with a ceiling of 2; scanning past the 2nd HDU must hit the documented limit.
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_only, .{ .limits = .{ .max_hdu_count = 2 } });
+    defer f2.deinit();
+    try testing.expectError(error.LimitExceeded, f2.hduCount());
 }
 
 test "copyHdu refuses to copy the primary and leaves the device unchanged" {

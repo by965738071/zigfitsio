@@ -96,12 +96,17 @@ pub const Hdu = struct {
     /// Total bytes occupied by this HDU on disk (padded header + padded data).
     pub fn totalBytes(self: *const Hdu) u64 {
         const header_blocks = block.roundUpBlocks(@as(u64, self.header.count()) * block.CARD);
-        return header_blocks + block.roundUpBlocks(self.data_bytes);
+        // Saturating: a malformed GCOUNT/PCOUNT can make data_bytes ≈ 2^64, so the sum must not
+        // integer-overflow panic. A saturated total is harmless — it only feeds size comparisons.
+        return header_blocks +| block.roundUpBlocks(self.data_bytes);
     }
 
     /// Byte offset of the HDU following this one.
     pub fn nextOff(self: *const Hdu) u64 {
-        return self.data_off + block.roundUpBlocks(self.data_bytes);
+        // Saturating add: roundUpBlocks already saturates, and data_off + (saturated) would
+        // otherwise overflow u64 and panic during the scan. A saturated offset lands past EOF,
+        // so scanning simply stops (the declared data unit is unreadable), never panics.
+        return self.data_off +| block.roundUpBlocks(self.data_bytes);
     }
 
     /// Bytes per pixel/element, `|BITPIX|/8`.
