@@ -1,0 +1,79 @@
+name: Python wheels
+
+# Build the Python bindings: cross-platform binary wheels (cibuildwheel) plus an sdist.
+# Linux wheels compile Zig inside the manylinux container via `bindings/python/ci/install_zig.sh`;
+# macOS/Windows wheels use the host Zig installed by setup-zig.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "bindings/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - "pyproject.toml"
+      - "hatch_build.py"
+      - ".github/workflows/python-wheels.yml"
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  wheels:
+    name: wheels ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21.3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # Fast non-matrix smoke test: build the lib + run the suite on a single host (mirrors the
+  # local dev flow), so PRs get quick Python feedback without waiting on the full wheel matrix.
+  smoke:
+    name: smoke test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: zig build capi
+      - run: zig build capi-test --summary all
+      - run: pip install numpy astropy pytest
+      - run: pytest bindings/python/tests -q
+        env:
+          PYTHONPATH: bindings/python/src
+          ZIGFITSIO_LIBRARY: ${{ github.workspace }}/zig-out/lib/libzigfitsio_capi.so
