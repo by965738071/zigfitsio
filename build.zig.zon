@@ -11,6 +11,7 @@
         "build.zig.zon",
         "src",
         "tools",
+        "bindings",
         "LICENSE",
         "README.md",
         "CHANGELOG.md",

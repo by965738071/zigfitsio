@@ -29,6 +29,40 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // C-ABI shim (Python/C bindings, design bindings/). A separate dynamic library compiled
+    // from `bindings/capi/capi.zig`, which imports the public `zigfitsio` module and exports the
+    // `zf_*` C symbols. Kept out of `src/` so the repo's "no C header under src" guard is moot;
+    // the hand-written contract lives in `bindings/c/zigfitsio.h`.
+    const capi_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/capi/capi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_mod.addImport("zigfitsio", mod);
+    const capi_lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "zigfitsio_capi",
+        .root_module = capi_mod,
+    });
+    b.installArtifact(capi_lib);
+    // Install the shared library into `zig-out/lib` when `zig build capi` is invoked directly
+    // (the compile step alone does not copy the artifact out of the cache).
+    const capi_install = b.addInstallArtifact(capi_lib, .{});
+    const capi_step = b.step("capi", "Build the C-ABI shared library for the bindings");
+    capi_step.dependOn(&capi_install.step);
+
+    // `zig build capi-test` — round-trip tests of the C-ABI shim (in `bindings/capi/test_capi.zig`).
+    const capi_test_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/capi/test_capi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_test_mod.addImport("zigfitsio", mod);
+    const capi_tests = b.addTest(.{ .root_module = capi_test_mod });
+    const run_capi_tests = b.addRunArtifact(capi_tests);
+    const capi_test_step = b.step("capi-test", "Test the C-ABI shim");
+    capi_test_step.dependOn(&run_capi_tests.step);
+
     // `zig build test` — the full suite. `root.zig` pulls in every module's tests via
     // its `test` reference block, so this single artifact covers the tree.
     const tests = b.addTest(.{ .root_module = mod });

@@ -2,3 +2,16 @@
 zig-out/
 *.o
 .claude/
+
+# Python bindings
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+# Zig-built shared library staged into the package by hatch_build.py
+bindings/python/src/zigfitsio/*.so
+bindings/python/src/zigfitsio/*.dylib
+bindings/python/src/zigfitsio/*.dll
