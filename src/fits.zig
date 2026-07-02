@@ -380,6 +380,20 @@ pub const Fits = struct {
 
         const is_primary = self.hdus.items.len == 0;
         const offset = self.scan_off;
+        // `header.writeTo` below flushes real bytes to the device (it always pads to a full
+        // block), growing `self.dev` before `Hdu.init` has validated the new HDU (mandatory
+        // keywords, NAXIS-product/heap resource limits, …). If anything fails after that
+        // write — including `Hdu.init` itself, e.g. `error.LimitExceeded` from an oversized
+        // `NAXISn` product — restore the device to its captured pre-append size so the handle
+        // is left exactly as it was found. Without this, `scan_off` would trail the grown
+        // device and the very next `appendHdu` call would misfire the "trailing special
+        // records" guard above, permanently refusing further appends on an otherwise-healthy
+        // handle (NFR-SAFE-1: a resource-limit rejection must not corrupt handle state).
+        // Mirrors the same capture-then-restore-on-failure idiom `copyHdu` uses below (the
+        // guard above establishes size <= scan_off, so restoring the captured size — not
+        // `offset` — is exact even for a file whose device is shorter than its declared end).
+        const pre_append_size = try self.dev.getSize();
+        errdefer self.dev.setSize(pre_append_size) catch {};
         var bw = try block.BlockWriter.init(self.alloc, self.dev, offset, 0);
         defer bw.deinit();
         try header.writeTo(&bw);
@@ -1360,6 +1374,28 @@ test "appendHdu refuses a file with trailing special records" {
     // Appending would clobber the special-records region, so it is refused with a typed error.
     try testing.expectError(error.WrongHduType, f2.appendImageHdu(.{ .bitpix = 8, .axes = &.{4} }));
     try testing.expectEqual(eof + block.BLOCK, try f2.dev.getSize()); // region left untouched
+}
+
+test "appendHdu that fails after the header hits the device rolls back cleanly (handle stays usable)" {
+    // Regression: a resource-limit rejection inside Hdu.init (here, an oversized NAXIS
+    // product) used to leave `scan_off` trailing the already-grown device — because
+    // `header.writeTo` flushes a full block before `Hdu.init` validates — which then
+    // permanently wedged the handle: every subsequent appendHdu misfired the trailing-
+    // special-records guard with `error.WrongHduType`, even for perfectly valid input.
+    var mem = MemoryDevice.init(testing.allocator);
+    defer mem.deinit();
+    var f = try Fits.create(testing.allocator, mem.device(), .{ .limits = .{ .max_naxis_product = 10 } });
+    defer f.deinit();
+
+    const before = try f.dev.getSize();
+    try testing.expectError(error.LimitExceeded, f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 4 } })); // 16 > 10
+    try testing.expectEqual(before, try f.dev.getSize()); // device size fully restored
+    try testing.expectEqual(@as(u64, 0), f.scan_off); // bookkeeping untouched
+
+    // The handle is still perfectly usable: a valid, within-limit append succeeds.
+    const hdu = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 3, 3 } }); // 9 <= 10
+    try testing.expectEqualSlices(u64, &.{ 3, 3 }, hdu.axes);
+    try testing.expectEqual(@as(usize, 1), try f.hduCount());
 }
 
 test "distinct Fits handles run concurrently from multiple threads" {
