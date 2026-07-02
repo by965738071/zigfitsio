@@ -70,6 +70,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the unit/integration test suite");
     test_step.dependOn(&run_tests.step);
 
+    // The C-ABI shim's own round-trip tests (`bindings/capi/test_capi.zig`) are wired into the
+    // default `test` step too (test-plan Phase 4): previously `capi-test` only ran in one Linux
+    // CI job (the wheels `smoke` job), so the ABI boundary had no coverage on macOS/Windows/
+    // aarch64 or the s390x big-endian cell. `abi.zig`'s allocator (`std.heap.smp_allocator`)
+    // needs no libc, so this cross-compiles/runs everywhere `mod`'s own tests do.
+    test_step.dependOn(&run_capi_tests.step);
+
     // The on-disk sample-corpus harness (NFR-TEST-2) lives under `test/` (outside the module
     // path), so it is its own test artifact importing the public `zigfitsio` module. It reads
     // the committed `test/corpus/*.fits` files from the build root and asserts header + data

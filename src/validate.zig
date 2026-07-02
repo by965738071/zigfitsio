@@ -784,6 +784,169 @@ test "TSCAL/TZERO on an A/L/X column is a warning, not an error" {
     try testing.expectEqual(@as(usize, 0), countSeverity(&findings, .err));
 }
 
+test "whole-file size not a multiple of 2880 bytes is flagged" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{10} });
+    try f.flush();
+
+    const good_size = try f.dev.getSize();
+    try testing.expectEqual(@as(u64, 0), good_size % block.BLOCK);
+    try f.dev.setSize(good_size + 17); // break block alignment directly on the device
+
+    var findings = try verify(alloc, &f);
+    defer deinitFindings(alloc, &findings);
+    try testing.expect(hasFinding(&findings, 0, .err, null)); // whole-file finding, hdu=0
+}
+
+test "malformed TFORM syntax on a binary table is flagged (scanner-reachable)" {
+    // Unlike the NAXIS1-sum mismatch test above, this pins that checkBinaryGeometry itself
+    // parses TFORMn — no NAXIS1/geometry hack needed. Hdu.init never inspects TFORMn (only
+    // BITPIX/NAXIS/PCOUNT/GCOUNT), so this header scans successfully through the public
+    // Fits.appendHdu/open path with no bypass required.
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+    var f = try Fits.create(alloc, mem.device(), .{});
+    defer f.deinit();
+
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} }); // primary
+
+    var h = Header.initEmpty();
+    {
+        errdefer h.deinit(alloc);
+        try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
+        try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+        try h.appendValue(alloc, "NAXIS", .{ .int = 2 }, null);
+        try h.appendValue(alloc, "NAXIS1", .{ .int = 4 }, null);
+        try h.appendValue(alloc, "NAXIS2", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "PCOUNT", .{ .int = 0 }, null);
+        try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "TFIELDS", .{ .int = 1 }, null);
+        try h.appendValue(alloc, "TFORM1", .{ .string = "not-a-tform" }, null); // malformed syntax
+    }
+    _ = try f.appendHdu(h);
+    try f.flush();
+
+    var findings = try verify(alloc, &f);
+    defer deinitFindings(alloc, &findings);
+    try testing.expect(hasFinding(&findings, 2, .err, "TFORM1"));
+}
+
+// The next three tests hand-assemble an `Hdu` and call one `Validator` check directly, mirroring
+// "checkMandatory flags table count keywords out of position" above: `Hdu.init`'s own
+// `computeGeometry`/`hdu.validate` already reject these malformed states before an `Hdu` can ever
+// be scanned from a real file, so the only way to exercise the validator's own defense-in-depth
+// logic for them is to bypass construction entirely.
+
+test "checkEnd flags a header not terminated by an END card" {
+    const alloc = testing.allocator;
+    const axes = try alloc.dupe(u64, &.{4});
+    errdefer alloc.free(axes);
+    var h = Header.initEmpty();
+    errdefer h.deinit(alloc);
+    try h.appendValue(alloc, "SIMPLE", .{ .logical = true }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+    try h.appendValue(alloc, "NAXIS", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 4 }, null);
+    // Deliberately no `h.ensureEnd`: the in-memory header carries no END card. `Header.parse`
+    // rejects an END-less stream on read and `ensureEnd` always runs before a write, so a real
+    // scanned Hdu can never reach `checkEnd` in this state.
+
+    var hdu: Hdu = .{
+        .kind = .primary,
+        .header = h,
+        .header_off = 0,
+        .data_off = block.BLOCK,
+        .data_bytes = 4,
+        .bitpix = 8,
+        .naxis = 1,
+        .axes = axes,
+        .pcount = 0,
+        .gcount = 1,
+    };
+    var findings: Findings = .empty;
+    defer deinitFindings(alloc, &findings);
+    var v: Validator = .{ .alloc = alloc, .fits = undefined, .out = &findings };
+    try v.checkEnd(&hdu, 1);
+    try testing.expect(hasFinding(&findings, 1, .err, "END"));
+
+    hdu.deinit(alloc);
+}
+
+test "checkRanges flags an out-of-set BITPIX and a zero GCOUNT" {
+    const alloc = testing.allocator;
+    const axes = try alloc.dupe(u64, &.{4});
+    errdefer alloc.free(axes);
+    var h = Header.initEmpty();
+    errdefer h.deinit(alloc);
+    try h.appendValue(alloc, "SIMPLE", .{ .logical = true }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 24 }, null); // not one of the six legal values
+    try h.appendValue(alloc, "NAXIS", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 4 }, null);
+    try h.ensureEnd(alloc);
+
+    var hdu: Hdu = .{
+        .kind = .primary,
+        .header = h,
+        .header_off = 0,
+        .data_off = block.BLOCK,
+        .data_bytes = 4,
+        .bitpix = 24,
+        .naxis = 1,
+        .axes = axes,
+        .pcount = 0,
+        .gcount = 0, // illegal: GCOUNT must be positive
+    };
+    var findings: Findings = .empty;
+    defer deinitFindings(alloc, &findings);
+    var v: Validator = .{ .alloc = alloc, .fits = undefined, .out = &findings };
+    try v.checkRanges(&hdu, 1);
+    try testing.expect(hasFinding(&findings, 1, .err, "BITPIX"));
+    try testing.expect(hasFinding(&findings, 1, .err, "GCOUNT"));
+
+    hdu.deinit(alloc);
+}
+
+test "checkMandatory flags the wrong leading keyword for the HDU kind" {
+    const alloc = testing.allocator;
+    const axes = try alloc.dupe(u64, &.{4});
+    errdefer alloc.free(axes);
+    var h = Header.initEmpty();
+    errdefer h.deinit(alloc);
+    // A "primary" Hdu whose first card is XTENSION, not SIMPLE. `hdu.validate` rejects this at
+    // construction (`error.KeywordOrder`) for any real file, so bypass it to pin checkMandatory's
+    // own leading-keyword check.
+    try h.appendValue(alloc, "XTENSION", .{ .string = "WRONG" }, null);
+    try h.appendValue(alloc, "BITPIX", .{ .int = 8 }, null);
+    try h.appendValue(alloc, "NAXIS", .{ .int = 1 }, null);
+    try h.appendValue(alloc, "NAXIS1", .{ .int = 4 }, null);
+    try h.ensureEnd(alloc);
+
+    var hdu: Hdu = .{
+        .kind = .primary,
+        .header = h,
+        .header_off = 0,
+        .data_off = block.BLOCK,
+        .data_bytes = 4,
+        .bitpix = 8,
+        .naxis = 1,
+        .axes = axes,
+        .pcount = 0,
+        .gcount = 1,
+    };
+    var findings: Findings = .empty;
+    defer deinitFindings(alloc, &findings);
+    var v: Validator = .{ .alloc = alloc, .fits = undefined, .out = &findings };
+    try v.checkMandatory(&hdu, 1);
+    try testing.expect(hasFinding(&findings, 1, .err, "SIMPLE"));
+
+    hdu.deinit(alloc);
+}
+
 test "block-aligned trailing special records yield no false-positive findings" {
     const alloc = testing.allocator;
     var mem = MemoryDevice.init(alloc);

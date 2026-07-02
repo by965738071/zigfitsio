@@ -9,6 +9,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, unconditional run of the `interop` job (bypassing its path filter below) so
+    # CFITSIO/fpack/Astropy toolchain drift is caught even when no PR touches interop-relevant
+    # paths (test-plan Phase 4: the job was previously push/PR-path-gated only, so an unrelated
+    # week of PRs could pass with a silently-broken interop leg).
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
 
 env:
   ZIG_VERSION: "0.16.0"
@@ -114,14 +120,20 @@ jobs:
     # hermetic `test` matrix stays pure-Zig and runs the committed-golden consumer (test/golden.zig)
     # everywhere. Path-gated with dorny/paths-filter so the heavy work runs only when
     # interop-relevant files change, while the job always reports a result (safe as a required
-    # check). The committed goldens are authored by CFITSIO 4.6.4 (see interop/README.md); this job
-    # proves cross-tool interop semantically (version-tolerant) and byte-checks regeneration as an
-    # informational guard.
+    # check) — except on the weekly `schedule` trigger above, which always runs the full job
+    # regardless of the path filter, so toolchain drift is caught even across a week of
+    # interop-path-untouched PRs. The committed goldens are authored by CFITSIO 4.6.4 (see
+    # interop/README.md); this job proves cross-tool interop semantically (version-tolerant) and
+    # byte-checks regeneration as an informational guard.
     name: external interop & golden parity (X-INTEROP/X-XVAL/X-SUM)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      # paths-filter only supports push/pull_request context (it needs a base to diff against),
+      # so it must be skipped on the weekly `schedule` trigger — every later step then runs via
+      # its `|| github.event_name == 'schedule'` arm (a skipped step's output is '' != 'true').
+      - if: github.event_name != 'schedule'
+        uses: dorny/paths-filter@v3
         id: f
         with:
           filters: |
@@ -134,16 +146,16 @@ jobs:
               - 'tools/emit_fixtures.zig'
               - 'build.zig'
               - '.github/workflows/ci.yml'
-      - if: steps.f.outputs.relevant == 'true'
+      - if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - if: steps.f.outputs.relevant == 'true'
+      - if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install CFITSIO + fpack/funpack + Astropy
-        if: steps.f.outputs.relevant == 'true'
+        if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         run: |
           set -e
           sudo apt-get update
@@ -151,13 +163,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r interop/requirements.txt
       - name: Inbound — Astropy reads & cross-validates every committed CFITSIO golden (X-XVAL)
-        if: steps.f.outputs.relevant == 'true'
+        if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         run: |
           set -e
           python interop/verify_outbound.py test/golden   # conformance (skips conformance/malformed)
           python interop/xval.py test/golden               # pixel/cell values match the ramp/formulas
       - name: Outbound — funpack/Astropy read every zigfitsio-written file (X-INTEROP outbound)
-        if: steps.f.outputs.relevant == 'true'
+        if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         run: |
           set -e
           OUT="$RUNNER_TEMP/outbound"
@@ -166,7 +178,7 @@ jobs:
           python interop/verify_outbound.py "$OUT"         # Astropy opens/verifies every emitted file
           for f in "$OUT"/*.fits; do fitsverify -q "$f" || true; done   # informational structural report
       - name: Golden drift-guard — regenerate & byte-diff (informational; needs CFITSIO 4.6.4)
-        if: steps.f.outputs.relevant == 'true'
+        if: steps.f.outputs.relevant == 'true' || github.event_name == 'schedule'
         continue-on-error: true
         run: |
           make -C interop golden
