@@ -101,6 +101,15 @@ class ZigSharedLibraryHook(BuildHookInterface):
     def _build(self, repo: Path) -> None:
         args = ["build", "capi", "-Doptimize=ReleaseFast"]
         target = os.environ.get("ZIG_TARGET")
+        if not target and _host_os() == "macos":
+            # A native macOS build stamps the dylib's minimum OS version with the *host*
+            # version (e.g. 15.x on the CI runner). delocate then rejects it against the
+            # macosx_11_0_* wheel tag ("dependencies do not satisfy target MacOS version").
+            # Pin it to the wheel's floor so the dylib fits — same arch, so still not a
+            # cross-compile (the tag stays interpreter-inferred).
+            zig_arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+            minver = os.environ.get("MACOSX_DEPLOYMENT_TARGET", "11.0")
+            target = f"{zig_arch}-macos.{minver}"
         if target:
             args.append(f"-Dtarget={target}")
 

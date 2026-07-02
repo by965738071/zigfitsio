@@ -65,7 +65,9 @@ testpaths = ["bindings/python/tests"]
 
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
-skip = "*-musllinux_i686 *_i686 pp*"
+# 32-bit targets are skipped: hatch_build.py compiles the C-ABI library for the 64-bit host,
+# so a win32/i686 wheel would bundle a 64-bit binary and fail to load ([WinError 193]).
+skip = "*-musllinux_i686 *_i686 *-win32 pp*"
 build-frontend = "build"
 test-requires = ["pytest", "numpy", "astropy"]
 # The bundled library is import-time loaded; run the suite against the installed wheel.
@@ -77,3 +79,9 @@ test-command = "pytest {project}/bindings/python/tests -q"
 [tool.cibuildwheel.linux]
 before-all = "bash {project}/bindings/python/ci/install_zig.sh"
 environment = { PATH = "/opt/zig:$PATH" }
+
+# Pin the macOS deployment target so the wheel's platform tag and the Zig-built dylib's minimum
+# OS version agree (hatch_build.py reads MACOSX_DEPLOYMENT_TARGET); otherwise delocate rejects a
+# dylib whose minos is the runner's host version against a lower wheel tag.
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
