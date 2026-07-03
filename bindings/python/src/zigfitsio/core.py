@@ -10,6 +10,7 @@ Data is exchanged as native-endian NumPy arrays; image arrays use C-order with r
 from __future__ import annotations
 
 import ctypes as c
+import os
 from typing import Any, Sequence
 
 import numpy as np
@@ -35,6 +36,7 @@ _UNSIGNED_TZERO = {
 _ZF_TO_TFORM = {
     ll.ZF_BOOL: "L", ll.ZF_BIT: "X", ll.ZF_UINT8: "B", ll.ZF_INT8: "B",
     ll.ZF_INT16: "I", ll.ZF_INT32: "J", ll.ZF_INT64: "K",
+    ll.ZF_UINT16: "I", ll.ZF_UINT32: "J", ll.ZF_UINT64: "K",  # unsigned via signed letter + TZERO
     ll.ZF_FLOAT32: "E", ll.ZF_FLOAT64: "D", ll.ZF_COMPLEX64: "C", ll.ZF_COMPLEX128: "M",
 }
 
@@ -57,6 +59,19 @@ def _tform_of(info) -> str:
     if info.is_vla:
         return f"1P{letter}"
     return f"{int(info.repeat)}{letter}"
+
+
+def _ascii_tform_of(info) -> str:
+    """Rebuild an ASCII-table TFORM (``Iw`` / ``Ew.d`` / ``Aw``) from column metadata. ASCII TFORMs
+    carry an explicit width, so a copied ASCII table needs these rather than binary ``1J``-style
+    formats (which zf_create_tbl(ASCII_TBL, ...) rejects)."""
+    code = int(info.typecode)
+    w = max(int(info.width), 1)
+    if code == ll.ZF_STRING:
+        return f"A{w}"
+    if code in (ll.ZF_FLOAT32, ll.ZF_FLOAT64):
+        return f"E{w}.{max(w - 7, 1)}"  # leave room for sign, decimal point, and E±dd exponent
+    return f"I{w}"  # integer column of any width
 
 
 def _vla_elem_dtype(fmt: str):
@@ -94,12 +109,41 @@ def _unsigned_col_tzero(col):
     return _UNSIGNED_COL.get((a.dtype.itemsize, letter))
 
 
-def _enc(s: str | bytes) -> bytes:
-    return s if isinstance(s, bytes) else s.encode("utf-8")
+def _enc(s) -> bytes:
+    if isinstance(s, bytes):
+        return s
+    return os.fspath(s).encode("utf-8")  # accepts str and os.PathLike (e.g. pathlib.Path)
 
 
 def _carr(values: Sequence[int]):
     return (c.c_long * len(values))(*[int(v) for v in values])
+
+
+def _fits_value_literal(value) -> str:
+    """Serialize a header value to its FITS card literal (for HIERARCH cards written raw)."""
+    if isinstance(value, bool):
+        return "T" if value else "F"
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _commentary_card(kw: str, value) -> bytes:
+    """An 80-byte COMMENT/HISTORY/blank card: keyword in cols 1-8, free text in cols 9-80."""
+    text = "" if value is None else str(value)
+    return (kw.upper().ljust(8) + text)[:80].ljust(80).encode("ascii", "replace")
+
+
+def _hierarch_card(kw: str, value, comment) -> bytes:
+    """A best-effort 80-byte HIERARCH card: ``HIERARCH tokens = value [/ comment]``."""
+    body = "HIERARCH " + kw.strip() + " = " + _fits_value_literal(value)
+    if comment:
+        body += " / " + comment
+    return body[:80].ljust(80).encode("ascii", "replace")
 
 
 def _ptr(arr: np.ndarray) -> _VOID:
@@ -192,6 +236,11 @@ class _HDU:
     def _writable(self) -> bool:
         return self._hdulist is not None and self._hdulist._mode != ll.READONLY
 
+    def _mark_dirty(self):
+        # An in-memory edit the open handle doesn't know about — force reconstruction on save.
+        if self._hdulist is not None:
+            self._hdulist._dirty = True
+
     # ── header ────────────────────────────────────────────────────────────────────────────
     @property
     def header(self) -> Header:
@@ -213,6 +262,8 @@ class _HDU:
         if self._writable():
             hdr._persist = self._write_key
             hdr._delete = self._delete_key
+        # A read-only header edit is not persisted to the handle; flag it so save reconstructs.
+        hdr._dirty_cb = self._mark_dirty
         return hdr
 
     def _write_key(self, key: str, value: Any, comment: str | None):
@@ -271,6 +322,7 @@ class ImageHDU(_HDU):
     @data.setter
     def data(self, value):
         self._data = None if value is None else np.asarray(value)
+        self._mark_dirty()  # a replaced array is not in the open handle's bytes
 
     @property
     def shape(self):
@@ -389,9 +441,14 @@ class ImageHDU(_HDU):
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
                 continue
-            # Skip commentary and HIERARCH-style keys (spaces / >8 chars aren't writable as a
-            # standard keyword; a faithful copy of such cards goes through the raw-passthrough path).
-            if up in ("COMMENT", "HISTORY", "") or " " in kw or len(kw) > 8:
+            # Commentary and HIERARCH/spaced/>8-char keys can't be written as standard 8-char
+            # keywords; reconstruct their 80-byte card and write it verbatim so COMMENT/HISTORY
+            # provenance and HIERARCH keywords survive the reconstruction (non-pristine) path.
+            if up in ("COMMENT", "HISTORY", ""):
+                ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, value)))
+                continue
+            if " " in kw or len(kw) > 8:
+                ll.check(ll.lib.zf_write_record(handle, _hierarch_card(kw, value, comment)))
                 continue
             value = _coerce_kw_value(value)
             kb = _enc(kw)
@@ -436,9 +493,31 @@ class CompImageHDU(ImageHDU):
         data = _native(self.data)
         bitpix = dt.dtype_to_bitpix(data.dtype)
         axes = list(reversed(data.shape))
-        tile = _carr(self._tile) if self._tile else None
-        q = _enc(self._quantize) if self._quantize else None
-        ll.check(ll.lib.zf_write_compressed(handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(self._comp), q, 1, _ptr(data), int(data.size)))
+        comp, tile_spec, quant = self._comp, self._tile, self._quantize
+        if self._hdulist is not None:
+            # A scanned compressed image: reuse its own ZCMPTYPE/ZTILEn/ZQUANTIZ so re-emitting does
+            # not silently change the codec (or fail outright for a float image that was GZIP-stored
+            # without quantization) by recompressing with the constructor's RICE_1 default.
+            hdr = self.header
+            comp = str(hdr.get("ZCMPTYPE", comp))
+            quant = hdr.get("ZQUANTIZ", quant)
+            tiles = []
+            i = 1
+            while hdr.get(f"ZTILE{i}") is not None:
+                tiles.append(int(hdr.get(f"ZTILE{i}")))
+                i += 1
+            if tiles:
+                tile_spec = tiles  # ZTILEn and axes are both fastest-axis-first
+        tile = _carr(tile_spec) if tile_spec else None
+        q = _enc(quant) if quant else None
+        ll.check(ll.lib.zf_write_compressed(handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1, _ptr(data), int(data.size)))
+        # Preserve EXTNAME (the general image path writes it via _apply_user_keys, which this
+        # override does not call because the scanned header carries the compression machinery).
+        nm = self.name
+        if nm and nm != "PRIMARY":
+            nb = _enc(nm)
+            kb = _enc("EXTNAME")
+            ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), nb, len(nb), None, 0))
 
 
 class _TableHDU(_HDU):
@@ -561,6 +640,23 @@ class _TableHDU(_HDU):
 
             return object, read_vla
 
+        # ASCII-table columns: the TFORM letter (I/F/E/D) does not encode width, so the binary
+        # letter map mis-sizes them (e.g. 'I11' -> int16, overflowing values > 32767 — the library
+        # could not read back its own ASCII output). Take the element dtype from the authoritative
+        # typecode instead. ASCII columns are scalar and never complex/VLA (handled above).
+        if self._table_type == ll.ASCII_TBL:
+            elem_dtype = dt.zf_to_dtype(int(info.typecode))
+            if elem_dtype.kind in ("i", "u") and (info.tscal != 1.0 or info.tzero != 0.0):
+                elem_dtype = np.dtype("f8")
+
+            def read_ascii():
+                flat = np.empty(nrows, dtype=elem_dtype)
+                if flat.size:
+                    ll.check(ll.lib.zf_read_col(t, dt.zf_code(elem_dtype), col, 1, flat.size, None, _ptr(flat)))
+                return flat
+
+            return elem_dtype, read_ascii
+
         elem_dtype, is_complex = dt.bin_elem_dtype(tform)
         if is_complex:
             cdtype = np.dtype("c8") if elem_dtype == np.dtype("f4") else np.dtype("c16")
@@ -613,7 +709,8 @@ class _TableHDU(_HDU):
             for i, name in enumerate(data.dtype.names):
                 info = ll.ZfColInfo()
                 ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
-                cols.append(Column(name, _tform_of(info), array=data[name]))
+                fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
+                cols.append(Column(name, fmt, array=data[name]))
             return cols, nrows
         finally:
             ll.lib.zf_table_close(t)
@@ -677,6 +774,8 @@ class _TableHDU(_HDU):
             ll.check(ll.lib.zf_write_col(t, dt.zf_code(base), i, 1, flat.size, None, _ptr(flat)))
             return
         flat = np.ascontiguousarray(a).reshape(-1)
+        if flat.dtype == np.bool_:
+            flat = flat.astype(np.uint8)  # a logical (L) column transfers as 0/1 bytes (ZF_UINT8)
         ll.check(ll.lib.zf_write_col(t, dt.zf_code(flat.dtype), i, 1, flat.size, None, _ptr(flat)))
 
     @staticmethod
@@ -727,6 +826,11 @@ class HDUList(list):
         self._mode = ll.READONLY
         self._owns = False
         self._scanned_count = 0  # HDUs scanned from the source (for the pristine-copy fast path)
+        # Set when an in-memory edit is NOT reflected in the open C handle's bytes (a data
+        # replacement, or a header edit in read-only mode where nothing is persisted). Such an edit
+        # disqualifies the verbatim byte-copy fast path so writeto()/to_bytes() reconstruct instead
+        # of silently emitting the stale original bytes.
+        self._dirty = False
 
     # ── opening ───────────────────────────────────────────────────────────────────────────
     @classmethod
@@ -791,7 +895,7 @@ class HDUList(list):
     def _is_pristine_attached(self) -> bool:
         """True when this list is exactly what was scanned from an open file — every HDU still
         attached in its original slot, nothing appended/removed — so it can be copied verbatim."""
-        if self._handle is None or not self._owns or len(self) != self._scanned_count:
+        if self._handle is None or not self._owns or self._dirty or len(self) != self._scanned_count:
             return False
         return all(
             isinstance(h, _HDU) and h._hdulist is self and h._index == i + 1
@@ -808,7 +912,14 @@ class HDUList(list):
         return buf.raw[: got.value]
 
     def close(self):
-        if self._handle is not None:
+        if self._handle is None:
+            return
+        # Persist pending edits before closing (astropy flushes on close in update mode); always
+        # release the handle even if the flush fails, so the file descriptor is never leaked.
+        try:
+            if self._mode != ll.READONLY:
+                self.flush()
+        finally:
             ll.lib.zf_close(self._handle)
             self._handle = None
 
@@ -826,26 +937,37 @@ class HDUList(list):
             pass
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
-    def writeto(self, path: str, overwrite: bool = False, checksum: bool = False):
-        import os
-
+    def writeto(self, path, overwrite: bool = False, checksum: bool = False):
+        path = os.fspath(path)
         if os.path.exists(path) and not overwrite:
             raise OSError(f"file exists: {path} (use overwrite=True)")
-        if not checksum and self._is_pristine_attached():
-            with __import__("builtins").open(path, "wb") as fh:
-                fh.write(self._source_bytes())
-            return
-        opts = ll.ZfOpenOpts()
-        if checksum:
-            opts.checksum_on_close = 1
-        handle = _VOID()
-        pb = _enc(path)
-        ll.check(ll.lib.zf_create_file(pb, len(pb), c.byref(opts) if checksum else None, c.byref(handle)))
+        # Write to a temp file in the same directory, then atomically rename into place: a failure
+        # never leaves a partial/corrupt file at `path`, and overwrite=True does not destroy the
+        # existing file until the new one is complete.
+        tmp = path + ".zigfitsio.tmp"
         try:
-            self._emit(handle.value, checksum)
-            ll.check(ll.lib.zf_flush(handle))
-        finally:
-            ll.lib.zf_close(handle)
+            if not checksum and self._is_pristine_attached():
+                with __import__("builtins").open(tmp, "wb") as fh:
+                    fh.write(self._source_bytes())
+            else:
+                opts = ll.ZfOpenOpts()
+                if checksum:
+                    opts.checksum_on_close = 1
+                handle = _VOID()
+                pb = _enc(tmp)
+                ll.check(ll.lib.zf_create_file(pb, len(pb), c.byref(opts) if checksum else None, c.byref(handle)))
+                try:
+                    self._emit(handle.value, checksum)
+                    ll.check(ll.lib.zf_flush(handle))
+                finally:
+                    ll.lib.zf_close(handle)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def to_bytes(self) -> bytes:
         """Serialize the HDU list to an in-memory FITS byte string."""
@@ -869,8 +991,11 @@ class HDUList(list):
         hdus = list(self)
         if not hdus:
             raise ValueError("cannot serialize an empty HDUList (a FITS file needs a primary HDU)")
-        if hdus and not hdus[0].is_image:
-            PrimaryHDU()._write_to(handle, primary=True)  # tables need a primary first
+        # Tables and tile-compressed images both serialize as BINTABLE extensions, so they need a
+        # real primary HDU before them. CompImageHDU.is_image is True (it subclasses ImageHDU), so
+        # it must be handled explicitly alongside the non-image case.
+        if hdus and (not hdus[0].is_image or isinstance(hdus[0], CompImageHDU)):
+            PrimaryHDU()._write_to(handle, primary=True)
         for i, hdu in enumerate(hdus):
             hdu._write_to(handle, primary=(i == 0))
             if checksum:
@@ -880,13 +1005,22 @@ class HDUList(list):
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # Module-level conveniences (astropy-compatible names)
 # ════════════════════════════════════════════════════════════════════════════════════════════
-def open(path: str, mode: str = "readonly", opts: ll.ZfOpenOpts | None = None) -> HDUList:
-    """Open a FITS file. ``mode``: ``"readonly"``, ``"update"`` (read-write), or ``"append"``."""
-    mode_code = {"readonly": ll.READONLY, "update": ll.READWRITE, "append": ll.READWRITE}.get(mode, ll.READONLY)
+def open(path, mode: str = "readonly", opts: ll.ZfOpenOpts | None = None) -> HDUList:
+    """Open a FITS file. ``mode``: ``"readonly"``, ``"update"`` (read-write), or ``"append"``.
+    ``path`` may be a str or an ``os.PathLike`` (e.g. ``pathlib.Path``)."""
+    path = os.fspath(path)
+    try:
+        mode_code = {"readonly": ll.READONLY, "update": ll.READWRITE, "append": ll.READWRITE}[mode]
+    except KeyError:
+        raise ValueError(f"invalid mode {mode!r}: expected 'readonly', 'update', or 'append'")
     handle = _VOID()
     pb = _enc(path)
     optref = c.byref(opts) if opts is not None else None
     if path.endswith(".gz"):
+        # A .gz opens into an in-memory handle that cannot write back to the compressed file;
+        # reject a writable mode up front rather than failing mid-edit with a device-read-only error.
+        if mode_code != ll.READONLY:
+            raise ValueError("a .gz file can only be opened in 'readonly' mode")
         with __import__("builtins").open(path, "rb") as fh:
             raw = fh.read()
         ll.check(ll.lib.zf_open_gzip(raw, len(raw), optref, c.byref(handle)))

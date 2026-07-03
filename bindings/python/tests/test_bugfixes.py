@@ -251,3 +251,84 @@ def test_bit_column_round_trips():
     src = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("B", "8X", array=bits)])]).to_bytes()
     got = zf.from_bytes(src)[1].data["B"]
     assert np.array_equal(got.reshape(1, 8), bits)
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+# 2026-07-03 hunt: lifecycle data-loss + reconstruction/dtype correctness (disk round-trips)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+def test_readonly_edit_reflected_in_writeto(tmp_fits):
+    # A read-only open, edited in memory, must reconstruct on writeto — not copy the stale bytes.
+    src, out = tmp_fits("src.fits"), tmp_fits("out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((3, 4), dtype="i2"))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)  # default read-only
+    hdul[0].data = hdul[0].data * 10
+    hdul[0].header["MYKEY"] = 42
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert int(chk[0].data[0, 1]) == 10
+        assert chk[0].header.get("MYKEY") == 42
+
+
+def test_update_mode_flushes_on_close(tmp_fits):
+    # An update-mode data edit must persist even without an explicit flush() (close flushes).
+    p = tmp_fits("upd.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.zeros((2, 2), dtype="f4"))]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h[0].data[:] = 7.0
+    with zf.open(p) as chk:
+        assert float(chk[0].data[0, 0]) == 7.0
+
+
+def test_ascii_wide_int_column_roundtrips(tmp_fits):
+    # An ASCII 'I11' column must read back at full width (was mis-sized to int16 -> overflow).
+    p = tmp_fits("ascii.fits")
+    col = zf.Column("BIGINT", "I11", array=np.array([100000, 2000000, -3000000], dtype="i8"))
+    zf.HDUList([zf.PrimaryHDU(), zf.AsciiTableHDU.from_columns([col])]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:
+        np.testing.assert_array_equal(hdul[1].data["BIGINT"], [100000, 2000000, -3000000])
+
+
+def test_commentary_preserved_through_reconstruction(tmp_fits):
+    # A COMMENT card must survive the reconstruction (non-pristine) write path.
+    src, out = tmp_fits("c.fits"), tmp_fits("c_out.fits")
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))
+    h.header["COMMENT"] = "provenance note"
+    zf.HDUList([h]).writeto(src, overwrite=True)
+    hdul = zf.open(src)
+    hdul.append(zf.ImageHDU(data=np.zeros(3, dtype="i2"), name="X"))  # forces reconstruction
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert any("provenance" in cc for cc in chk[0].header.comments)
+
+
+def test_unknown_open_mode_raises(tmp_fits):
+    p = tmp_fits("m.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
+    with pytest.raises(ValueError):
+        zf.open(p, mode="rw")  # a typo must error, not silently fall back to read-only
+
+
+def test_pathlib_path_accepted(tmp_fits):
+    import pathlib
+    p = pathlib.Path(tmp_fits("path.fits"))
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="i2"))]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:  # both writeto and open accept a Path
+        np.testing.assert_array_equal(hdul[0].data, [0, 1, 2, 3])
+
+
+def test_failed_writeto_leaves_no_partial_file(tmp_fits):
+    import os
+    p = tmp_fits("dest.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones(3, dtype="i2"))]).writeto(p, overwrite=True)
+    before = open(p, "rb").read()
+
+    class Boom(zf.PrimaryHDU):
+        def _write_to(self, handle, primary):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        zf.HDUList([Boom(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
+    assert open(p, "rb").read() == before  # original intact, no partial temp left behind
+    assert not os.path.exists(str(p) + ".zigfitsio.tmp")

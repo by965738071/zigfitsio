@@ -145,6 +145,9 @@ class Header:
         self._cards: list[_Card] = []
         self._persist: Optional[Callable[[str, Any, Optional[str]], None]] = None
         self._delete: Optional[Callable[[str], None]] = None
+        # Called after an edit that is NOT persisted to an open handle (read-only mode), so the
+        # owning HDUList can flag itself dirty and reconstruct rather than copy stale bytes on save.
+        self._dirty_cb: Optional[Callable[[], None]] = None
 
     # ── construction ──────────────────────────────────────────────────────────────────────
     @classmethod
@@ -179,24 +182,29 @@ class Header:
         if isinstance(value, tuple) and len(value) == 2:
             value, comment = value
         i = self._find(key)
+        resolved_comment = comment if comment is not None else (self._cards[i].comment if i >= 0 else "")
+        # Persist FIRST: a rejected edit (a structural keyword, or a read-only device) must not
+        # leave a bogus card in the in-memory header, which would poison every later read.
+        if self._persist is not None:
+            self._persist(key, value, resolved_comment)
         if i >= 0:
             self._cards[i].value = value
             if comment is not None:
                 self._cards[i].comment = comment
-            else:
-                comment = self._cards[i].comment
         else:
             self._cards.append(_Card(key.upper(), value, comment or ""))
-        if self._persist is not None:
-            self._persist(key, value, comment)
+        if self._persist is None and self._dirty_cb is not None:
+            self._dirty_cb()  # read-only edit → not in the handle's bytes; reconstruct on save
 
     def __delitem__(self, key: str) -> None:
         i = self._find(key)
         if i < 0:
             raise KeyError(key)
-        del self._cards[i]
         if self._delete is not None:
-            self._delete(key)
+            self._delete(key)  # persist first; on failure the in-memory card is retained
+        del self._cards[i]
+        if self._delete is None and self._dirty_cb is not None:
+            self._dirty_cb()
 
     def __iter__(self) -> Iterator[str]:
         for c in self._cards:
