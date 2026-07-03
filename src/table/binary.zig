@@ -272,6 +272,7 @@ pub const BinTable = struct {
     /// the current row count (append). `error.RowOutOfRange` otherwise.
     pub fn insertRows(self: *BinTable, before_row: u64, n: u64) OpenError!void {
         try self.requireWritable();
+        try self.rejectHeapGap();
         if (before_row > self.naxis2) return error.RowOutOfRange;
         if (n == 0) return;
         const naxis1 = self.naxis1;
@@ -301,6 +302,7 @@ pub const BinTable = struct {
     /// unit shrinks by `n×NAXIS1`. `error.RowOutOfRange` if the range is out of bounds.
     pub fn deleteRows(self: *BinTable, first_row: u64, n: u64) OpenError!void {
         try self.requireWritable();
+        try self.rejectHeapGap();
         if (n == 0) return;
         const end = std.math.add(u64, first_row, n) catch return error.RowOutOfRange;
         if (end > self.naxis2) return error.RowOutOfRange;
@@ -442,9 +444,22 @@ pub const BinTable = struct {
         if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
     }
 
+    // Reject a size-changing edit on a table whose heap is offset from the end of the row matrix by
+    // an explicit `THEAP` gap. Every heap-relocating edit here assumes the heap immediately follows
+    // the rows at `data_off + NAXIS1×NAXIS2` (as every conforming writer emits); with a gap it would
+    // relocate the wrong bytes and SILENTLY corrupt the heap. Turn that documented limitation into a
+    // clean error instead. No heap (`PCOUNT == 0`) or an absent/default `THEAP` is fine.
+    fn rejectHeapGap(self: *const BinTable) OpenError!void {
+        if (self.hdu.pcount == 0) return;
+        const theap = self.hdu.header.getValue(i64, "THEAP") catch return; // absent ⇒ default position
+        const default_theap = try limits.mul(self.naxis1, self.naxis2);
+        if (theap < 0 or @as(u64, @intCast(theap)) != default_theap) return error.BadTbcol;
+    }
+
     // Grow each row from `old_naxis1` to a wider `new_naxis1`: resize the data unit, slide the
     // heap up clear of the larger row matrix, then re-stride the rows back-to-front via `segs`.
     fn applyGrow(self: *BinTable, alloc: Allocator, old_naxis1: u64, new_naxis1: u64, segs: []const Seg) OpenError!void {
+        try self.rejectHeapGap();
         const nrows = self.naxis2;
         const pcount = self.hdu.pcount;
         const old_rows = try limits.mul(old_naxis1, nrows);
@@ -462,6 +477,7 @@ pub const BinTable = struct {
     // Shrink each row from `old_naxis1` to a narrower `new_naxis1`: re-stride the rows
     // front-to-back via `segs`, slide the heap down to follow, then shrink the data unit.
     fn applyShrink(self: *BinTable, alloc: Allocator, old_naxis1: u64, new_naxis1: u64, segs: []const Seg) OpenError!void {
+        try self.rejectHeapGap();
         const nrows = self.naxis2;
         const pcount = self.hdu.pcount;
         const old_rows = try limits.mul(old_naxis1, nrows);

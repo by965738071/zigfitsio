@@ -296,11 +296,15 @@ pub const TiledImage = struct {
         // Validate the pixel product against the configured ceiling before later allocation.
         const npix = try limits.naxisProduct(znaxisn, fits.limits.max_naxis_product);
 
-        // Tile count = product of per-axis covering-tile counts (handles non-multiple sizes).
+        // Tile count = product of per-axis covering-tile counts (handles non-multiple sizes). It
+        // must equal the table row count: each tile is one BINTABLE row. Validate up front (parity
+        // with TileTable.ofTable) so a mismatched geometry fails with a clear BadTiling rather than
+        // a later, less-specific RowOutOfRange on the first tile access.
         var ntiles_total: u64 = 1;
         for (0..znaxis) |i| {
             ntiles_total = try limits.mul(ntiles_total, ceilDiv(znaxisn[i], ztilen[i]));
         }
+        if (ntiles_total != base.naxis2) return error.BadTiling;
 
         // ZQUANTIZ / ZDITHER0 (optional, recorded).
         const quantize = blk: {

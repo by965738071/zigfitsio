@@ -112,7 +112,12 @@ pub const HttpDevice = struct {
             req.sendBodiless() catch return error.ReadFailed;
             const resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
             if (resp.head.status == .ok) {
-                if (resp.head.content_length) |len| return len;
+                // Reject a size beyond what this backend can cache/serve rather than admitting an
+                // attacker-chosen ~2^64 Content-Length that would feed unbounded offset arithmetic.
+                if (resp.head.content_length) |len| {
+                    if (len > self.max_cache_bytes) return error.DeviceFull;
+                    return len;
+                }
             }
         }
 
@@ -128,7 +133,10 @@ pub const HttpDevice = struct {
             req.sendBodiless() catch return error.ReadFailed;
             var resp = req.receiveHead(&self.redirect_buf) catch return error.ReadFailed;
             if (resp.head.status == .partial_content) {
-                if (contentRangeTotal(&resp)) |total| return total;
+                if (contentRangeTotal(&resp)) |total| {
+                    if (total > self.max_cache_bytes) return error.DeviceFull;
+                    return total;
+                }
             }
         }
 
