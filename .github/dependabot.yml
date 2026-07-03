@@ -6,6 +6,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # codeql-action/init and .../analyze are separate "dependencies" to Dependabot but
+      # MUST move in lockstep — a v3 init writes a config a v4 analyze rejects ("Loaded a
+      # configuration file for version '3.x', but running version '4.x'"). Group them so
+      # every bump updates both paths in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
   - package-ecosystem: pip
     directory: / # pyproject.toml (bindings runtime dep: numpy)
     schedule:
