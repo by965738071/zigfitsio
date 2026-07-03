@@ -289,7 +289,7 @@ const MemoryDevice = @import("io/memory.zig").MemoryDevice;
 
 fn parseHeader(alloc: Allocator, cards: []const []const u8) !struct { h: Header, consumed: u64, mem: *MemoryDevice, reader: *block.BlockReader } {
     const mem = try alloc.create(MemoryDevice);
-    var buf: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var buf: [block.BLOCK]u8 = @splat(' ');
     for (cards, 0..) |c, i| @memcpy(buf[i * 80 ..][0..c.len], c);
     @memcpy(buf[cards.len * 80 ..][0..3], "END");
     mem.* = try MemoryDevice.initBytes(alloc, &buf);

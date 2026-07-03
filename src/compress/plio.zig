@@ -325,7 +325,7 @@ fn forEachOpcode(enc: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), u1
 }
 
 test "round-trip: all-zero line (pure ZN runs)" {
-    const line = [_]i32{0} ** 100;
+    const line: [100]i32 = @splat(0);
     try expectRoundTrip(&line);
 }
 
@@ -334,7 +334,7 @@ test "round-trip: empty line" {
 }
 
 test "round-trip: single nonzero run" {
-    const line = [_]i32{7} ** 10;
+    const line: [10]i32 = @splat(7); // [_]i32{7} ** 10;
     try expectRoundTrip(&line);
 }
 
@@ -344,7 +344,7 @@ test "round-trip: multiple alternating runs" {
 }
 
 test "round-trip: high-value run >4095 exercises SH" {
-    const line = [_]i32{70000} ** 8; // 70000 = 0x11170 -> low 0x170, high 17
+    const line: [8]i32 = @splat(70000); // 70000 = 0x11170 -> low 0x170, high 17
     try expectRoundTrip(&line);
 }
 
@@ -360,7 +360,7 @@ test "round-trip: line exercising every opcode (ZN, SH, IH, DH, HN, PN, IS, DS)"
     const enc = try compress(testing.allocator, &line);
     defer testing.allocator.free(enc);
 
-    var seen = [_]bool{false} ** 8;
+    var seen: [8]bool = @splat(false);
     forEachOpcode(enc, &seen, struct {
         fn mark(s: *[8]bool, op: u16) void {
             s[op] = true;

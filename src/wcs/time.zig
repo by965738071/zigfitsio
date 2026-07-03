@@ -287,8 +287,8 @@ pub const TimeSys = enum {
             .{ "TDB", TimeSys.tdb }, .{ "TCG", TimeSys.tcg }, .{ "TCB", TimeSys.tcb },
             .{ "UT1", TimeSys.ut1 }, .{ "GPS", TimeSys.gps }, .{ "LOCAL", TimeSys.local },
             // Deprecated synonyms (Table 30): TDT/ET ⇒ TT, IAT ⇒ TAI, GMT ⇒ UTC.
-            .{ "TDT", TimeSys.tt }, .{ "ET", TimeSys.tt },
-            .{ "IAT", TimeSys.tai }, .{ "GMT", TimeSys.utc },
+            .{ "TDT", TimeSys.tt },  .{ "ET", TimeSys.tt },   .{ "IAT", TimeSys.tai },
+            .{ "GMT", TimeSys.utc },
         };
         inline for (map) |e| if (std.ascii.eqlIgnoreCase(t, e[0])) return e[1];
         // A bare `UT` (generic Universal Time) is taken as UT1.
@@ -299,9 +299,16 @@ pub const TimeSys = enum {
     /// The canonical keyword string for this scale, or `null` for `.unknown`.
     pub fn toString(self: TimeSys) ?[]const u8 {
         return switch (self) {
-            .utc => "UTC", .tai => "TAI", .tt => "TT", .tdb => "TDB",
-            .tcg => "TCG", .tcb => "TCB", .ut1 => "UT1", .gps => "GPS",
-            .local => "LOCAL", .unknown => null,
+            .utc => "UTC",
+            .tai => "TAI",
+            .tt => "TT",
+            .tdb => "TDB",
+            .tcg => "TCG",
+            .tcb => "TCB",
+            .ut1 => "UT1",
+            .gps => "GPS",
+            .local => "LOCAL",
+            .unknown => null,
         };
     }
 };
@@ -337,12 +344,12 @@ pub const RefPos = enum {
         const map = .{
             .{ "TOP", RefPos.topocenter }, .{ "GEO", RefPos.geocenter },
             .{ "BAR", RefPos.barycenter }, .{ "REL", RefPos.relocatable },
-            .{ "CUS", RefPos.custom }, .{ "HEL", RefPos.heliocenter },
-            .{ "GAL", RefPos.galactic }, .{ "EMB", RefPos.embarycenter },
-            .{ "MER", RefPos.mercury }, .{ "VEN", RefPos.venus },
-            .{ "MAR", RefPos.mars }, .{ "JUP", RefPos.jupiter },
-            .{ "SAT", RefPos.saturn }, .{ "URA", RefPos.uranus },
-            .{ "NEP", RefPos.neptune }, .{ "PLU", RefPos.pluto },
+            .{ "CUS", RefPos.custom },     .{ "HEL", RefPos.heliocenter },
+            .{ "GAL", RefPos.galactic },   .{ "EMB", RefPos.embarycenter },
+            .{ "MER", RefPos.mercury },    .{ "VEN", RefPos.venus },
+            .{ "MAR", RefPos.mars },       .{ "JUP", RefPos.jupiter },
+            .{ "SAT", RefPos.saturn },     .{ "URA", RefPos.uranus },
+            .{ "NEP", RefPos.neptune },    .{ "PLU", RefPos.pluto },
         };
         inline for (map) |e| if (std.ascii.eqlIgnoreCase(pre, e[0])) return e[1];
         return .unknown;
@@ -351,13 +358,23 @@ pub const RefPos = enum {
     /// The canonical keyword string for this position, or `null` for `.unknown`.
     pub fn toString(self: RefPos) ?[]const u8 {
         return switch (self) {
-            .topocenter => "TOPOCENTER", .geocenter => "GEOCENTER",
-            .barycenter => "BARYCENTER", .heliocenter => "HELIOCENTER",
-            .relocatable => "RELOCATABLE", .custom => "CUSTOM",
-            .galactic => "GALACTIC", .embarycenter => "EMBARYCENTER",
-            .mercury => "MERCURY", .venus => "VENUS", .mars => "MARS",
-            .jupiter => "JUPITER", .saturn => "SATURN", .uranus => "URANUS",
-            .neptune => "NEPTUNE", .pluto => "PLUTO", .unknown => null,
+            .topocenter => "TOPOCENTER",
+            .geocenter => "GEOCENTER",
+            .barycenter => "BARYCENTER",
+            .heliocenter => "HELIOCENTER",
+            .relocatable => "RELOCATABLE",
+            .custom => "CUSTOM",
+            .galactic => "GALACTIC",
+            .embarycenter => "EMBARYCENTER",
+            .mercury => "MERCURY",
+            .venus => "VENUS",
+            .mars => "MARS",
+            .jupiter => "JUPITER",
+            .saturn => "SATURN",
+            .uranus => "URANUS",
+            .neptune => "NEPTUNE",
+            .pluto => "PLUTO",
+            .unknown => null,
         };
     }
 };
@@ -606,7 +623,7 @@ test "TimeCoords parses the global time keyword set" {
     const blk = @import("../io/block.zig");
     const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
     const a = testing.allocator;
-    var buf: [blk.BLOCK]u8 = [_]u8{' '} ** blk.BLOCK;
+    var buf: [blk.BLOCK]u8 = @splat(' ');
     const cards = [_][]const u8{
         "TIMESYS = 'TT'",
         "TREFPOS = 'GEOCENTER'",

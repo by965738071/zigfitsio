@@ -53,7 +53,7 @@ fn kw(buf: []u8, comptime prefix: []const u8, n: usize) []const u8 {
 /// Append a commentary card (`COMMENT`/`HISTORY`) with free text via the raw-card path.
 fn appendCommentary(h: *fits.Header, alloc: Allocator, comptime keyword: []const u8, text: []const u8) !void {
     comptime std.debug.assert(keyword.len <= 8);
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..keyword.len], keyword);
     const n = @min(text.len, 80 - 8);
     @memcpy(raw[8..][0..n], text[0..n]);
@@ -439,7 +439,7 @@ test "e2e: image scaling, BLANK/NaN nulls, and section I/O" {
         try testing.expectEqualSlices(i32, &[_]i32{ 6, 8, 10, 18, 20, 22 }, &out);
 
         var img2 = try fits.ImageView.append(&f, .{ .bitpix = 32, .axes = &.{ 4, 3 } });
-        var zeros = [_]i32{0} ** 12;
+        var zeros: [12]i32 = @splat(0);
         try img2.writeAll(i32, &zeros, .{});
         var nines = [_]i32{ 9, 9, 9, 9 };
         try img2.writeSection(i32, &.{ 0, 0 }, &.{ 2, 2 }, &.{ 2, 2 }, &nines, .{});

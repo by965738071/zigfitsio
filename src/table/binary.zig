@@ -751,7 +751,7 @@ fn moveRegion(dev: Device, src: u64, dst: u64, len: u64) errors.IoError!void {
 // Zero exactly `len` bytes at `off` on `dev`, in bounded chunks.
 fn zeroBytes(dev: Device, off: u64, len: u64) errors.IoError!void {
     if (len == 0) return;
-    var buf: [MOVE_CHUNK]u8 = [_]u8{0} ** MOVE_CHUNK;
+    var buf: [MOVE_CHUNK]u8 = @splat(0);
     var remaining = len;
     var o = off;
     while (remaining > 0) {
@@ -1239,7 +1239,7 @@ test "X bit column packs/unpacks MSB-first; r=0 accepted" {
     var t = try BinTable.of(&f, hdu);
     defer t.deinit(alloc);
 
-    var bits: [16]bool = [_]bool{false} ** 16;
+    var bits: [16]bool = @splat(false);
     bits[0] = true; // MSB of first byte
     bits[8] = true; // MSB of second byte
     bits[15] = true; // LSB of second byte
@@ -1570,7 +1570,7 @@ test "FR-BTB-7: TDIM string array resets NUL/pad per substring (60A / (5,4,3))" 
 
     // Each 5-byte slot decodes independently: chars up to its first NUL, then spaces.
     for (words, 0..) |w, s| {
-        var exp: [5]u8 = [_]u8{' '} ** 5;
+        var exp: [5]u8 = @splat(' ');
         @memcpy(exp[0..w.len], w);
         try testing.expectEqualSlices(u8, &exp, out[s * 5 ..][0..5]);
     }

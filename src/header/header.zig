@@ -103,7 +103,7 @@ pub const Header = struct {
         const n = std.mem.trimEnd(u8, name, " ");
         if (n.len == 0) return false; // blank
         const exact = [_][]const u8{
-            "SIMPLE",  "XTENSION", "BITPIX", "NAXIS",  "PCOUNT", "GCOUNT",
+            "SIMPLE",  "XTENSION", "BITPIX", "NAXIS",   "PCOUNT",  "GCOUNT",
             "TFIELDS", "EXTEND",   "END",    "COMMENT", "HISTORY", "GROUPS",
         };
         for (exact) |e| if (std.ascii.eqlIgnoreCase(n, e)) return false;
@@ -314,7 +314,7 @@ pub const Header = struct {
     /// before serialization.
     pub fn ensureEnd(self: *Header, alloc: Allocator) (HeaderError || Allocator.Error)!void {
         if (self.cards.items.len > 0 and self.cards.items[self.cards.items.len - 1].kind == .end) return;
-        var raw: [80]u8 = [_]u8{' '} ** 80;
+        var raw: [80]u8 = @splat(' ');
         @memcpy(raw[0..3], "END");
         try self.cards.append(alloc, try Card.parse(&raw));
     }
@@ -385,7 +385,7 @@ pub const Header = struct {
     /// place without rewriting following HDUs (FR-HDR-12, header-space pre-allocation).
     pub fn reserveSpace(self: *Header, alloc: Allocator, n: usize) (HeaderError || Allocator.Error)!void {
         const pos = self.endIndex() orelse self.cards.items.len;
-        const blank: [80]u8 = [_]u8{' '} ** 80;
+        const blank: [80]u8 = @splat(' ');
         var k: usize = 0;
         while (k < n) : (k += 1) try self.cards.insert(alloc, pos, try Card.parse(&blank));
     }
@@ -407,7 +407,7 @@ const MemoryDevice = @import("../io/memory.zig").MemoryDevice;
 // Assemble a minimal in-memory header (cards then END, space-padded to a block) and return a
 // MemoryDevice holding it.
 fn buildHeaderDevice(alloc: Allocator, cards: []const []const u8) !MemoryDevice {
-    var buf: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var buf: [block.BLOCK]u8 = @splat(' ');
     for (cards, 0..) |c, i| {
         @memcpy(buf[i * 80 ..][0..c.len], c);
     }
@@ -446,7 +446,7 @@ test "parse scans to END and reads values with conversion" {
 }
 
 test "missing END within budget is an error" {
-    var buf: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+    var buf: [block.BLOCK]u8 = @splat(' ');
     @memcpy(buf[0..6], "SIMPLE");
     var mem = try MemoryDevice.initBytes(testing.allocator, &buf);
     defer mem.deinit();

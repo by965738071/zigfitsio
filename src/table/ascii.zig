@@ -391,7 +391,7 @@ pub const AsciiTable = struct {
 
     /// Write `count` ASCII spaces at `off`, in bounded chunks (no allocation).
     fn padSpaces(self: *AsciiTable, off: u64, count: u64) errors.IoError!void {
-        const spaces = [_]u8{' '} ** 256;
+        const spaces: [256]u8 = @splat(' ');
         var done: u64 = 0;
         while (done < count) {
             const n: usize = @intCast(@min(@as(u64, spaces.len), count - done));

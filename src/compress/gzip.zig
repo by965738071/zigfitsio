@@ -81,13 +81,18 @@ fn isShuffleWidth(w: usize) bool {
 const testing = std.testing;
 
 test "GZIP_1 encode→decode round-trips" {
-    const original = "SIMPLE  =                    T / FITS tile payload " ** 30;
-    const enc = try gzipEncode(testing.allocator, original);
+    const original = comptime blk: {
+        const s = "SIMPLE  =                    T / FITS tile payload ";
+        var buf: [s.len * 30]u8 = undefined;
+        for (0..30) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    const enc = try gzipEncode(testing.allocator, &original);
     defer testing.allocator.free(enc);
     try testing.expect(enc.len < original.len);
     const dec = try gzipDecode(testing.allocator, enc, 1 << 20);
     defer testing.allocator.free(dec);
-    try testing.expectEqualStrings(original, dec);
+    try testing.expectEqualStrings(&original, dec);
 }
 
 test "GZIP_2 shuffles numeric widths and round-trips" {
@@ -103,16 +108,21 @@ test "GZIP_2 shuffles numeric widths and round-trips" {
 }
 
 test "GZIP_2 with width 1 is plain gzip (no shuffle)" {
-    const data = "byte column data, no shuffle for A/B/L" ** 4;
-    const enc = try gzip2Encode(testing.allocator, data, 1);
+    const data = comptime blk: {
+        const s = "byte column data, no shuffle for A/B/L";
+        var buf: [s.len * 4]u8 = undefined;
+        for (0..4) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    const enc = try gzip2Encode(testing.allocator, &data, 1);
     defer testing.allocator.free(enc);
     const dec = try gzip2Decode(testing.allocator, enc, 1, 1 << 20);
     defer testing.allocator.free(dec);
-    try testing.expectEqualStrings(data, dec);
+    try testing.expectEqualStrings(&data, dec);
 }
 
 test "decode enforces the output ceiling" {
-    const original = "x" ** 5000;
+    const original = &@as([5000]u8, @splat('x'));
     const enc = try gzipEncode(testing.allocator, original);
     defer testing.allocator.free(enc);
     try testing.expectError(error.CorruptTile, gzipDecode(testing.allocator, enc, 100));

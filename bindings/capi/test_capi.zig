@@ -307,7 +307,7 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     // zf_read_key_longstr is allocate-and-return; verify the round-trip and release with
     // zf_free.
     const name = "LONGSTR";
-    const longval = "x" ** 100;
+    const longval = &@as([100]u8, @splat('x'));
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
     var out_ptr: ?[*]u8 = null;
     var out_len: usize = 0;
@@ -376,7 +376,7 @@ test "rename_key and insert_record" {
     var idx_count: c_long = -1;
     try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &idx_count));
     const end_idx = idx_count - 1;
-    var card: [80]u8 = [_]u8{' '} ** 80;
+    var card: [80]u8 = @splat(' ');
     const text = "HISTORY inserted via zf_insert_record";
     @memcpy(card[0..text.len], text);
     try testing.expectEqual(@as(c_int, 0), capi.zf_insert_record(hh, end_idx, &card));
@@ -499,7 +499,7 @@ test "write_subset round-trips a rectangular section" {
     const hh = h.?;
     const axes = [_]c_long{ 4, 4 };
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 32, 2, &axes));
-    var zero: [16]i32 = [_]i32{0} ** 16;
+    var zero: [16]i32 = @splat(0);
     try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(hh, I32, 1, 16, null, null, &zero));
 
     const lo = [_]c_long{ 1, 1 };

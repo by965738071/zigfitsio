@@ -101,7 +101,7 @@ pub const Name = struct {
     /// or empty field is right-padded with spaces (an all-space field is a blank name).
     pub fn parse(field: []const u8) HeaderError!Name {
         if (field.len > 8) return error.BadKeywordName;
-        var self: Name = .{ .bytes = [_]u8{' '} ** 8 };
+        var self: Name = .{ .bytes = @as([8]u8, @splat(' ')) };
         for (field, 0..) |c, i| {
             const up = std.ascii.toUpper(c);
             const ok = (up >= 'A' and up <= 'Z') or

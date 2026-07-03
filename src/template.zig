@@ -192,7 +192,7 @@ const Builder = struct {
 // fixed/free-format card via `Header.appendValue` — the same path the programmatic builder uses.
 fn appendKeyword(alloc: Allocator, header: *Header, name: Name, after_kw: []const u8) FitsError!void {
     if (name.isCommentary()) {
-        var raw: [80]u8 = [_]u8{' '} ** 80;
+        var raw: [80]u8 = @splat(' ');
         const nt = name.text();
         @memcpy(raw[0..nt.len], nt);
         if (after_kw.len > COMMENTARY_WIDTH) return error.CardOverflow;

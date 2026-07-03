@@ -694,7 +694,7 @@ test "writeSection writes a strided sub-rectangle, preserving gaps" {
     var f = try Fits.create(testing.allocator, mem.device(), .{});
     defer f.deinit();
     var img = try ImageView.append(&f, .{ .bitpix = 32, .axes = &.{ w, h } });
-    var zeros = [_]i32{0} ** (w * h);
+    var zeros: [w * h]i32 = @splat(0);
     try img.writeAll(i32, &zeros, .{});
 
     // Write 9s into x in {0,2}, y in {0,2}.
@@ -844,7 +844,7 @@ test "reshape rejects bad BITPIX and too many axes (IMG-7 validation)" {
 
     try testing.expectError(error.BadBitpix, img.reshape(7, &.{4}));
     try testing.expectError(error.BadBitpix, img.reshape(0, &.{4}));
-    const too_many = [_]u64{1} ** 1000;
+    const too_many: [1000]u64 = @splat(1);
     try testing.expectError(error.BadNaxis, img.reshape(16, &too_many));
 
     // The HDU geometry is unchanged after the rejected calls.

@@ -88,7 +88,7 @@ fn tuning(comptime W: usize) Tuning {
 }
 
 fn Unsigned(comptime T: type) type {
-    return std.meta.Int(.unsigned, @bitSizeOf(T));
+    return @Int(.unsigned, @bitSizeOf(T));
 }
 
 // Zig-zag fold: signed `d` → non-negative `2d` (d≥0) / `2|d|-1` (d<0), all in W-bit wrap arithmetic.
@@ -319,7 +319,7 @@ fn roundtrip(comptime T: type, vals: []const T, blocksize: u32) !void {
 test "round-trip i8 across patterns and blocksizes" {
     inline for (.{ 16, 32 }) |bs| {
         try roundtrip(i8, &.{42}, bs); // single element
-        try roundtrip(i8, &[_]i8{5} ** 100, bs); // constant
+        try roundtrip(i8, &@as([100]i8, @splat(5)), bs); // constant
         var ramp: [200]i8 = undefined;
         for (&ramp, 0..) |*p, k| p.* = @truncate(@as(i32, @intCast(k)) - 100);
         try roundtrip(i8, &ramp, bs); // ramp
@@ -339,7 +339,7 @@ test "round-trip i8 across patterns and blocksizes" {
 test "round-trip i16 across patterns and blocksizes" {
     inline for (.{ 16, 32 }) |bs| {
         try roundtrip(i16, &.{-12345}, bs);
-        try roundtrip(i16, &[_]i16{1000} ** 100, bs);
+        try roundtrip(i16, &@as([100]i16, @splat(1000)), bs);
         var ramp: [300]i16 = undefined;
         for (&ramp, 0..) |*p, k| p.* = @truncate(@as(i32, @intCast(k)) * 37 - 5000);
         try roundtrip(i16, &ramp, bs);
@@ -359,7 +359,7 @@ test "round-trip i16 across patterns and blocksizes" {
 test "round-trip i32 across patterns and blocksizes" {
     inline for (.{ 16, 32 }) |bs| {
         try roundtrip(i32, &.{-2000000000}, bs);
-        try roundtrip(i32, &[_]i32{123456} ** 100, bs);
+        try roundtrip(i32, &@as([100]i32, @splat(123456)), bs);
         var ramp: [300]i32 = undefined;
         for (&ramp, 0..) |*p, k| p.* = @as(i32, @intCast(k)) * 100003 - 1000000;
         try roundtrip(i32, &ramp, bs);
@@ -387,7 +387,7 @@ test "empty tile round-trips to empty" {
 
 test "constant tile compresses far below raw size" {
     const alloc = testing.allocator;
-    const raw = try pack(i32, alloc, &[_]i32{7} ** 1000);
+    const raw = try pack(i32, alloc, &@as([1000]i32, @splat(7)));
     defer alloc.free(raw);
     const enc = try compress(alloc, raw, 4, 32);
     defer alloc.free(enc);

@@ -132,7 +132,8 @@ pub fn build(b: *std.Build) void {
     emit_mod.addImport("zigfitsio", mod);
     const emit = b.addExecutable(.{ .name = "emit-fixtures", .root_module = emit_mod });
     const run_emit = b.addRunArtifact(emit);
-    if (b.args) |args| run_emit.addArgs(args);
+    //if (b.args) |args| run_emit.addArgs(args);
+    run_emit.addPassthruArgs();
     const emit_step = b.step("emit-fixtures", "Emit the zigfitsio-authored outbound interop corpus");
     emit_step.dependOn(&run_emit.step);
 
@@ -145,7 +146,8 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("zigfitsio", mod);
     const bench = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     const run_bench = b.addRunArtifact(bench);
-    if (b.args) |args| run_bench.addArgs(args);
+    //if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run throughput benchmarks");
     bench_step.dependOn(&run_bench.step);
 
@@ -159,7 +161,8 @@ pub fn build(b: *std.Build) void {
     const fitsverify = b.addExecutable(.{ .name = "fitsverify", .root_module = fv_mod });
     b.installArtifact(fitsverify);
     const run_fv = b.addRunArtifact(fitsverify);
-    if (b.args) |args| run_fv.addArgs(args);
+    //if (b.args) |args| run_fv.addArgs(args);
+    run_fv.addPassthruArgs();
     const fv_step = b.step("fitsverify", "Run the fitsverify CLI demo");
     fv_step.dependOn(&run_fv.step);
 

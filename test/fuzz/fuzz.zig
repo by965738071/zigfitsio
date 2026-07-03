@@ -55,7 +55,7 @@ fn fuzzOpen(_: void, smith: *Smith) anyerror!void {
 
 fn firstCoord(naxis: u16) [999]u64 {
     _ = naxis;
-    return [_]u64{0} ** 999;
+    return @as([999]u64, @splat(0));
 }
 
 test "fuzz: card parser" {
@@ -125,7 +125,7 @@ test "seeds: hostile headers yield typed errors, never panic or huge alloc" {
 }
 
 test "seeds: a control character in a card is rejected" {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..6], "OBJECT");
     raw[20] = 0x07; // bell
     try std.testing.expectError(error.NonAsciiInHeader, fits.Card.parse(&raw));

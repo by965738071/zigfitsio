@@ -978,7 +978,7 @@ test "block-aligned trailing special records yield no false-positive findings" {
         // Append one 2880-byte special-records block (§3.5): parses as a header (ends with END) but
         // is not a valid extension, so the scanner stops there and the file stays block-aligned.
         const eof = try f.dev.getSize();
-        var blk: [block.BLOCK]u8 = [_]u8{' '} ** block.BLOCK;
+        var blk: [block.BLOCK]u8 = @splat(' ');
         const comment = "COMMENT trailing special records, not an HDU";
         @memcpy(blk[0..comment.len], comment);
         @memcpy(blk[80..83], "END");

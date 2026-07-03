@@ -155,8 +155,13 @@ pub fn compressDeviceToGzip(
 const testing = std.testing;
 
 test "stdin-style stream materializes into a seekable Device and round-trips" {
-    const payload = "SIMPLE  =                    T" ** 10; // arbitrary sequential bytes
-    var reader = std.Io.Reader.fixed(payload);
+    const payload = comptime blk: {
+        const s = "SIMPLE  =                    T";
+        var buf: [s.len * 10]u8 = undefined;
+        for (0..10) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    var reader = std.Io.Reader.fixed(&payload);
     var mem = try materialize(testing.allocator, &reader, 1 << 20);
     defer mem.deinit();
 
@@ -198,8 +203,10 @@ test "gzip round-trips a FITS-ish buffer through materializeGzip" {
     // 2880-byte block zero-fill — exercises both literals and back-references in deflate.
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(testing.allocator);
-    try plain.appendSlice(testing.allocator, "SIMPLE  =                    T" ** 16);
-    try plain.appendSlice(testing.allocator, "BITPIX  =                   16" ** 16);
+    const sim = "SIMPLE  =                    T";
+    for (0..16) |_| try plain.appendSlice(testing.allocator, sim);
+    const bit = "BITPIX  =                   16";
+    for (0..16) |_| try plain.appendSlice(testing.allocator, bit);
     try plain.appendNTimes(testing.allocator, ' ', 2880);
     try plain.appendNTimes(testing.allocator, 0, 2880);
 
@@ -223,7 +230,7 @@ test "gzip round-trips a FITS-ish buffer through materializeGzip" {
 
 test "materializeGzip enforces the decompressed-size ceiling" {
     // ~8 KiB of zeros compresses tiny but inflates well past a 1 KiB ceiling -> LimitExceeded.
-    const plain = [_]u8{0} ** 8192;
+    const plain: [8192]u8 = @splat(0);
     const compressed = try gzipToOwned(&plain);
     defer testing.allocator.free(compressed);
 
@@ -244,7 +251,11 @@ test "materializeGzip rejects garbage with a typed error, not a panic" {
 }
 
 test "materializeGzip rejects a truncated gzip container" {
-    const compressed = try gzipToOwned("payload that will be cut off mid-stream " ** 8);
+    // Build a repeated payload string without using the removed ** operator.
+    const src = "payload that will be cut off mid-stream ";
+    var payload: [src.len * 8]u8 = undefined;
+    for (0..8) |i| @memcpy(payload[i * src.len ..][0..src.len], src);
+    const compressed = try gzipToOwned(&payload);
     defer testing.allocator.free(compressed);
 
     // Lop off the trailing CRC32/ISIZE footer (and a few body bytes): the decoder must fault.
@@ -277,7 +288,14 @@ test "gzip round-trips an empty payload" {
 test "compressDeviceToGzip + inflateGzipToDevice round-trip a Device end to end" {
     var src = MemoryDevice.init(testing.allocator);
     defer src.deinit();
-    const payload = "SIMPLE  =                    T" ** 24 ++ ("\x00" ** 1024);
+    const payload_arr = comptime blk: {
+        const s = "SIMPLE  =                    T";
+        var buf: [s.len * 24 + 1024]u8 = undefined;
+        for (0..24) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        @memset(buf[s.len * 24 ..], 0);
+        break :blk buf;
+    };
+    const payload: []const u8 = &payload_arr;
     try src.device().writeAll(payload, 0);
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
@@ -298,7 +316,7 @@ test "inflateGzipToDevice maps a corrupt container to a typed ReadFailed" {
 }
 
 test "inflateGzipToDevice enforces the decompressed-size ceiling" {
-    const plain = [_]u8{0} ** 8192;
+    const plain: [8192]u8 = @splat(0);
     const compressed = try gzipToOwned(&plain);
     defer testing.allocator.free(compressed);
     try testing.expectError(

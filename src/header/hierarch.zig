@@ -72,7 +72,7 @@ pub fn parseValue(alloc: Allocator, card: *const Card) (HeaderError || errors.Va
 /// Build a `HIERARCH` card for hierarchical name `name` (spaced tokens) with value `v` and an
 /// optional comment. `error.CardOverflow` if it does not fit in 80 bytes.
 pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
-    var raw: [80]u8 = [_]u8{' '} ** 80;
+    var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..8], "HIERARCH");
     var w = std.Io.Writer.fixed(raw[8..]);
     w.writeByte(' ') catch return error.CardOverflow;
@@ -141,7 +141,7 @@ fn tokensEqualIgnoreCase(a: []const u8, b: []const u8) bool {
 const testing = std.testing;
 
 fn card80(s: []const u8) Card {
-    var b: [80]u8 = [_]u8{' '} ** 80;
+    var b: [80]u8 = @splat(' ');
     @memcpy(b[0..s.len], s);
     return Card.parse(&b) catch unreachable;
 }
