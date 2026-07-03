@@ -1,0 +1,36 @@
+name: CodeQL
+
+# Static code scanning for the Python bindings (bindings/python) and the workflow files
+# themselves (the `actions` language pack catches script-injection and permission issues).
+# Zig is not a CodeQL-supported language — the Zig core is covered by the test/fuzz/guard
+# lanes in ci.yml instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 2" # Tuesday 06:00 UTC, weekly
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload SARIF results
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: github/codeql-action/init@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3.36.3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/analyze@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3.36.3
+        with:
+          category: "/language:${{ matrix.language }}"
