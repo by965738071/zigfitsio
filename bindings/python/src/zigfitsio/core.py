@@ -556,6 +556,17 @@ class _TableHDU(_HDU):
             self._data = self._read_table()
         return self._data
 
+    @data.setter
+    def data(self, value):
+        # Replace the table's rows wholesale (e.g. `hdu.data = hdu.data[mask]` to filter rows).
+        # `writeto`/`to_bytes` reconstruct from this via _emit_columns; an in-place update-mode
+        # flush of a row-count change fails loud (see _flush_data). If the table was never read,
+        # there is no per-column baseline, so treat every column as changed on the next flush.
+        self._data = None if value is None else np.asarray(value)
+        if self._data is not None and self._col_fingerprints is None:
+            self._col_fingerprints = {}
+        self._mark_dirty()
+
     def _data_changed(self) -> bool:
         if self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
             return False

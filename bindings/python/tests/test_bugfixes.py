@@ -399,3 +399,36 @@ def test_unchanged_readonly_open_still_uses_fast_path(tmp_fits):
     hdul.close()
     with zf.open(out) as chk:
         np.testing.assert_array_equal(chk[0].data, np.arange(12).reshape(3, 4))
+
+
+def test_table_data_setter_replaces_rows(tmp_fits):
+    # Wholesale table-data replacement (e.g. row filtering) via the .data setter round-trips
+    # through writeto; an in-place update-mode row-count change fails loud (no silent loss).
+    def mk(p, n):
+        cols = [zf.Column("IDX", "1J", array=np.arange(n, dtype="i4")),
+                zf.Column("V", "1E", array=(np.arange(n) * 1.5).astype("f4"))]
+        zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols)]).writeto(p, overwrite=True)
+
+    src, out = tmp_fits("tds.fits"), tmp_fits("tdso.fits")
+    mk(src, 6)
+    h = zf.open(src)
+    h[1].data = h[1].data[h[1].data["IDX"] % 2 == 0]  # keep even rows -> [0,2,4]
+    h.writeto(out, overwrite=True)
+    h.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[1].data["IDX"], [0, 2, 4])
+
+    # update-mode assignment with the SAME row count persists on close.
+    u = tmp_fits("tdu.fits"); mk(u, 4)
+    with zf.open(u, mode="update") as h:
+        rec = h[1].data.copy(); rec["IDX"][:] = [10, 20, 30, 40]; h[1].data = rec
+    with zf.open(u) as chk:
+        np.testing.assert_array_equal(chk[1].data["IDX"], [10, 20, 30, 40])
+
+    # update-mode row-count change in place is unsupported -> fail loud, file left intact.
+    r = tmp_fits("tdr.fits"); mk(r, 5)
+    with pytest.raises(NotImplementedError):
+        with zf.open(r, mode="update") as h:
+            h[1].data = h[1].data[:3]
+    with zf.open(r) as chk:
+        assert len(chk[1].data) == 5
