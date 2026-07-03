@@ -72,6 +72,12 @@ build-frontend = "build"
 test-requires = ["pytest", "numpy", "astropy"]
 # The bundled library is import-time loaded; run the suite against the installed wheel.
 test-command = "pytest {project}/bindings/python/tests -q"
+# astropy publishes no musllinux/aarch64 wheel for every built CPython (e.g. none for cp39),
+# so the test-deps install source-builds astropy there — which fails to compile under the
+# musllinux_1_2 image's GCC 14 (-Wincompatible-pointer-types is now an error). The wheel is
+# still built and shipped; its test just doesn't run under musl/arm (the same-arch
+# manylinux_aarch64 wheel — identical Zig binary + bindings — is fully tested).
+test-skip = "*-musllinux_aarch64"
 
 # Linux wheels build inside a manylinux container, so fetch a pinned Zig 0.16 into it and put
 # it on PATH for hatch_build.py's system-`zig` fallback. macOS/Windows build on the host where
