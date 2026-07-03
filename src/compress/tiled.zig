@@ -393,10 +393,17 @@ pub const TiledImage = struct {
         if (out.len != self.npix) return error.BadDimensions;
         if (!self.ztype.isImplemented()) return error.UnsupportedCodec;
         // Lossy float compression: the stored tile values are quantized 32-bit integers, not the
-        // raw IEEE floats. Decode them as `i32` and undo the per-tile linear map plus the
-        // subtractive-dither offset (FITS 4.0 §10.2). `ZBITPIX < 0` keeps this off the integer
-        // image path.
-        if (self.quantize.isDithered() and self.zbitpix < 0) return self.readAllDithered(T, out);
+        // raw IEEE floats. The signal that a float image was quantized is the presence of a
+        // per-tile `ZSCALE` column (CFITSIO keys on exactly this), NOT the dither method — a
+        // `NO_DITHER` file (`fpack -q0`) is quantized too, just without the subtractive offset.
+        // Route every quantized float tile through the integer-decode path, which applies the
+        // per-tile linear map and (for `SUBTRACTIVE_DITHER_*`) the dither offset; `NO_DITHER`
+        // uses `kind == .none`, i.e. the linear map with no offset. An unrecognized `ZQUANTIZ`
+        // cannot be decoded safely — error rather than guess (CFITSIO does the same).
+        if (self.zbitpix < 0 and self.zscale_col != null) {
+            if (self.quantize == .unknown) return error.UnsupportedCodec;
+            return self.readAllDithered(T, out);
+        }
         switch (self.zbitpix) {
             8 => try self.readAllTyped(T, u8, out),
             16 => try self.readAllTyped(T, i16, out),
@@ -530,7 +537,9 @@ pub const TiledImage = struct {
         const table = try dither.fitsRandom(alloc);
         defer alloc.free(table);
         const kind = self.quantize.toDitherKind();
-        const zd = self.zdither0 orelse 0;
+        // A dithered file missing ZDITHER0 defaults to seed 1 (CFITSIO's default), matching the
+        // write path (`CompressSpec.zdither0 = 1`) and how funpack reads such a file.
+        const zd = self.zdither0 orelse 1;
         const nan = std.math.nan(f32);
 
         var row: u64 = 0;
@@ -547,37 +556,66 @@ pub const TiledImage = struct {
             }
             if (npix_tile == 0) continue;
 
-            const zs = try self.tileScale(row);
-            const zz = try self.tileZero(row);
-            // The null sentinel for the quantized integers is the declared `ZBLANK` when present,
-            // otherwise the convention's reserved `null_value` (handled inside `unquantizeNext`).
-            const blank: ?i64 = try self.tileBlank(row);
-
-            const expected = try limits.mul(npix_tile, w);
-            try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
-
-            const stored_bytes = try self.decodeTile(alloc, row, w, expected, npix_tile, tdim);
-            defer alloc.free(stored_bytes);
-            if (stored_bytes.len != @as(usize, @intCast(expected))) return error.CorruptTile;
-
-            var cur = dither.Dither.init(table, kind, zd, row);
-            var p: u64 = 0;
-            while (p < npix_tile) : (p += 1) {
-                var rp = p;
-                var full: u64 = 0;
-                for (0..n) |i| {
-                    const c = rp % tdim[i];
-                    rp /= tdim[i];
-                    full += (tstart[i] + c) * img_stride[i];
+            const src = try self.tileSource(row);
+            if (src == .compressed) {
+                // Quantized-integer tile: 32-bit stored values, per-tile linear map + dither.
+                const zs = try self.tileScale(row);
+                const zz = try self.tileZero(row);
+                // The null sentinel is the declared `ZBLANK` when present, otherwise the reserved
+                // `null_value` handled inside `unquantizeNext`.
+                const blank: ?i64 = try self.tileBlank(row);
+                const expected = try limits.mul(npix_tile, w);
+                try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
+                const stored_bytes = try self.decodeTile(alloc, row, w, expected, npix_tile, tdim);
+                defer alloc.free(stored_bytes);
+                if (stored_bytes.len != @as(usize, @intCast(expected))) return error.CorruptTile;
+                var cur = dither.Dither.init(table, kind, zd, row);
+                var p: u64 = 0;
+                while (p < npix_tile) : (p += 1) {
+                    var rp = p;
+                    var full: u64 = 0;
+                    for (0..n) |i| {
+                        const c = rp % tdim[i];
+                        rp /= tdim[i];
+                        full += (tstart[i] + c) * img_stride[i];
+                    }
+                    const byteoff: usize = @intCast(p * w);
+                    const s = endian.read(i32, stored_bytes[byteoff..][0..w]);
+                    // `unquantizeNext` always advances the dither cursor (keeping it in lock-step
+                    // with the encoder) and maps the reserved `null_value` to NaN; a declared
+                    // `ZBLANK` overrides that sentinel so its pixels also read back as NaN.
+                    const fval = cur.unquantizeNext(s, zs, zz, nan);
+                    const sub: f32 = if (blank) |bl| (if (@as(i64, s) == bl) nan else fval) else fval;
+                    out[@intCast(full)] = try convert.cast(T, sub, .bulk);
                 }
-                const byteoff: usize = @intCast(p * w);
-                const s = endian.read(i32, stored_bytes[byteoff..][0..w]);
-                // `unquantizeNext` always advances the dither cursor (keeping it in lock-step with the
-                // encoder) and maps the reserved `null_value` to NaN; a declared `ZBLANK` overrides
-                // that sentinel so its pixels also read back as the null substitute.
-                const fval = cur.unquantizeNext(s, zs, zz, nan);
-                const sub: f32 = if (blank) |bl| (if (@as(i64, s) == bl) nan else fval) else fval;
-                out[@intCast(full)] = try convert.cast(T, sub, .bulk);
+            } else {
+                // Lossless-fallback (GZIP_COMPRESSED_DATA/UNCOMPRESSED_DATA) or an empty tile: the
+                // payload is the raw IEEE floats of the original ZBITPIX width, stored verbatim (a
+                // tile CFITSIO chose not to quantize — e.g. a constant or ±Inf tile). Read them
+                // directly, with no linear map and no dither; NaN passes through unchanged.
+                const fw = bitpixWidth(self.zbitpix); // 4 for -32, 8 for -64
+                const expected = try limits.mul(npix_tile, fw);
+                try limits.ensureWithin(expected, self.fits.limits.max_tile_bytes, null);
+                const raw = try self.decodeTile(alloc, row, fw, expected, npix_tile, tdim);
+                defer alloc.free(raw);
+                if (raw.len != @as(usize, @intCast(expected))) return error.CorruptTile;
+                var p: u64 = 0;
+                while (p < npix_tile) : (p += 1) {
+                    var rp = p;
+                    var full: u64 = 0;
+                    for (0..n) |i| {
+                        const c = rp % tdim[i];
+                        rp /= tdim[i];
+                        full += (tstart[i] + c) * img_stride[i];
+                    }
+                    const byteoff: usize = @intCast(p * fw);
+                    const fval: f64 = switch (self.zbitpix) {
+                        -32 => @as(f64, endian.read(f32, raw[byteoff..][0..4])),
+                        -64 => endian.read(f64, raw[byteoff..][0..8]),
+                        else => return error.BadBitpix,
+                    };
+                    out[@intCast(full)] = try convert.cast(T, fval, .bulk);
+                }
             }
         }
     }
@@ -677,6 +715,24 @@ pub const TiledImage = struct {
     fn hasData(self: *TiledImage, col: u16, row: u64) heap.DescriptorError!bool {
         const d = try heap.readDescriptor(&self.base, .{ .index = col }, row);
         return d.len > 0;
+    }
+
+    // Which column supplies tile `row`'s payload, per the §10.1 precedence. On the quantized-float
+    // read path this distinguishes a quantized-integer tile (`.compressed`) from a losslessly-
+    // stored raw-float fallback tile (`.gzip`/`.uncompressed`), which must be read as raw IEEE
+    // floats rather than unquantized. `.none` is an empty (all-zero) tile.
+    const TileSource = enum { compressed, gzip, uncompressed, none };
+    fn tileSource(self: *TiledImage, row: u64) heap.DescriptorError!TileSource {
+        if (self.comp_col) |col| {
+            if (try self.hasData(col, row)) return .compressed;
+        }
+        if (self.gzip_col) |col| {
+            if (try self.hasData(col, row)) return .gzip;
+        }
+        if (self.uncomp_col) |col| {
+            if (try self.hasData(col, row)) return .uncompressed;
+        }
+        return .none;
     }
 
     // Read the raw (big-endian, untranslated) payload bytes of the VLA cell at (`row`, `col`):
@@ -803,16 +859,18 @@ fn nativeToBig(alloc: Allocator, native: []const u8, w: usize) (errors.CompressE
     return out;
 }
 
-// Pack `vals` as big-endian signed integers of width `w` (truncating to the low `w` bytes). Used
-// for PLIO_1 / HCOMPRESS_1, which both produce `i32` stored values.
+// Pack `vals` as big-endian signed integers of width `w`. Used for PLIO_1 / HCOMPRESS_1, which
+// both produce `i32` stored values. A decoded value that does not fit the declared `ZBITPIX` width
+// (e.g. a corrupt/out-of-spec PLIO mask value > 255 packed as `w == 1`) is rejected with a typed
+// error rather than silently `@truncate`d — every other conversion path in the library is checked.
 fn i32ToBig(alloc: Allocator, vals: []const i32, w: usize) (errors.CompressError || Allocator.Error)![]u8 {
     const out = try alloc.alloc(u8, vals.len * w);
     errdefer alloc.free(out);
     for (vals, 0..) |v, idx| {
         const off = idx * w;
         switch (w) {
-            1 => std.mem.writeInt(i8, out[off..][0..1], @truncate(v), .big),
-            2 => std.mem.writeInt(i16, out[off..][0..2], @truncate(v), .big),
+            1 => std.mem.writeInt(i8, out[off..][0..1], std.math.cast(i8, v) orelse return error.DataConstraintViolated, .big),
+            2 => std.mem.writeInt(i16, out[off..][0..2], std.math.cast(i16, v) orelse return error.DataConstraintViolated, .big),
             4 => std.mem.writeInt(i32, out[off..][0..4], v, .big),
             8 => std.mem.writeInt(i64, out[off..][0..8], v, .big),
             else => return error.DataConstraintViolated,
@@ -945,6 +1003,9 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
     const w = bitpixWidth(spec.bitpix);
     const do_dither = spec.bitpix < 0 and spec.quantize.isDithered();
+    // ZDITHER0 must be a positive integer 1..10000 (FITS 4.0 §10.2). An out-of-range seed writes a
+    // non-conformant file and drives a CFITSIO reader's `fits_rand_value[]` index out of bounds.
+    if (do_dither and (spec.zdither0 < 1 or spec.zdither0 > 10000)) return error.DataConstraintViolated;
 
     // Validate the codec/BITPIX pairing (CMP-8 write path). GZIP_1/GZIP_2 accept any BITPIX (they
     // store raw big-endian bytes). RICE_1/PLIO_1/HCOMPRESS_1 encode integer stored values, so they
@@ -1010,6 +1071,12 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
         for (enc_list.items) |e| alloc.free(e);
         enc_list.deinit(alloc);
     }
+    // Per-tile flag (dithered path only): true when tile `r` could not be quantized and is stored
+    // losslessly as raw gzipped floats in GZIP_COMPRESSED_DATA instead of quantized COMPRESSED_DATA.
+    var enc_lossless: std.ArrayList(bool) = .empty;
+    defer enc_lossless.deinit(alloc);
+    // Whether any tile produced a null (NaN → the reserved sentinel), which requires a ZBLANK card.
+    var any_null = false;
     var zscales: std.ArrayList(f64) = .empty;
     defer zscales.deinit(alloc);
     var zzeros: std.ArrayList(f64) = .empty;
@@ -1041,14 +1108,22 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
         }
         const tile_idx = idxs[0..@intCast(npix_tile)];
 
+        var this_lossless = false;
         const enc = blk: {
             if (do_dither) {
+                // Per-tile min/max over FINITE pixels only: NaN is excluded (it maps to the null
+                // sentinel), and ±Inf is excluded so one infinite pixel can't poison the scale.
                 var mn: f64 = 0;
                 var mx: f64 = 0;
                 var have = false;
+                var has_inf = false;
                 for (tile_idx) |full| {
                     const v: f64 = anyToF64(T, pixels[@intCast(full)]);
                     if (std.math.isNan(v)) continue;
+                    if (!std.math.isFinite(v)) {
+                        has_inf = true;
+                        continue;
+                    }
                     if (!have) {
                         mn = v;
                         mx = v;
@@ -1066,11 +1141,24 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
                 } else if (have) {
                     zz = mn;
                 }
+                // A tile that cannot be faithfully quantized — it holds ±Inf, has no finite pixel,
+                // or its range overflows f64 so the scale/zero go non-finite — is stored losslessly
+                // as raw gzipped floats in GZIP_COMPRESSED_DATA (CFITSIO's fallback), rather than
+                // quantized to garbage. Its ZSCALE/ZZERO are unused, so any placeholder will do.
+                if (has_inf or !have or !std.math.isFinite(zs) or !std.math.isFinite(zz)) {
+                    this_lossless = true;
+                    try zscales.append(alloc, 1.0);
+                    try zzeros.append(alloc, 0.0);
+                    const raw_f = try buildRawBytes(T, alloc, spec.bitpix, pixels, tile_idx);
+                    defer alloc.free(raw_f);
+                    break :blk try gzip.gzipEncode(alloc, raw_f);
+                }
                 const raw = try alloc.alloc(u8, @intCast(npix_tile * 4));
                 defer alloc.free(raw);
                 var cur = dither.Dither.init(table.?, kind, spec.zdither0, row);
                 for (tile_idx, 0..) |full, j| {
                     const fv: f32 = anyToF32(T, pixels[@intCast(full)]);
+                    if (std.math.isNan(fv)) any_null = true; // NaN → the reserved null sentinel
                     const code = cur.quantizeNext(fv, zs, zz);
                     endian.write(i32, code, raw[j * 4 ..][0..4]);
                 }
@@ -1087,12 +1175,13 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
         {
             errdefer alloc.free(enc);
             try enc_list.append(alloc, enc);
+            if (do_dither) try enc_lossless.append(alloc, this_lossless);
         }
         total_bytes = try limits.add(total_bytes, enc.len);
     }
 
-    const ncols: u64 = if (do_dither) 3 else 1;
-    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_dither, tile, w);
+    const ncols: u64 = if (do_dither) 4 else 1;
+    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_dither, tile, w, any_null);
     const hdu = try fits.appendHdu(h); // takes ownership of `h` (frees it on its own error)
 
     var bt = try BinTable.of(fits, hdu);
@@ -1100,7 +1189,19 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     var mgr = try HeapManager.initForTable(&bt);
     defer mgr.deinit(alloc);
     for (enc_list.items, 0..) |enc, r| {
-        if (spec.codec == .plio_1) {
+        if (do_dither) {
+            // Route each tile to its column: quantized tiles fill COMPRESSED_DATA (index 0),
+            // lossless-fallback tiles fill GZIP_COMPRESSED_DATA (index 3). The unused column gets
+            // an explicit empty cell so its descriptor is length-0 and the reader's precedence
+            // (COMPRESSED_DATA → GZIP_COMPRESSED_DATA) selects the right payload per tile.
+            if (enc_lossless.items[r]) {
+                try writeVlaCell(alloc, &bt, &mgr, .{ .index = 3 }, r, u8, enc);
+                try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, u8, &[_]u8{});
+            } else {
+                try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, u8, enc);
+                try writeVlaCell(alloc, &bt, &mgr, .{ .index = 3 }, r, u8, &[_]u8{});
+            }
+        } else if (spec.codec == .plio_1) {
             // COMPRESSED_DATA is a `1PI` (16-bit word) VLA for PLIO_1. `plio.compress` always emits
             // whole big-endian words, so `enc.len` is even; the descriptor's element count must be
             // the *word* count (`enc.len / 2`), not the byte count. Decode each big-endian word to a
@@ -1124,7 +1225,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
 // Build the compressed-image BINTABLE header. Has its own errdefer; on success the caller passes
 // the returned header to `appendHdu`, which then owns (and on its own error frees) it.
-fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_dither: bool, tile: []const u64, w: usize) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
+fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_dither: bool, tile: []const u64, w: usize, any_null: bool) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
     var h = Header.initEmpty();
     errdefer h.deinit(alloc);
     try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
@@ -1134,7 +1235,7 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     try h.appendValue(alloc, "NAXIS2", .{ .int = @intCast(ntiles_total) }, null);
     try h.appendValue(alloc, "PCOUNT", .{ .int = @intCast(total_bytes) }, null);
     try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
-    try h.appendValue(alloc, "TFIELDS", .{ .int = if (do_dither) 3 else 1 }, null);
+    try h.appendValue(alloc, "TFIELDS", .{ .int = if (do_dither) 4 else 1 }, null);
     // PLIO_1's COMPRESSED_DATA is a list of 16-bit words: CFITSIO stores it as `1PI` (signed
     // 16-bit VLA) so the big-endian on-disk words are byte-swapped to native on read. The other
     // codecs (GZIP/RICE/HCOMPRESS) produce an opaque byte stream stored as `1PB`. Emitting `1PB`
@@ -1147,6 +1248,11 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
         try h.appendValue(alloc, "TTYPE2", .{ .string = "ZSCALE" }, null);
         try h.appendValue(alloc, "TFORM3", .{ .string = "1D" }, null);
         try h.appendValue(alloc, "TTYPE3", .{ .string = "ZZERO" }, null);
+        // Lossless-fallback column: tiles that couldn't be quantized store raw gzipped floats here
+        // (COMPRESSED_DATA is left empty for those tiles). Column order is irrelevant to a reader,
+        // which resolves payload columns by TTYPE name and applies the §10.1 precedence.
+        try h.appendValue(alloc, "TFORM4", .{ .string = "1PB" }, null);
+        try h.appendValue(alloc, "TTYPE4", .{ .string = "GZIP_COMPRESSED_DATA" }, null);
     }
     try h.appendValue(alloc, "ZIMAGE", .{ .logical = true }, null);
     try h.appendValue(alloc, "ZCMPTYPE", .{ .string = codec_name }, null);
@@ -1178,6 +1284,9 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     if (do_dither) {
         try h.appendValue(alloc, "ZQUANTIZ", .{ .string = spec.quantize.name().? }, null);
         try h.appendValue(alloc, "ZDITHER0", .{ .int = spec.zdither0 }, null);
+        // Declare the null sentinel so third-party readers substitute NaN for null-coded pixels;
+        // without ZBLANK a CFITSIO reader leaves them as the raw reserved value (§10.2 step 5).
+        if (any_null) try h.appendValue(alloc, "ZBLANK", .{ .int = dither.null_value }, null);
     }
     try h.ensureEnd(alloc);
     return h;
@@ -2368,6 +2477,98 @@ test "writeCompressed float SUBTRACTIVE_DITHER_1 round-trips within tolerance" {
     var out: [24]f32 = undefined;
     try ti.readAll(f32, &out);
     for (src, out) |s, o| try testing.expect(@abs(o - s) <= 0.01);
+}
+
+test "writeCompressed dithered: a tile holding ±Inf is stored losslessly and round-trips exactly" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // axes {6,4}, default tiling ⇒ 4 row-strips of 6. +Inf in row 0 makes tile 0 un-quantizable,
+    // so it is stored as raw gzipped floats and must round-trip bit-exact (Inf plus its finite
+    // neighbours), while the remaining tiles quantize normally. Before the fix, one Inf drove the
+    // whole tile's ZSCALE/ZZERO to Inf and quantized every pixel to garbage.
+    var src: [24]f32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 1.5 - 5.0;
+    src[3] = std.math.inf(f32);
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 6, 4 },
+        .codec = .gzip_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [24]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (0..6) |i| {
+        if (std.math.isInf(src[i])) {
+            try testing.expect(std.math.isInf(out[i]));
+        } else {
+            try testing.expectEqual(src[i], out[i]); // lossless ⇒ exact
+        }
+    }
+    for (6..24) |i| try testing.expect(@abs(out[i] - src[i]) <= 0.01);
+}
+
+test "writeCompressed dithered: NaN pixels emit ZBLANK and read back as NaN" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [24]f32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 1.5 - 5.0;
+    src[10] = std.math.nan(f32); // tile 1 (indices 6..12), still quantizable via its finite pixels
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 6, 4 },
+        .codec = .gzip_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    // A ZBLANK card must have been emitted so third-party readers substitute NaN for the sentinel.
+    try testing.expect(ti.zblank_kw != null or ti.zblank_col != null);
+
+    var out: [24]f32 = undefined;
+    try ti.readAll(f32, &out);
+    try testing.expect(std.math.isNan(out[10]));
+    for (src, out, 0..) |s, o, i| {
+        if (i == 10) continue;
+        try testing.expect(@abs(o - s) <= 0.01);
+    }
+}
+
+test "writeCompressed float SUBTRACTIVE_DITHER_2 round-trips (exact zero preserved)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [24]f32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 1.5 - 5.0;
+    src[7] = 0.0; // exact zero must survive DITHER_2 losslessly (§10.2.1)
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 6, 4 },
+        .codec = .gzip_1,
+        .quantize = .subtractive_dither_2,
+        .zdither0 = 5,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Quantize.subtractive_dither_2, ti.quantize);
+    var out: [24]f32 = undefined;
+    try ti.readAll(f32, &out);
+    try testing.expectEqual(@as(f32, 0.0), out[7]);
+    for (src, out, 0..) |s, o, i| {
+        if (i == 7) continue;
+        try testing.expect(@abs(o - s) <= 0.01);
+    }
 }
 
 // ── CMP-9 tile-compressed table read ─────────────────────────────────────────────────────────
