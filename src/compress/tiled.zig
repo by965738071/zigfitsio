@@ -397,14 +397,15 @@ pub const TiledImage = struct {
         if (out.len != self.npix) return error.BadDimensions;
         if (!self.ztype.isImplemented()) return error.UnsupportedCodec;
         // Lossy float compression: the stored tile values are quantized 32-bit integers, not the
-        // raw IEEE floats. The signal that a float image was quantized is the presence of a
-        // per-tile `ZSCALE` column (CFITSIO keys on exactly this), NOT the dither method — a
-        // `NO_DITHER` file (`fpack -q0`) is quantized too, just without the subtractive offset.
+        // raw IEEE floats. The signal that a float image was quantized is the presence of a linear
+        // scale (`isScaled()` — a per-tile `ZSCALE` column, as CFITSIO emits, or a global `ZSCALE`
+        // keyword, which `tileScale` also honors), NOT the dither method — a `NO_DITHER` file
+        // (`fpack -q0`) is quantized too, just without the subtractive offset.
         // Route every quantized float tile through the integer-decode path, which applies the
         // per-tile linear map and (for `SUBTRACTIVE_DITHER_*`) the dither offset; `NO_DITHER`
         // uses `kind == .none`, i.e. the linear map with no offset. An unrecognized `ZQUANTIZ`
         // cannot be decoded safely — error rather than guess (CFITSIO does the same).
-        if (self.zbitpix < 0 and self.zscale_col != null) {
+        if (self.zbitpix < 0 and self.isScaled()) {
             if (self.quantize == .unknown) return error.UnsupportedCodec;
             return self.readAllDithered(T, out);
         }
@@ -873,7 +874,10 @@ fn i32ToBig(alloc: Allocator, vals: []const i32, w: usize) (errors.CompressError
     for (vals, 0..) |v, idx| {
         const off = idx * w;
         switch (w) {
-            1 => std.mem.writeInt(i8, out[off..][0..1], std.math.cast(i8, v) orelse return error.DataConstraintViolated, .big),
+            // BITPIX=8 is UNSIGNED (0..255): accept the full byte range (a bright pixel like 200
+            // is valid) and reject only genuinely out-of-range decodes, rather than casting to a
+            // signed i8 whose 127 ceiling would drop legitimate values 128..255.
+            1 => std.mem.writeInt(u8, out[off..][0..1], std.math.cast(u8, v) orelse return error.DataConstraintViolated, .big),
             2 => std.mem.writeInt(i16, out[off..][0..2], std.math.cast(i16, v) orelse return error.DataConstraintViolated, .big),
             4 => std.mem.writeInt(i32, out[off..][0..4], v, .big),
             8 => std.mem.writeInt(i64, out[off..][0..8], v, .big),
@@ -1178,8 +1182,12 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
         };
         {
             errdefer alloc.free(enc);
-            try enc_list.append(alloc, enc);
+            // Append the parallel lossless flag FIRST (while `enc` is still owned by `errdefer`),
+            // then hand `enc` to `enc_list` as the last fallible op: if either append OOMs, `enc` is
+            // freed exactly once (by the errdefer, since it is not yet in `enc_list`). Doing the
+            // `enc_list` append first would let a failing `enc_lossless` append double-free `enc`.
             if (do_dither) try enc_lossless.append(alloc, this_lossless);
+            try enc_list.append(alloc, enc);
         }
         total_bytes = try limits.add(total_bytes, enc.len);
     }
@@ -1372,7 +1380,7 @@ fn bigToI32(alloc: Allocator, raw: []const u8, w: usize) (errors.CompressError |
     for (out, 0..) |*o, idx| {
         const off = idx * w;
         o.* = switch (w) {
-            1 => std.mem.readInt(i8, raw[off..][0..1], .big),
+            1 => std.mem.readInt(u8, raw[off..][0..1], .big), // BITPIX=8 is unsigned (0..255), not i8
             2 => std.mem.readInt(i16, raw[off..][0..2], .big),
             4 => std.mem.readInt(i32, raw[off..][0..4], .big),
             8 => std.math.cast(i32, std.mem.readInt(i64, raw[off..][0..8], .big)) orelse return error.DataConstraintViolated,
@@ -2408,6 +2416,28 @@ test "writeCompressed PLIO_1 round-trips a mask image" {
     var out: [12]i32 = undefined;
     try ti.readAll(i32, &out);
     try testing.expectEqualSlices(i32, &src, &out);
+}
+
+test "writeCompressed PLIO_1 round-trips an 8-bit image with values >= 128 (unsigned BITPIX=8)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // BITPIX=8 is UNSIGNED 0..255: bright values 128..255 must survive. i32ToBig packs the stored
+    // byte as u8, not signed i8 (a signed cast would reject everything above 127).
+    const src = [_]u8{ 0, 128, 200, 255, 1, 127, 254, 130 };
+    const hdu = try writeCompressed(u8, &fx.f, .{
+        .bitpix = 8,
+        .axes = &.{ 4, 2 },
+        .tile = &.{ 4, 2 },
+        .codec = .plio_1,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [8]u8 = undefined;
+    try ti.readAll(u8, &out);
+    try testing.expectEqualSlices(u8, &src, &out);
 }
 
 test "writeCompressed HCOMPRESS_1 round-trips a 2-D integer image (lossless)" {

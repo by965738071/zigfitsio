@@ -364,3 +364,38 @@ def test_inplace_compressed_update_fails_loud(tmp_fits):
     with pytest.raises(NotImplementedError):
         with zf.open(p, mode="update") as h:
             h[1].data[0, 0] = 123
+
+
+def test_inplace_mutation_of_readonly_open_is_saved(tmp_fits):
+    # An in-place array mutation (no setter call) of a read-only-opened HDU must be written by
+    # writeto/to_bytes, not silently dropped by the verbatim pristine fast-path.
+    src, out = tmp_fits("ip_src.fits"), tmp_fits("ip_out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((3, 4), dtype="i2"))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)  # read-only
+    hdul[0].data[:] = 7  # in-place; does NOT call the data setter
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert int(chk[0].data[0, 0]) == 7
+
+    # In-place table cell edit on a read-only open, via to_bytes.
+    src2 = tmp_fits("ip_tbl.fits")
+    col = zf.Column("FLUX", "1E", array=np.array([1.0, 2.0, 3.0], dtype="f4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src2, overwrite=True)
+    h2 = zf.open(src2)
+    h2[1].data["FLUX"][:] = 42.0
+    reread = zf.from_bytes(h2.to_bytes())
+    h2.close()
+    np.testing.assert_array_equal(reread[1].data["FLUX"], [42.0, 42.0, 42.0])
+
+
+def test_unchanged_readonly_open_still_uses_fast_path(tmp_fits):
+    # Reading data without editing must not disable the verbatim copy (data preserved either way).
+    src, out = tmp_fits("fp_src.fits"), tmp_fits("fp_out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(12, dtype="i2").reshape(3, 4))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)
+    _ = hdul[0].data  # materialize, but do not edit
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[0].data, np.arange(12).reshape(3, 4))

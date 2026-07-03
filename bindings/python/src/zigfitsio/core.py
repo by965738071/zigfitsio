@@ -81,11 +81,17 @@ def _vla_elem_dtype(fmt: str):
     return dt.bin_elem_dtype(ord(letter)) if letter else (np.dtype("f8"), False)
 
 
+def _ndarray_fp(arr):
+    """Content fingerprint of a numeric ndarray (normalized to C-order bytes so the same logical
+    array always hashes the same, regardless of memory layout)."""
+    return hash(np.ascontiguousarray(arr).tobytes())
+
+
 def _col_fp(col):
     """A change-detection fingerprint for one materialized table column (object=VLA safe)."""
     if col.dtype == object:
         return hash(tuple(np.asarray(x).tobytes() for x in col))
-    return hash(np.ascontiguousarray(col).tobytes())
+    return _ndarray_fp(col)
 
 
 def _vla_heap_bytes(cols) -> int:
@@ -248,6 +254,12 @@ class _HDU:
         if self._hdulist is not None:
             self._hdulist._dirty = True
 
+    def _data_changed(self) -> bool:
+        """Whether this HDU's materialized data differs from what was read — catching an in-place
+        mutation (`data[:] = x`) that never goes through a setter. Base HDUs hold no data; image and
+        table HDUs override this. Consulted by the writeto/to_bytes pristine gate."""
+        return False
+
     # ── header ────────────────────────────────────────────────────────────────────────────
     @property
     def header(self) -> Header:
@@ -331,6 +343,9 @@ class ImageHDU(_HDU):
         self._data = None if value is None else np.asarray(value)
         self._mark_dirty()  # a replaced array is not in the open handle's bytes
 
+    def _data_changed(self) -> bool:
+        return self._data is not None and _ndarray_fp(self._data) != self._data_fingerprint
+
     @property
     def shape(self):
         d = self.data
@@ -365,8 +380,10 @@ class ImageHDU(_HDU):
         if n:
             h = self._select()
             ll.check(ll.lib.zf_read_img(h, dt.zf_code(out_dtype), 1, n, None, None, _ptr(arr)))
-        if self._writable():  # baseline for update-mode write-back (detects later edits)
-            self._data_fingerprint = hash(arr.tobytes())
+        # Baseline in ALL modes so both update-mode write-back and the writeto/to_bytes pristine
+        # gate can detect a later edit — including an in-place mutation (`data[:] = x`) that never
+        # goes through the data setter and so never sets `_dirty`.
+        self._data_fingerprint = _ndarray_fp(arr)
         return arr
 
     # ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ────────────
@@ -420,7 +437,7 @@ class ImageHDU(_HDU):
         data = self._data
         if data is None:
             return
-        fp = hash(data.tobytes())
+        fp = _ndarray_fp(data)
         if fp == self._data_fingerprint:
             return
         h = self._select()
@@ -539,6 +556,11 @@ class _TableHDU(_HDU):
             self._data = self._read_table()
         return self._data
 
+    def _data_changed(self) -> bool:
+        if self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
+            return False
+        return any(_col_fp(self._data[n]) != self._col_fingerprints.get(n) for n in self._data.dtype.names)
+
     def _flush_data(self):
         """Write back in-place edits to a materialized table's cell values (update mode). Only
         changed columns are rewritten; changing the row count or editing a VLA/scaled column in
@@ -629,7 +651,7 @@ class _TableHDU(_HDU):
             rec = np.empty(max(nrows, 0), dtype=np.dtype(fields))
             for (name, _), reader in zip(fields, readers):
                 rec[name] = reader()
-            if self._writable() and rec.dtype.names:  # baselines for in-place update write-back
+            if rec.dtype.names:  # baselines for write-back AND the writeto pristine gate (all modes)
                 self._col_fingerprints = {name: _col_fp(rec[name]) for name in rec.dtype.names}
             return rec
         finally:
@@ -946,8 +968,9 @@ class HDUList(list):
                     hdu._hdulist = self
                     hdu._index = i + 1
                     if isinstance(hdu, ImageHDU) and hdu._data is not None:
-                        # Baseline so the next flush doesn't re-write the just-appended pixels.
-                        hdu._data_fingerprint = hash(np.asarray(hdu._data).tobytes())
+                        # Baseline so the next flush (and pristine check) treats the just-appended
+                        # pixels as unchanged rather than re-writing them.
+                        hdu._data_fingerprint = _ndarray_fp(hdu._data)
             if len(self) > self._scanned_count:
                 self._scanned_count = len(self)
             # 2) Write back in-place edits to attached image/table data.
@@ -956,7 +979,7 @@ class HDUList(list):
                     continue
                 if isinstance(hdu, CompImageHDU):
                     # In-place recompression isn't supported; fail loud rather than silently drop.
-                    if hdu._data is not None and hash(np.asarray(hdu._data).tobytes()) != hdu._data_fingerprint:
+                    if hdu._data_changed():
                         raise NotImplementedError(
                             "in-place update of a compressed image is not supported; use writeto() to a new file"
                         )
@@ -968,6 +991,8 @@ class HDUList(list):
         """True when this list is exactly what was scanned from an open file — every HDU still
         attached in its original slot, nothing appended/removed — so it can be copied verbatim."""
         if self._handle is None or not self._owns or self._dirty or len(self) != self._scanned_count:
+            return False
+        if any(hdu._data_changed() for hdu in self):  # in-place edits don't set _dirty
             return False
         return all(
             isinstance(h, _HDU) and h._hdulist is self and h._index == i + 1
