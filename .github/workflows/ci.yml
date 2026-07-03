@@ -30,7 +30,10 @@ jobs:
           - { os: linux, arch: x86_64, runner: ubuntu-latest }
           - { os: linux, arch: aarch64, runner: ubuntu-24.04-arm }
           - { os: macos, arch: aarch64, runner: macos-latest }
-          - { os: macos, arch: x86_64, runner: macos-13 }
+          # macos-13 (the previous Intel image) was retired 2025-12-04; macos-15-intel is
+          # GitHub's last x86_64 macOS image and sunsets August 2027 — this {macos, x86_64}
+          # cell needs a new home then.
+          - { os: macos, arch: x86_64, runner: macos-15-intel }
           - { os: windows, arch: x86_64, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
