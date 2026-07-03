@@ -134,11 +134,17 @@ pub fn unquantize(stored: i32, zscale: f64, zzero: f64, dither_value: f32) f32 {
     return @floatCast(f);
 }
 
-/// The per-tile starting index into the random table (FITS 4.0 §10.2): `(tile_index + ZDITHER0)
-/// mod random_count`, where `tile_index` is the 0-based tile/row number. `@mod` keeps the result
-/// in `[0, random_count)` even for a negative `ZDITHER0`.
+/// The per-tile starting index into the random table: `(tile_index + ZDITHER0 - 1) mod
+/// random_count`, where `tile_index` is the 0-based tile/row number. `@mod` keeps the result in
+/// `[0, random_count)` even for a negative sum.
+///
+/// The `- 1` matches CFITSIO/fpack/astropy — the de-facto standard every real dithered file is
+/// written and read against — which seeds the table at `(irow - 1 + ZDITHER0 - 1) % N_RANDOM`
+/// with `irow` 1-based (i.e. `irow - 1 == tile_index`). The FITS 4.0 standard's *literal* Eq. text
+/// omits this offset; following it (as this code originally did) mis-decodes every
+/// SUBTRACTIVE_DITHER file exchanged with the ecosystem by one table entry.
 pub fn tileOffset(zdither0: i64, tile_index: u64) usize {
-    const sum: i128 = @as(i128, @intCast(tile_index)) + zdither0;
+    const sum: i128 = @as(i128, @intCast(tile_index)) + zdither0 - 1;
     return @intCast(@mod(sum, @as(i128, random_count)));
 }
 
@@ -282,12 +288,13 @@ test "quantize never emits a reserved sentinel for an ordinary pixel" {
     try testing.expect(!isReserved(null_value + reserved_count));
 }
 
-test "tileOffset is (tile_index + ZDITHER0) mod 10000, in range for huge indices" {
-    try testing.expectEqual(@as(usize, 1), tileOffset(1, 0));
-    try testing.expectEqual(@as(usize, 4), tileOffset(5, 9999)); // 10004 mod 10000
-    try testing.expectEqual(@as(usize, 0), tileOffset(1, 9999)); // 10000 mod 10000
-    // Negative ZDITHER0 still floors into range.
-    try testing.expectEqual(@as(usize, 9999), tileOffset(-1, 0));
+test "tileOffset is (tile_index + ZDITHER0 - 1) mod 10000 (CFITSIO convention), in range for huge indices" {
+    // ZDITHER0=1 (the default) with the first tile seeds at table index 0, matching fpack.
+    try testing.expectEqual(@as(usize, 0), tileOffset(1, 0)); // 0 + 1 - 1
+    try testing.expectEqual(@as(usize, 3), tileOffset(5, 9999)); // 10003 mod 10000
+    try testing.expectEqual(@as(usize, 9999), tileOffset(1, 9999)); // 9999 mod 10000
+    // Negative / small sums still floor into range.
+    try testing.expectEqual(@as(usize, 9998), tileOffset(-1, 0)); // -2 mod 10000
     // Large tile index never goes out of range.
     const big = tileOffset(7, std.math.maxInt(u64));
     try testing.expect(big < random_count);

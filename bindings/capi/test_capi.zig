@@ -145,6 +145,37 @@ test "binary table create, write columns, read back" {
     try testing.expectEqualStrings("gamma", std.mem.trimEnd(u8, name_out[16..24], " \x00"));
 }
 
+test "table view survives owner close without use-after-free; bad indices error, never trap" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    const ttype = [_]?[*:0]const u8{"INDEX"};
+    const tform = [_]?[*:0]const u8{"1J"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(hh, 0, 3, 1, &ttype, &tform, null, "T"));
+
+    var t: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+    const th = t.?;
+
+    // Negative / out-of-range indices must return an error status, never trap across the ABI
+    // (a Zig panic from an @intCast is uncatchable by a C caller).
+    var out_len: c_longlong = 0;
+    var out_off: c_longlong = 0;
+    try testing.expect(capi.zf_read_descript(th, 0, 0, &out_len, &out_off) != 0); // row 0 (< 1)
+    try testing.expect(capi.zf_append_rows(th, -1) != 0); // negative count
+    try testing.expect(capi.zf_delete_col(th, 70000) != 0); // > u16 max
+
+    // Close the file while the view is still open: the view must be invalidated, not left dangling.
+    capi.zf_close(h);
+
+    var nrows: c_longlong = 0;
+    try testing.expect(capi.zf_table_nrows(th, &nrows) != 0); // dead view → error, not use-after-free
+
+    // The (dead) view is still safe to close and free.
+    capi.zf_table_close(t);
+}
+
 test "tile-compressed image round-trips through zf_read_img" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

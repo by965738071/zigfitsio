@@ -48,6 +48,18 @@ pub fn keyword(card: *const Card, out: []u8) ?[]const u8 {
     return out[0..n];
 }
 
+/// The raw value field of a `HIERARCH` card — everything after the first `=` (the value plus any
+/// `/ comment`), analogous to `Card.valueField()` for a fixed-format card. `null` if `card` is not
+/// a well-formed `HIERARCH` card (no `=`). `value.parseValue`/`value.parseComment` accept the slice
+/// unchanged, so header getters can route HIERARCH cards through it instead of the fixed columns
+/// 11–80 (which for a HIERARCH card fall inside the keyword, not the value).
+pub fn valueField(card: *const Card) ?[]const u8 {
+    if (!isHierarch(card)) return null;
+    const rest = card.raw[8..];
+    const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return null;
+    return rest[eq + 1 ..];
+}
+
 /// Parse the value of a `HIERARCH` card (everything after the first `=`). Allocates a string
 /// payload via `alloc`. `null` if `card` is not a well-formed `HIERARCH` card.
 pub fn parseValue(alloc: Allocator, card: *const Card) (HeaderError || errors.ValueError || Allocator.Error)!?value.KeywordValue {

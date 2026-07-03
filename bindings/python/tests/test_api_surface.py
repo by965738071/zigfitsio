@@ -350,19 +350,22 @@ def test_complex_column_roundtrip(tmp_fits):
         np.testing.assert_allclose(got, vals)
 
 
-def test_logical_column_write_requires_uint8_not_bool(tmp_fits):
-    # `zf_code` has no ZfType mapping for numpy `bool`, so a native bool array cannot be passed
-    # directly for an 'L' (logical) TFORM -- pin that typed error, then show the documented
-    # workaround (a uint8 0/1 array) round-trips, and that the read dtype today is uint8, not
-    # bool (bin_elem_dtype maps 'L' -> u1, per _dtypes.py).
-    with pytest.raises(zf.FitsTypeError):
-        col = zf.Column("FLAG", "1L", array=np.array([True, False, True]))
-        zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).to_bytes()
-
+def test_logical_column_write_accepts_bool_or_uint8(tmp_fits):
+    # A native bool array now round-trips through an 'L' (logical) TFORM (it is transferred as 0/1
+    # bytes), as does the equivalent uint8 0/1 array; both read back as uint8 (bin_elem_dtype maps
+    # 'L' -> u1, per _dtypes.py). Previously a bool array raised FitsTypeError.
     p = tmp_fits()
-    workaround = zf.Column("FLAG", "1L", array=np.array([1, 0, 1], dtype="u1"))
-    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([workaround])]).writeto(p, overwrite=True)
+    col = zf.Column("FLAG", "1L", array=np.array([True, False, True]))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(p, overwrite=True)
     with zf.open(p) as hdul:
+        got = hdul[1].data["FLAG"]
+        assert got.dtype == np.dtype("u1")
+        np.testing.assert_array_equal(got, [1, 0, 1])
+
+    p2 = tmp_fits()
+    workaround = zf.Column("FLAG", "1L", array=np.array([1, 0, 1], dtype="u1"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([workaround])]).writeto(p2, overwrite=True)
+    with zf.open(p2) as hdul:
         got = hdul[1].data["FLAG"]
         assert got.dtype == np.dtype("u1")
         np.testing.assert_array_equal(got, [1, 0, 1])

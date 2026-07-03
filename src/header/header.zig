@@ -133,12 +133,21 @@ pub const Header = struct {
     /// scalar conversion policy (FR-HDR-13, FR-CONV-1). `error.KeywordNotFound` if absent,
     /// `error.ValueUndefined` for a blank value field, `error.WrongValueType` for a type
     /// mismatch (e.g. a string requested as `f64`).
+    // The value-field bytes of a resolved card. `get`/`findFirst` resolve a HIERARCH card by its
+    // hierarchical name, but that card's fixed columns 11–80 (`Card.valueField`) fall inside the
+    // keyword, not the value — so route HIERARCH cards through `hierarch.valueField` (the slice
+    // after their `=`). `matchName` already required a `=`, so the `orelse` is defensive only.
+    fn valueBytesOf(card: *const Card) HeaderError![]const u8 {
+        if (hierarch.isHierarch(card)) return hierarch.valueField(card) orelse error.BadValueSyntax;
+        return card.valueField();
+    }
+
     pub fn getValue(self: *const Header, comptime T: type, name: []const u8) (ValueError || ConvError || HeaderError)!T {
         const card = try self.get(name);
         // The value is parsed from the card's raw bytes on demand. Only numeric/logical types
         // are handled here (no allocation); strings use `getString`.
         var fixed_alloc = std.heap.FixedBufferAllocator.init(&[_]u8{});
-        const v = value.parseValue(fixed_alloc.allocator(), card.valueField()) catch |err| switch (err) {
+        const v = value.parseValue(fixed_alloc.allocator(), try valueBytesOf(card)) catch |err| switch (err) {
             error.OutOfMemory => return error.WrongValueType, // a string value (needs alloc) → use getString
             else => |e| return e,
         };
@@ -169,7 +178,7 @@ pub const Header = struct {
     /// the value is not a string.
     pub fn getString(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)![]u8 {
         const card = try self.get(name);
-        const v = try value.parseValue(alloc, card.valueField());
+        const v = try value.parseValue(alloc, try valueBytesOf(card));
         switch (v) {
             .string => |s| return @constCast(s),
             .undefined => return error.ValueUndefined,
@@ -221,7 +230,7 @@ pub const Header = struct {
     /// `deinit`s it); other variants own nothing. `error.KeywordNotFound` if absent.
     pub fn getValueUnion(self: *const Header, alloc: Allocator, name: []const u8) (ValueError || HeaderError || Allocator.Error)!value.KeywordValue {
         const card = try self.get(name);
-        return value.parseValue(alloc, card.valueField());
+        return value.parseValue(alloc, try valueBytesOf(card));
     }
 
     /// Read a complex-valued keyword (FITS 4.0 §4.2.5/§4.2.6) as `[2]f64` `{real, imaginary}`.
@@ -231,7 +240,7 @@ pub const Header = struct {
     pub fn getComplex(self: *const Header, name: []const u8) (ValueError || HeaderError)![2]f64 {
         const card = try self.get(name);
         var fixed_alloc = std.heap.FixedBufferAllocator.init(&[_]u8{});
-        const v = value.parseValue(fixed_alloc.allocator(), card.valueField()) catch |err| switch (err) {
+        const v = value.parseValue(fixed_alloc.allocator(), try valueBytesOf(card)) catch |err| switch (err) {
             error.OutOfMemory => return error.WrongValueType, // a string value (needs alloc)
             else => |e| return e,
         };
@@ -249,7 +258,9 @@ pub const Header = struct {
     /// the keyword is absent or has no comment (FR-HDR-5).
     pub fn comment(self: *const Header, name: []const u8) ?[]const u8 {
         const card = self.get(name) catch return null;
-        return value.parseComment(card.valueField());
+        // A HIERARCH card's comment follows its value after the `=`, not at fixed columns 11–80.
+        const vf = if (hierarch.isHierarch(card)) (hierarch.valueField(card) orelse return null) else card.valueField();
+        return value.parseComment(vf);
     }
 
     /// Fill `out` with the indices of all cards whose names match the wildcard `pattern`
@@ -654,6 +665,21 @@ test "HIERARCH lookup through the Header by both spellings (FR-HDR-9)" {
     var m: Matches = .{};
     h.find("ESO INS TEMP", &m);
     try testing.expectEqual(@as(usize, 1), m.len);
+
+    // Regression: the generic value/comment getters resolve a HIERARCH card by name (has/get
+    // above), but previously parsed `card.valueField()` (fixed columns 11–80, which land inside
+    // the keyword) instead of the value after the `=`. getValue then returned a spurious
+    // BadValueSyntax and comment() returned silently-wrong text. They must now agree with
+    // getHierarch and expose the real value/comment.
+    try testing.expectEqual(@as(f64, 12.5), try h.getValue(f64, "ESO INS TEMP"));
+    try testing.expectEqualStrings("Celsius", h.comment("ESO INS TEMP").?);
+    try testing.expectEqualStrings("detector name", h.comment("ESO DET CHIP1 NAME").?);
+    const nm = try h.getString(testing.allocator, "ESO DET CHIP1 NAME");
+    defer testing.allocator.free(nm);
+    try testing.expectEqualStrings("CCD1", nm);
+    const un = try h.getValueUnion(testing.allocator, "ESO INS TEMP");
+    defer un.deinit(testing.allocator);
+    try testing.expectEqual(@as(f64, 12.5), un.float);
 }
 
 test "complex and undefined values are reachable via getValueUnion/getComplex (FR-HDR-3)" {

@@ -118,6 +118,10 @@ int  zf_flush(ZfFits* h);
 int  zf_save_gzip(ZfFits* h, const uint8_t* path, size_t path_len);
 int  zf_data_size(ZfFits* h, uint64_t* out);
 int  zf_read_bytes(ZfFits* h, uint64_t offset, uint8_t* dst, size_t len, size_t* out_read);
+/* Close a handle and free its resources. Safe to call with NULL. Any open ZfTable* views over
+ * this handle are invalidated (subsequent table calls return an error, not a crash), but must
+ * still be freed with zf_table_close(). Calling zf_close() twice on the same non-NULL handle is
+ * undefined behavior (double free) — a freed handle is indistinguishable from a live one. */
 void zf_close(ZfFits* h);
 
 /* ── HDU navigation ──────────────────────────────────────────────────────────────────────── */

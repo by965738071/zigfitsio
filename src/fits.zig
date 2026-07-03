@@ -322,8 +322,9 @@ pub const Fits = struct {
 
     /// Move the current HDU by `delta` (relative navigation) and return it.
     pub fn move(self: *Fits, delta: isize) FitsError!*Hdu {
-        const target = @as(isize, @intCast(self.chdu)) + delta;
-        if (target < 0) return error.WrongHduType;
+        // Widen to i128 so an extreme caller `delta` cannot overflow the add or the final cast.
+        const target: i128 = @as(i128, self.chdu) + @as(i128, delta);
+        if (target < 0 or target >= std.math.maxInt(usize)) return error.WrongHduType;
         return self.select(@as(usize, @intCast(target)) + 1);
     }
 
@@ -446,7 +447,7 @@ pub const Fits = struct {
         var name_buf: [8]u8 = undefined;
         for (spec.axes, 0..) |ax, i| {
             const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{i + 1}) catch unreachable;
-            try header.appendValue(self.alloc, kw, .{ .int = @intCast(ax) }, null);
+            try header.appendValue(self.alloc, kw, .{ .int = std.math.cast(i64, ax) orelse return error.BadDimensions }, null);
         }
         if (is_primary) {
             try header.appendValue(self.alloc, "EXTEND", .{ .logical = true }, "may contain extensions");
@@ -669,6 +670,20 @@ pub const Fits = struct {
         };
         try self.reorderMandatoryOrder(&hdu.header, hdu.kind, naxis_now);
 
+        // Validate + commit the new geometry BEFORE touching the device. recomputeGeometry is
+        // atomic (leaves the HDU unchanged on failure) and derives everything from the edited
+        // header, so an invalid edit (bad BITPIX, over-limit NAXIS product, …) fails HERE — before
+        // any shiftTail/writeTo grows or relocates bytes — instead of leaving a grown, partially
+        // rewritten device with no rollback. `old_data_bytes` is the current on-disk data length,
+        // captured before the commit for the resize below.
+        const old_data_bytes = hdu.data_bytes;
+        try hdu.recomputeGeometry(self.alloc, self.limits);
+        const new_data_bytes = hdu.data_bytes;
+
+        // Belt-and-suspenders: restore the device size if any device write below fails.
+        const pre_size = try self.dev.getSize();
+        errdefer self.dev.setSize(pre_size) catch {};
+
         const old_header_blocks = hdu.data_off - hdu.header_off; // already block-aligned
         const new_header_blocks = block.roundUpBlocks(@as(u64, hdu.header.count()) * block.CARD);
         const header_delta: i64 =
@@ -684,10 +699,7 @@ pub const Fits = struct {
         defer bw.deinit();
         try hdu.header.writeTo(&bw);
 
-        // Refresh the structural fields and re-align the data if the new geometry changed its size.
-        const old_data_bytes = hdu.data_bytes;
-        try hdu.recomputeGeometry(self.alloc, self.limits);
-        const new_data_bytes = hdu.data_bytes;
+        // Re-align the data if the new geometry changed its size.
         if (new_data_bytes != old_data_bytes) {
             hdu.data_bytes = old_data_bytes; // restore so resizeHduData sees the on-disk size
             try self.resizeHduData(hdu, new_data_bytes); // re-inits the reader

@@ -55,6 +55,11 @@ def zf_code(dtype) -> int:
 ZF_TO_DTYPE = {code: dt for dt, code in _DTYPE_TO_ZF.items()}
 ZF_TO_DTYPE[ll.ZF_COMPLEX64] = np.dtype("c8")
 ZF_TO_DTYPE[ll.ZF_COMPLEX128] = np.dtype("c16")
+# Logical/bit codes read back as bytes (0/1) — the C ABI transfers one byte per element. This makes
+# a logical (PL) or bit (PX) VLA column readable instead of raising on an unmapped typecode. (These
+# explicit entries override the ZF_BOOL->bool inverse from the write map above.)
+ZF_TO_DTYPE[ll.ZF_BOOL] = np.dtype("u1")
+ZF_TO_DTYPE[ll.ZF_BIT] = np.dtype("u1")
 
 
 def zf_to_dtype(code: int) -> np.dtype:

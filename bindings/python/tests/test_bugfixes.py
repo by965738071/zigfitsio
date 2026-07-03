@@ -251,3 +251,151 @@ def test_bit_column_round_trips():
     src = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("B", "8X", array=bits)])]).to_bytes()
     got = zf.from_bytes(src)[1].data["B"]
     assert np.array_equal(got.reshape(1, 8), bits)
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+# 2026-07-03 hunt: lifecycle data-loss + reconstruction/dtype correctness (disk round-trips)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+def test_readonly_edit_reflected_in_writeto(tmp_fits):
+    # A read-only open, edited in memory, must reconstruct on writeto — not copy the stale bytes.
+    src, out = tmp_fits("src.fits"), tmp_fits("out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((3, 4), dtype="i2"))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)  # default read-only
+    hdul[0].data = hdul[0].data * 10
+    hdul[0].header["MYKEY"] = 42
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert int(chk[0].data[0, 1]) == 10
+        assert chk[0].header.get("MYKEY") == 42
+
+
+def test_update_mode_flushes_on_close(tmp_fits):
+    # An update-mode data edit must persist even without an explicit flush() (close flushes).
+    p = tmp_fits("upd.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.zeros((2, 2), dtype="f4"))]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h[0].data[:] = 7.0
+    with zf.open(p) as chk:
+        assert float(chk[0].data[0, 0]) == 7.0
+
+
+def test_ascii_wide_int_column_roundtrips(tmp_fits):
+    # An ASCII 'I11' column must read back at full width (was mis-sized to int16 -> overflow).
+    p = tmp_fits("ascii.fits")
+    col = zf.Column("BIGINT", "I11", array=np.array([100000, 2000000, -3000000], dtype="i8"))
+    zf.HDUList([zf.PrimaryHDU(), zf.AsciiTableHDU.from_columns([col])]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:
+        np.testing.assert_array_equal(hdul[1].data["BIGINT"], [100000, 2000000, -3000000])
+
+
+def test_commentary_preserved_through_reconstruction(tmp_fits):
+    # A COMMENT card must survive the reconstruction (non-pristine) write path.
+    src, out = tmp_fits("c.fits"), tmp_fits("c_out.fits")
+    h = zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))
+    h.header["COMMENT"] = "provenance note"
+    zf.HDUList([h]).writeto(src, overwrite=True)
+    hdul = zf.open(src)
+    hdul.append(zf.ImageHDU(data=np.zeros(3, dtype="i2"), name="X"))  # forces reconstruction
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert any("provenance" in cc for cc in chk[0].header.comments)
+
+
+def test_unknown_open_mode_raises(tmp_fits):
+    p = tmp_fits("m.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
+    with pytest.raises(ValueError):
+        zf.open(p, mode="rw")  # a typo must error, not silently fall back to read-only
+
+
+def test_pathlib_path_accepted(tmp_fits):
+    import pathlib
+    p = pathlib.Path(tmp_fits("path.fits"))
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="i2"))]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:  # both writeto and open accept a Path
+        np.testing.assert_array_equal(hdul[0].data, [0, 1, 2, 3])
+
+
+def test_failed_writeto_leaves_no_partial_file(tmp_fits):
+    import os
+    p = tmp_fits("dest.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones(3, dtype="i2"))]).writeto(p, overwrite=True)
+    before = open(p, "rb").read()
+
+    class Boom(zf.PrimaryHDU):
+        def _write_to(self, handle, primary):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        zf.HDUList([Boom(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
+    assert open(p, "rb").read() == before  # original intact, no partial temp left behind
+    assert not os.path.exists(str(p) + ".zigfitsio.tmp")
+
+
+def test_update_mode_table_writeback(tmp_fits):
+    # An in-place edit to a materialized table column must persist on close (update mode).
+    p = tmp_fits("tbl.fits")
+    col = zf.Column("FLUX", "1E", array=np.array([1.0, 2.0, 3.0], dtype="f4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h[1].data["FLUX"][:] = 99.0
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["FLUX"], [99.0, 99.0, 99.0])
+
+
+def test_append_hdu_persists_on_close(tmp_fits):
+    # An HDU appended to an update-mode list must be serialized to the file on close.
+    p = tmp_fits("app.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h.append(zf.ImageHDU(data=np.arange(4, dtype="i2"), name="NEW"))
+    with zf.open(p) as chk:
+        assert len(chk) == 2
+        np.testing.assert_array_equal(chk["NEW"].data, [0, 1, 2, 3])
+
+
+def test_inplace_compressed_update_fails_loud(tmp_fits):
+    # In-place recompression is unsupported; it must raise (not silently drop the edit).
+    p = tmp_fits("comp.fits")
+    img = np.arange(16, dtype="i2").reshape(4, 4)
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(data=img, compression="RICE_1")]).writeto(p, overwrite=True)
+    with pytest.raises(NotImplementedError):
+        with zf.open(p, mode="update") as h:
+            h[1].data[0, 0] = 123
+
+
+def test_inplace_mutation_of_readonly_open_is_saved(tmp_fits):
+    # An in-place array mutation (no setter call) of a read-only-opened HDU must be written by
+    # writeto/to_bytes, not silently dropped by the verbatim pristine fast-path.
+    src, out = tmp_fits("ip_src.fits"), tmp_fits("ip_out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((3, 4), dtype="i2"))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)  # read-only
+    hdul[0].data[:] = 7  # in-place; does NOT call the data setter
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert int(chk[0].data[0, 0]) == 7
+
+    # In-place table cell edit on a read-only open, via to_bytes.
+    src2 = tmp_fits("ip_tbl.fits")
+    col = zf.Column("FLUX", "1E", array=np.array([1.0, 2.0, 3.0], dtype="f4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(src2, overwrite=True)
+    h2 = zf.open(src2)
+    h2[1].data["FLUX"][:] = 42.0
+    reread = zf.from_bytes(h2.to_bytes())
+    h2.close()
+    np.testing.assert_array_equal(reread[1].data["FLUX"], [42.0, 42.0, 42.0])
+
+
+def test_unchanged_readonly_open_still_uses_fast_path(tmp_fits):
+    # Reading data without editing must not disable the verbatim copy (data preserved either way).
+    src, out = tmp_fits("fp_src.fits"), tmp_fits("fp_out.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(12, dtype="i2").reshape(3, 4))]).writeto(src, overwrite=True)
+    hdul = zf.open(src)
+    _ = hdul[0].data  # materialize, but do not edit
+    hdul.writeto(out, overwrite=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        np.testing.assert_array_equal(chk[0].data, np.arange(12).reshape(3, 4))

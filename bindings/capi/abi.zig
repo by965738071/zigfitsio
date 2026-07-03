@@ -28,6 +28,11 @@ pub const Handle = struct {
     diag: fits.Diagnostics = .{},
     /// Heap-pinned in-memory device backing `open_memory`/`create_memory`; freed on close.
     mem_dev: ?*fits.MemoryDevice = null,
+    /// Open `TableHandle` views over this file. `zf_close` invalidates each (releases its resources
+    /// and marks it `dead`) before freeing the `Fits`, so a later `zf_table_*` on a still-held
+    /// `ZfTable*` cannot use-after-free the freed `Fits`/`Hdu` it borrows. `zf_table_open` registers
+    /// a view here; `zf_table_close` removes it.
+    tables: std.ArrayList(*TableHandle) = .empty,
 
     /// The current HDU, or `error.WrongHduType` when the file has no HDU yet (a freshly
     /// `create`d handle before the first `zf_create_img`/table builder). Mirrors the contract
@@ -47,11 +52,25 @@ pub const TableHandle = struct {
     bin: ?fits.BinTable = null,
     asc: ?fits.AsciiTable = null,
     mgr: ?fits.heap.HeapManager = null,
+    /// Set when the owning `Handle` was closed while this view was still open: the borrowed
+    /// `Fits`/`Hdu` are freed, so every `zf_table_*` op must reject before dereferencing them.
+    dead: bool = false,
 
     pub fn deinit(self: *TableHandle) void {
-        if (self.mgr) |*m| m.deinit(gpa);
-        if (self.bin) |*b| b.deinit(gpa);
-        if (self.asc) |*a| a.deinit(gpa);
+        // Idempotent: `zf_close` deinits open views (while the `Fits` is still alive) and nulls the
+        // fields, so the caller's later `zf_table_close` frees the handle without a double-free.
+        if (self.mgr) |*m| {
+            m.deinit(gpa);
+            self.mgr = null;
+        }
+        if (self.bin) |*b| {
+            b.deinit(gpa);
+            self.bin = null;
+        }
+        if (self.asc) |*a| {
+            a.deinit(gpa);
+            self.asc = null;
+        }
     }
 };
 

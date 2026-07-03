@@ -143,7 +143,9 @@ pub fn compressDeviceToGzip(
 ) (IoError || LimitError || std.mem.Allocator.Error)!void {
     const size64 = try src.getSize();
     if (size64 > max_bytes) return error.LimitExceeded;
-    const size: usize = @intCast(size64);
+    // On a 32-bit-usize target a source ≥ 4 GiB (with a ≥ 2^32 `max_bytes`) would overflow a plain
+    // `@intCast`; reject it like `Fits.openGzipFile` does rather than trap.
+    const size = std.math.cast(usize, size64) orelse return error.LimitExceeded;
     const buf = try allocator.alloc(u8, size);
     defer allocator.free(buf);
     try src.readAll(buf, 0); // a zero-length read is a no-op

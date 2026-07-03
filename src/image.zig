@@ -125,7 +125,7 @@ pub const ImageView = struct {
         var name_buf: [16]u8 = undefined;
         for (new_axes, 0..) |ax, i| {
             const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{i + 1}) catch unreachable;
-            try h.update(alloc, kw, .{ .int = @intCast(ax) }, null);
+            try h.update(alloc, kw, .{ .int = std.math.cast(i64, ax) orelse return error.BadDimensions }, null);
         }
         // Drop the now-surplus `NAXISn` cards when the dimensionality shrank.
         var n: usize = new_axes.len + 1;
@@ -220,6 +220,10 @@ pub const ImageView = struct {
 
     /// Read `out.len` contiguous pixels starting at the N-D coordinate `first` (FR-IMG-3).
     pub fn readPixels(self: *ImageView, comptime T: type, first: []const u64, out: []T, opts: ReadOpts(T)) ImageError!void {
+        // A tile-compressed view's `naxis`/`axes`/`bitpix` are the host BINTABLE's, not the image's,
+        // so a raw linear walk would read table bytes as pixels. Use `readAll` (which dispatches to
+        // the tiled decoder) for compressed images. Mirrors `iterator.forEachImage`.
+        if (self.isCompressed()) return error.BadDimensions;
         const start = try self.linearIndex(first);
         const total = self.elementCount();
         if (start > total or out.len > total - start) return error.BadDimensions;
@@ -228,12 +232,14 @@ pub const ImageView = struct {
 
     /// Write the entire array from `in` (exactly `elementCount()` elements).
     pub fn writeAll(self: *ImageView, comptime T: type, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         if (in.len != self.elementCount()) return error.BadDimensions;
         try self.writeLinear(T, 0, in, self.scalingOf(opts.scaling), opts.null_sentinel);
     }
 
     /// Write `in.len` contiguous pixels starting at the N-D coordinate `first`.
     pub fn writePixels(self: *ImageView, comptime T: type, first: []const u64, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         const start = try self.linearIndex(first);
         const total = self.elementCount();
         if (start > total or in.len > total - start) return error.BadDimensions;
@@ -244,11 +250,13 @@ pub const ImageView = struct {
     /// `stride`) into `out`, walking one innermost row at a time (FR-IMG-4). `out.len` must
     /// equal the product of per-axis selected counts `(upper-lower)/stride + 1`.
     pub fn readSection(self: *ImageView, comptime T: type, lower: []const u64, upper: []const u64, stride: ?[]const u64, out: []T, opts: ReadOpts(T)) ImageError!void {
+        if (self.isCompressed()) return error.BadDimensions; // section() indexes host-table geometry for a compressed view
         try self.section(T, lower, upper, stride, out, .read, self.scalingOf(opts.scaling), opts.null_sentinel);
     }
 
     /// Write a rectangular section (symmetric with `readSection`).
     pub fn writeSection(self: *ImageView, comptime T: type, lower: []const u64, upper: []const u64, stride: ?[]const u64, in: []const T, opts: WriteOpts(T)) ImageError!void {
+        if (self.isCompressed()) return error.BadDimensions; // writing raw pixels would corrupt the compressed table
         // `section` is shared with the read path (which fills its buffer), so it takes a mutable
         // slice; the write path only reads from `in`, hence the `@constCast` is sound here.
         try self.section(T, lower, upper, stride, @constCast(in), .write, self.scalingOf(opts.scaling), opts.null_sentinel);

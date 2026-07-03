@@ -34,6 +34,7 @@ const Hdu = @import("hdu.zig").Hdu;
 const HduKind = @import("hdu.zig").HduKind;
 const common = @import("table/common.zig");
 const checksum = @import("checksum.zig");
+const hierarch = @import("header/hierarch.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -218,15 +219,31 @@ const Validator = struct {
     // error; a duplicate of any other value keyword is a warning. Commentary cards are exempt.
     fn checkDuplicates(self: *Validator, hdu: *Hdu, idx: u32) Allocator.Error!void {
         const cards = hdu.header.cards.items;
-        for (cards, 0..) |*c, i| {
+        // O(n) duplicate detection (was O(n²) — a CPU-DoS on a large header of distinct value
+        // cards via the public `verify`). A hash set of the 8-byte normalized keyword names covers
+        // plain value cards; HIERARCH cards (whose 8-byte name is always the literal "HIERARCH", so
+        // they'd all collide — and did false-positive under the old byte-compare) are keyed on their
+        // full hierarchical keyword in a second set. Commentary cards legally repeat and are skipped
+        // (the `kind != .value` guard). An arena owns the transient tables and duplicated keys.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var seen = std.AutoHashMap([8]u8, void).init(a);
+        var seen_hier = std.StringHashMap(void).init(a);
+        var hier_buf: [70]u8 = undefined;
+        for (cards) |*c| {
             if (c.kind != .value) continue;
             var dup = false;
-            var j: usize = 0;
-            while (j < i) : (j += 1) {
-                if (cards[j].kind == .value and cards[j].name.eql(&c.name)) {
+            if (c.name.eqlText("HIERARCH")) {
+                const kw = hierarch.keyword(c, &hier_buf) orelse continue; // unparseable → not a dup
+                if (seen_hier.contains(kw)) {
                     dup = true;
-                    break;
+                } else {
+                    try seen_hier.put(try a.dupe(u8, kw), {}); // own a stable copy (hier_buf is reused)
                 }
+            } else {
+                const gop = try seen.getOrPut(c.name.bytes);
+                dup = gop.found_existing;
             }
             if (!dup) continue;
             const name = c.name.text();

@@ -117,56 +117,69 @@ pub const Hdu = struct {
 
     /// Recompute `bitpix`/`naxis`/`axes`/`pcount`/`gcount`/`data_bytes` from the HDU's CURRENT
     /// header — used after structural keywords (`BITPIX`/`NAXIS`/`NAXISn`/`PCOUNT`/`GCOUNT`) were
-    /// mutated in place — WITHOUT touching the kind or any byte offset (§4.4.1.1). The old `axes`
-    /// allocation is released and re-allocated for the new `NAXIS`. On error the HDU is left with
-    /// an empty (safe-to-free) `axes` slice rather than a dangling one.
+    /// mutated in place — WITHOUT touching the kind or any byte offset (§4.4.1.1).
+    ///
+    /// Atomic: the new geometry is computed into locals and committed only once every field
+    /// validates, so on ANY failure (bad BITPIX, missing NAXISn, over-limit product, …) the HDU is
+    /// left exactly as it was. This preserves the `naxis == axes.len` invariant every image path
+    /// relies on — a torn `naxis>0, axes.len==0` state (the old behavior) OOB-indexed the empty
+    /// `axes` slice in `ImageView.section()`.
     pub fn recomputeGeometry(self: *Hdu, alloc: Allocator, lim: Limits) (StructError || errors.ConvError || errors.ValueError || errors.HeaderError || errors.LimitError || Allocator.Error)!void {
-        alloc.free(self.axes);
-        self.axes = &.{};
-        self.computeGeometry(alloc, lim) catch |e| {
-            // computeGeometry's own errdefer frees a partially-built axes slice; normalize the
-            // field to empty so a later deinit/retry never double-frees a dangling pointer.
-            self.axes = &.{};
-            return e;
-        };
+        const old_axes = self.axes;
+        try self.computeGeometry(alloc, lim); // commits `self.*` only on success; `self` untouched on error
+        alloc.free(old_axes); // the new geometry is committed — release the previous axes allocation
     }
 
+    // Compute the full geometry into locals and commit to `self` only once every field validates.
+    // `self.axes` is replaced with a freshly-allocated slice; the caller owns freeing any prior
+    // allocation AFTER a successful return (`init` starts from an empty slice, `recomputeGeometry`
+    // frees the old one). On error `self` is left untouched and the newly-built axes are freed.
     fn computeGeometry(self: *Hdu, alloc: Allocator, lim: Limits) (StructError || errors.ConvError || errors.ValueError || errors.HeaderError || errors.LimitError || Allocator.Error)!void {
-        self.bitpix = self.header.getValue(i64, "BITPIX") catch return error.MissingRequiredKeyword;
-        if (!validBitpix(self.bitpix)) return error.BadBitpix;
+        const bitpix = self.header.getValue(i64, "BITPIX") catch return error.MissingRequiredKeyword;
+        if (!validBitpix(bitpix)) return error.BadBitpix;
 
-        const naxis = self.header.getValue(i64, "NAXIS") catch return error.MissingRequiredKeyword;
-        if (naxis < 0 or naxis > 999) return error.BadNaxis;
-        self.naxis = @intCast(naxis);
+        const naxis_i = self.header.getValue(i64, "NAXIS") catch return error.MissingRequiredKeyword;
+        if (naxis_i < 0 or naxis_i > 999) return error.BadNaxis;
+        const naxis: u16 = @intCast(naxis_i);
 
         // Extensions and random groups carry PCOUNT/GCOUNT; primaries default to 0/1.
-        self.pcount = self.header.getValue(u64, "PCOUNT") catch 0;
-        self.gcount = self.header.getValue(u64, "GCOUNT") catch 1;
-        if (self.gcount == 0) return error.BadDimensions;
+        const pcount = self.header.getValue(u64, "PCOUNT") catch 0;
+        const gcount = self.header.getValue(u64, "GCOUNT") catch 1;
+        if (gcount == 0) return error.BadDimensions;
 
-        self.axes = try alloc.alloc(u64, self.naxis);
-        errdefer alloc.free(self.axes);
+        const axes = try alloc.alloc(u64, naxis);
+        errdefer alloc.free(axes);
         var name_buf: [8]u8 = undefined;
-        for (0..self.naxis) |i| {
+        for (0..naxis) |i| {
             const kw = std.fmt.bufPrint(&name_buf, "NAXIS{d}", .{i + 1}) catch unreachable;
             const len = self.header.getValue(i64, kw) catch return error.MissingRequiredKeyword;
             if (len < 0) return error.BadDimensions;
-            self.axes[i] = @intCast(len);
+            axes[i] = @intCast(len);
         }
 
-        self.data_bytes = try self.dataByteCount(lim);
+        const data_bytes = try dataByteCountFrom(bitpix, naxis, self.kind, axes, pcount, gcount, lim);
+
+        // Commit — no failure points remain past here.
+        self.bitpix = bitpix;
+        self.naxis = naxis;
+        self.pcount = pcount;
+        self.gcount = gcount;
+        self.axes = axes;
+        self.data_bytes = data_bytes;
     }
 
     // The data-unit byte count per FITS 4.0 §4.4.1.1:
     //   Nbytes = |BITPIX|/8 × GCOUNT × (PCOUNT + Π NAXISn)
     // with NAXIS=0 ⇒ no data, and random groups (NAXIS1=0) taking the product over axes 2..n.
-    fn dataByteCount(self: *const Hdu, lim: Limits) errors.LimitError!u64 {
-        if (self.naxis == 0) return 0;
-        const start: usize = if (self.kind == .random_groups) 1 else 0;
-        const product = try limits.naxisProduct(self.axes[start..], lim.max_naxis_product);
-        const inner = try limits.add(self.pcount, product);
-        const groups = try limits.mul(self.gcount, inner);
-        const total = try limits.mul(self.elemBytes(), groups);
+    // Takes explicit geometry values so it can run on locals before the HDU is mutated (atomicity).
+    fn dataByteCountFrom(bitpix: i64, naxis: u16, kind: HduKind, axes: []const u64, pcount: u64, gcount: u64, lim: Limits) errors.LimitError!u64 {
+        if (naxis == 0) return 0;
+        const start: usize = if (kind == .random_groups) 1 else 0;
+        const product = try limits.naxisProduct(axes[start..], lim.max_naxis_product);
+        const inner = try limits.add(pcount, product);
+        const groups = try limits.mul(gcount, inner);
+        const elem_bytes: u64 = @as(u64, @intCast(if (bitpix < 0) -bitpix else bitpix)) / 8;
+        const total = try limits.mul(elem_bytes, groups);
         // Bound the data unit so both it and its block-rounded size stay within i64: every
         // downstream offset/size computation (nextOff, resizeHduData, deleteHdu, …) casts block
         // counts to i64, so an absurd GCOUNT/PCOUNT that drives data_bytes toward 2^64 would later
@@ -413,7 +426,7 @@ test "recomputeGeometry refreshes axes and data_bytes after a NAXISn edit" {
     try testing.expectEqual(@as(u64, 2 * 4 * 5 * 2), hdu.data_bytes);
 }
 
-test "recomputeGeometry leaves a safe-to-free axes slice on error" {
+test "recomputeGeometry is atomic: a failed recompute leaves the HDU geometry unchanged" {
     const p = try parseHeader(testing.allocator, &.{
         "SIMPLE  =                    T",
         "BITPIX  =                   16",
@@ -430,10 +443,16 @@ test "recomputeGeometry leaves a safe-to-free axes slice on error" {
     var hdu = try Hdu.init(testing.allocator, p.h, true, 0, p.consumed, .{});
     defer hdu.deinit(testing.allocator); // must not double-free after the failed recompute
 
-    // Claim a third axis but omit NAXIS3 ⇒ recompute fails partway; axes must end up empty.
+    // Claim a third axis but omit NAXIS3 ⇒ recompute fails partway. The HDU must be left EXACTLY as
+    // it was: the old NAXIS/axes/data_bytes survive and `naxis == axes.len` holds. The pre-fix code
+    // committed `naxis = 3` before failing yet reset `axes` to empty — a torn state that made
+    // `ImageView.section()` index `axes[0..3]` on a zero-length slice (OOB).
     try hdu.header.update(testing.allocator, "NAXIS", .{ .int = 3 }, null);
     try testing.expectError(error.MissingRequiredKeyword, hdu.recomputeGeometry(testing.allocator, .{}));
-    try testing.expectEqual(@as(usize, 0), hdu.axes.len);
+    try testing.expectEqual(@as(u16, 2), hdu.naxis);
+    try testing.expectEqual(@as(usize, hdu.naxis), hdu.axes.len); // invariant preserved
+    try testing.expectEqualSlices(u64, &.{ 4, 3 }, hdu.axes);
+    try testing.expectEqual(@as(u64, 2 * 4 * 3), hdu.data_bytes);
 }
 
 test "validate rejects BITPIX/NAXIS out of position (KeywordOrder)" {

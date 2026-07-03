@@ -26,7 +26,11 @@ pub fn gzipEncode(alloc: Allocator, in: []const u8) (CompressError || Alloc)![]u
     comp.writer.writeAll(in) catch return error.CorruptTile;
     comp.finish() catch return error.CorruptTile;
     const n = ow.buffered().len;
-    return alloc.realloc(out, n) catch out[0..n]; // shrink to fit (realloc-down won't fail meaningfully)
+    // Shrink to fit. On the (essentially unreachable) realloc-down failure, propagate the error:
+    // the `errdefer` above frees the intact `out` at its real capacity. Returning `out[0..n]`
+    // instead would hand back a length-`n` slice of a capacity-length allocation, so a later
+    // `alloc.free` sees a mismatched length (DebugAllocator asserts, page/arena leak or corrupt).
+    return try alloc.realloc(out, n);
 }
 
 /// GZIP_1: decompress a gzip stream into raw bytes, bounded by `max_out` (NFR-SAFE-1).
