@@ -11,7 +11,7 @@ name = "zigfitsio"
 version = "0.1.1"
 description = "Python bindings for zigfitsio — a pure-Zig FITS 4.0 I/O library"
 readme = "bindings/python/README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "zigfitsio contributors" }]
 keywords = ["FITS", "astronomy", "astrophysics", "io", "zig", "cfitsio"]
@@ -20,11 +20,11 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = ["numpy>=1.20"]
@@ -64,7 +64,7 @@ include = [
 testpaths = ["bindings/python/tests"]
 
 [tool.cibuildwheel]
-build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
 # 32-bit targets are skipped: hatch_build.py compiles the C-ABI library for the 64-bit host,
 # so a win32/i686 wheel would bundle a 64-bit binary and fail to load ([WinError 193]).
 skip = "*-musllinux_i686 *_i686 *-win32 pp*"
@@ -72,12 +72,15 @@ build-frontend = "build"
 test-requires = ["pytest", "numpy", "astropy"]
 # The bundled library is import-time loaded; run the suite against the installed wheel.
 test-command = "pytest {project}/bindings/python/tests -q"
-# astropy publishes no musllinux/aarch64 wheel for every built CPython (e.g. none for cp39),
-# so the test-deps install source-builds astropy there — which fails to compile under the
-# musllinux_1_2 image's GCC 14 (-Wincompatible-pointer-types is now an error). The wheel is
-# still built and shipped; its test just doesn't run under musl/arm (the same-arch
-# manylinux_aarch64 wheel — identical Zig binary + bindings — is fully tested).
-test-skip = "*-musllinux_aarch64"
+# Two lanes skip only their in-CI test (the wheel is still built and shipped in both):
+#   • *-musllinux_aarch64 — astropy ships no musllinux/aarch64 wheel for some built CPythons, so
+#     the test-deps install source-builds astropy there, which fails to compile under the
+#     musllinux_1_2 image's GCC 14 (-Wincompatible-pointer-types is now an error). The same-arch
+#     manylinux_aarch64 wheel — identical Zig binary + bindings — is fully tested.
+#   • cp314t-* (free-threaded 3.14) — astropy has no guaranteed free-threaded wheel yet, so its
+#     install would source-build and can fail. Drop this once numpy + astropy publish cp314t
+#     wheels for the built platforms, to actually exercise the ctypes binding under no-GIL.
+test-skip = "*-musllinux_aarch64 cp314t-*"
 
 # Linux wheels build inside a manylinux container, so fetch a pinned Zig 0.16 into it and put
 # it on PATH for hatch_build.py's system-`zig` fallback. macOS/Windows build on the host where

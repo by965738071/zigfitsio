@@ -6,7 +6,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- **Python support:** dropped end-of-life CPython 3.9 and added CPython 3.14 wheels, including
+  the free-threaded (no-GIL) `cp314t` build. Minimum supported Python is now 3.10. The
+  `cp314t` wheel is built and shipped but its test suite is skipped in CI until free-threaded
+  `numpy`/`astropy` wheels are available on the built platforms.
 
 ## [0.1.1] - 2026-07-02
 
