@@ -81,6 +81,13 @@ def _vla_elem_dtype(fmt: str):
     return dt.bin_elem_dtype(ord(letter)) if letter else (np.dtype("f8"), False)
 
 
+def _col_fp(col):
+    """A change-detection fingerprint for one materialized table column (object=VLA safe)."""
+    if col.dtype == object:
+        return hash(tuple(np.asarray(x).tobytes() for x in col))
+    return hash(np.ascontiguousarray(col).tobytes())
+
+
 def _vla_heap_bytes(cols) -> int:
     """Total heap bytes to reserve (PCOUNT) for the VLA columns of a to-be-written table."""
     total = 0
@@ -524,12 +531,53 @@ class _TableHDU(_HDU):
     _table_type = ll.BINARY_TBL
     _columns: list = []
     _nrows: int = 0
+    _col_fingerprints = None  # per-column baselines for update-mode in-place write-back
 
     @property
     def data(self):
         if self._hdulist is not None and self._data is None:
             self._data = self._read_table()
         return self._data
+
+    def _flush_data(self):
+        """Write back in-place edits to a materialized table's cell values (update mode). Only
+        changed columns are rewritten; changing the row count or editing a VLA/scaled column in
+        place is not supported (use writeto() to a new file, which reconstructs)."""
+        if self._data is None or self._col_fingerprints is None:
+            return
+        rec = self._data
+        if rec.dtype.names is None:
+            return
+        h = self._select()
+        t = _VOID()
+        ll.check(ll.lib.zf_table_open(h, c.byref(t)))
+        try:
+            nrows_ = c.c_longlong()
+            ll.check(ll.lib.zf_table_nrows(t, c.byref(nrows_)))
+            nrows = int(nrows_.value)
+            for i, name in enumerate(rec.dtype.names):
+                new_fp = _col_fp(rec[name])
+                if new_fp == self._col_fingerprints.get(name):
+                    continue  # column unchanged
+                if nrows != len(rec):
+                    raise NotImplementedError(
+                        "in-place table update cannot change the row count; use writeto() to a new file"
+                    )
+                info = ll.ZfColInfo()
+                ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
+                if info.is_vla:
+                    raise NotImplementedError(
+                        "in-place update of a variable-length-array column is not supported; use writeto()"
+                    )
+                if info.tscal != 1.0 or info.tzero != 0.0:
+                    raise NotImplementedError(
+                        "in-place update of a scaled/unsigned (TSCAL/TZERO) column is not supported; use writeto()"
+                    )
+                fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
+                _TableHDU._write_column(t, i, Column(name, fmt, array=rec[name]), nrows)
+                self._col_fingerprints[name] = new_fp
+        finally:
+            ll.lib.zf_table_close(t)
 
     @property
     def columns(self):
@@ -581,6 +629,8 @@ class _TableHDU(_HDU):
             rec = np.empty(max(nrows, 0), dtype=np.dtype(fields))
             for (name, _), reader in zip(fields, readers):
                 rec[name] = reader()
+            if self._writable() and rec.dtype.names:  # baselines for in-place update write-back
+                self._col_fingerprints = {name: _col_fp(rec[name]) for name in rec.dtype.names}
             return rec
         finally:
             ll.lib.zf_table_close(t)
@@ -887,8 +937,30 @@ class HDUList(list):
         if self._handle is None:
             return
         if self._mode != ll.READONLY:
-            for hdu in self:  # update-mode data write-back (images; headers persist on assignment)
-                if isinstance(hdu, ImageHDU) and not isinstance(hdu, CompImageHDU) and hdu._hdulist is self:
+            # 1) Serialize any newly-appended (detached) HDUs to the open file, in order — so an
+            #    open+append+close (or +flush) actually writes them, not just writeto().
+            for i in range(self._scanned_count, len(self)):
+                hdu = self[i]
+                if hdu._hdulist is None:
+                    hdu._write_to(self._handle, primary=(i == 0))
+                    hdu._hdulist = self
+                    hdu._index = i + 1
+                    if isinstance(hdu, ImageHDU) and hdu._data is not None:
+                        # Baseline so the next flush doesn't re-write the just-appended pixels.
+                        hdu._data_fingerprint = hash(np.asarray(hdu._data).tobytes())
+            if len(self) > self._scanned_count:
+                self._scanned_count = len(self)
+            # 2) Write back in-place edits to attached image/table data.
+            for hdu in self:
+                if hdu._hdulist is not self:
+                    continue
+                if isinstance(hdu, CompImageHDU):
+                    # In-place recompression isn't supported; fail loud rather than silently drop.
+                    if hdu._data is not None and hash(np.asarray(hdu._data).tobytes()) != hdu._data_fingerprint:
+                        raise NotImplementedError(
+                            "in-place update of a compressed image is not supported; use writeto() to a new file"
+                        )
+                elif isinstance(hdu, (ImageHDU, _TableHDU)):
                     hdu._flush_data()
         ll.check(ll.lib.zf_flush(self._handle))
 

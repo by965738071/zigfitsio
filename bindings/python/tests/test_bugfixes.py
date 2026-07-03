@@ -332,3 +332,35 @@ def test_failed_writeto_leaves_no_partial_file(tmp_fits):
         zf.HDUList([Boom(data=np.zeros(2, dtype="i2"))]).writeto(p, overwrite=True)
     assert open(p, "rb").read() == before  # original intact, no partial temp left behind
     assert not os.path.exists(str(p) + ".zigfitsio.tmp")
+
+
+def test_update_mode_table_writeback(tmp_fits):
+    # An in-place edit to a materialized table column must persist on close (update mode).
+    p = tmp_fits("tbl.fits")
+    col = zf.Column("FLUX", "1E", array=np.array([1.0, 2.0, 3.0], dtype="f4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h[1].data["FLUX"][:] = 99.0
+    with zf.open(p) as chk:
+        np.testing.assert_array_equal(chk[1].data["FLUX"], [99.0, 99.0, 99.0])
+
+
+def test_append_hdu_persists_on_close(tmp_fits):
+    # An HDU appended to an update-mode list must be serialized to the file on close.
+    p = tmp_fits("app.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.ones((2, 2), dtype="i2"))]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h.append(zf.ImageHDU(data=np.arange(4, dtype="i2"), name="NEW"))
+    with zf.open(p) as chk:
+        assert len(chk) == 2
+        np.testing.assert_array_equal(chk["NEW"].data, [0, 1, 2, 3])
+
+
+def test_inplace_compressed_update_fails_loud(tmp_fits):
+    # In-place recompression is unsupported; it must raise (not silently drop the edit).
+    p = tmp_fits("comp.fits")
+    img = np.arange(16, dtype="i2").reshape(4, 4)
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(data=img, compression="RICE_1")]).writeto(p, overwrite=True)
+    with pytest.raises(NotImplementedError):
+        with zf.open(p, mode="update") as h:
+            h[1].data[0, 0] = 123
