@@ -92,3 +92,51 @@ both directions against Astropy and the committed golden corpus. Honest limits a
   hatch build hook falls back to a system `zig` when `ziglang` is absent.
 
 None of these require ABI changes to address — they are extension points, not design constraints.
+
+## 4. Bug-hunt fixes (branch `fix/bug-hunt-2026-07-02`) — known limitations & deferrals
+
+This branch fixes ~30 confirmed bugs across the compression interop, core safety, the C-ABI, and
+the Python bindings (see `CHANGELOG.md`). Everything below is a deliberate, documented boundary of
+that work — each is *fail-loud* (a clear error), never silent data loss.
+
+- **Python: in-place update of a *compressed* image is not supported.** Mutating a materialized
+  `CompImageHDU`'s pixels and then `flush()`/`close()` (update mode) raises `NotImplementedError`
+  rather than attempting in-place recompression (the tile heap would have to be resized in place).
+  Use `writeto()`, which reconstructs the file and recompresses correctly, preserving the source
+  codec/tiling/quantization.
+- **Python: in-place table update is limited to fixed-geometry cell edits.** `flush()`/`close()`
+  write back changed cell values of ordinary (fixed-width, unscaled) columns. Changing the row
+  count, or editing a variable-length-array (`P`/`Q`) or `TSCAL`/`TZERO`-scaled column in place,
+  raises `NotImplementedError` — use `writeto()` to a new file (which reconstructs) for those.
+- **Python: `append` and structural table edits go through the file, not a scratch copy.** Appending
+  an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`; there is no
+  transactional rollback of a partial in-place structural edit if the device write fails midway
+  (the same is true at the Zig layer — see the append/copy rollback that *is* implemented, versus
+  the header-rewrite path which validates-before-mutating but does not un-shift relocated bytes on a
+  mid-write I/O error).
+- **Header `update()`/`modify()` do not support HIERARCH long-keyword cards.** Reading a HIERARCH
+  card by its hierarchical name is correct (`get`/`has`/`comment`/`getValue`/`getHierarch`), but the
+  *write* helpers build a fixed-format 8-char card (`Card.buildValue`) and cannot construct a
+  HIERARCH card, so updating a HIERARCH keyword's value in place is unsupported. Rebuild the card via
+  the HIERARCH builder (`src/header/hierarch.zig`) instead.
+- **Dithered/quantized-float compression interop is verified but not yet golden-committed.** The
+  fix was validated against real `fpack`/`funpack` (zigfitsio decodes an `fpack SUBTRACTIVE_DITHER_1`
+  file bit-for-bit identically to `funpack` — max pixel diff 0) and is covered by hermetic
+  round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles, ZBLANK).
+  A CFITSIO-authored dithered `.fz` **golden fixture** under `test/golden/` plus an `fpack`
+  cross-check wired into the toolchain-gated `interop` CI job is a follow-up (the §1 golden corpus
+  is integer-tile only).
+- **ASCII-table float TFORM is reconstructed heuristically on copy.** When a *modified* ASCII table
+  is re-serialized, a float column's `Ew.d` precision is derived as `E{w}.{w-7}` from the column
+  width, because the C ABI's `ZfColInfo` exposes width and typecode but not the original `TDISP`/
+  format string — a re-written ASCII float column may not preserve the source's exact displayed
+  precision. Integer (`Iw`) and character (`Aw`) ASCII columns reconstruct exactly. Reading ASCII
+  columns (including wide `I11`-style integers) is exact.
+
+### Delivery status (point-in-time)
+
+The work lives on branch `fix/bug-hunt-2026-07-02`, organized as area-staged, individually-green
+commits (compression interop, core memory-safety/DoS, C-ABI, low-severity hardening, Python
+data-loss+correctness, Python features, and a self-review fixup). All suites pass: **519/519 Zig
+tests in both Debug and ReleaseFast**, `zig build capi-test`, `zig build wasm-check`, and the
+Python suite (`pytest bindings/python/tests`). This section is moot once the branch is merged.
