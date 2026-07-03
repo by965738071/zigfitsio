@@ -597,10 +597,21 @@ pub const HeapManager = struct {
         // double-count their bytes, so without this check `bump` could exceed heap_size and
         // moveBytes would write the payload past the data unit (OOB write / next-HDU corruption).
         var bump: u64 = 0;
-        for (groups.items) |*g| {
+        for (groups.items, 0..) |*g, i| {
             const packed_end = std.math.add(u64, bump, g.len) catch return error.BadDescriptor;
             if (packed_end > geom.heap_size) return error.BadDescriptor;
             if (g.src != bump) {
+                // Reject if this relocation's DESTINATION [bump, packed_end) would overwrite a
+                // not-yet-moved extent's SOURCE — a cross-extent clobber that silently corrupts
+                // that later cell (it relocates the already-overwritten bytes). Only reachable on a
+                // forged/corrupt heap with partially overlapping DISTINCT extents; exact aliases
+                // were collapsed above, and a move that merely self-overlaps its own source is safe
+                // (`moveBytes` copies back-to-front for it). The earlier `packed_end > heap_size`
+                // guard bounds OOB writes but not this in-heap clobber.
+                for (groups.items[i + 1 ..]) |later| {
+                    const later_end = later.src + later.len; // ≤ heap_size by the per-row bound above
+                    if (bump < later_end and later.src < packed_end) return error.BadDescriptor;
+                }
                 try moveBytes(table, geom.heap_abs_off + g.src, geom.heap_abs_off + bump, g.len);
             }
             g.dst = bump;
@@ -1298,6 +1309,30 @@ test "compact rejects forged overlapping extents whose packed size exceeds the h
 
     try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2, 3, 4, 5 });
     try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 5, .off = 4 });
+
+    try testing.expectError(error.BadDescriptor, mgr.compact(alloc, &t));
+}
+
+test "compact rejects partially-overlapping interleaved extents that would clobber a later source" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // heap_size = 32. Three DISTINCT byte extents that interleave: {off=0,len=4}, {off=2,len=4},
+    // {off=4,len=4} — each end ≤ heap_size (passes the per-row bound) and packed size 12 fits.
+    // Packing {0,4}→0 then {2,4}→4 would overwrite [4,8) — which is {4,4}'s source — BEFORE {4,4}
+    // is relocated, so row 2 would silently read back the wrong (already-overwritten) bytes. No OOB
+    // (all within the heap), so the earlier size guard doesn't catch it; the cross-extent-clobber
+    // check must reject with BadDescriptor.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PB", 3, 32, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, u8, &[_]u8{ 10, 11, 12, 13 });
+    try setDescriptor(&t, .{ .index = 0 }, 1, .{ .len = 4, .off = 2 });
+    try setDescriptor(&t, .{ .index = 0 }, 2, .{ .len = 4, .off = 4 });
 
     try testing.expectError(error.BadDescriptor, mgr.compact(alloc, &t));
 }

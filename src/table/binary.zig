@@ -192,7 +192,7 @@ pub const BinTable = struct {
             if (first_row > self.naxis2) return error.RowOutOfRange;
             return;
         }
-        const sl: usize = @intCast(slots);
+        const sl: usize = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
         if (out.len % sl != 0) return error.CellOutOfRange;
         const nrows: u64 = out.len / sl;
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
@@ -227,7 +227,7 @@ pub const BinTable = struct {
             if (first_row > self.naxis2) return error.RowOutOfRange;
             return;
         }
-        const sl: usize = @intCast(slots);
+        const sl: usize = std.math.cast(usize, slots) orelse return error.CellOutOfRange;
         if (in.len % sl != 0) return error.CellOutOfRange;
         const nrows: u64 = in.len / sl;
         const last = std.math.add(u64, first_row, nrows) catch return error.RowOutOfRange;
@@ -292,7 +292,7 @@ pub const BinTable = struct {
         try moveRegion(self.fits.dev, data_off + ins_off, data_off + ins_off + ins_bytes, tail_bytes);
         try zeroBytes(self.fits.dev, data_off + ins_off, ins_bytes);
 
-        try self.hdu.header.modify("NAXIS2", .{ .int = @intCast(new_naxis2) }, null);
+        try self.hdu.header.modify("NAXIS2", .{ .int = std.math.cast(i64, new_naxis2) orelse return error.LimitExceeded }, null);
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
     }
@@ -321,7 +321,7 @@ pub const BinTable = struct {
         if (pcount > 0) try moveRegion(self.fits.dev, data_off + old_rows, data_off + new_rows, pcount);
         try self.fits.resizeHduData(self.hdu, new_total);
 
-        try self.hdu.header.modify("NAXIS2", .{ .int = @intCast(new_naxis2) }, null);
+        try self.hdu.header.modify("NAXIS2", .{ .int = std.math.cast(i64, new_naxis2) orelse return error.LimitExceeded }, null);
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
     }

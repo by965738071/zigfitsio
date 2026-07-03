@@ -69,8 +69,12 @@ fn castFloatInt(comptime Dst: type, src: anytype) ConvError!Dst {
 fn castIntFloat(comptime Dst: type, src: anytype, mode: Mode) ConvError!Dst {
     const f: Dst = @floatFromInt(src);
     if (mode == .scalar) {
-        // `f` is integral-valued; round-trip through i128 (which holds any value our floats
-        // can carry) to detect mantissa precision loss without risking an out-of-range cast.
+        // `f` is integral-valued; round-trip through i128 (which holds any value our floats can
+        // carry) to detect mantissa precision loss without risking an out-of-range cast. Guard
+        // against a non-finite intermediate first: an integer too large for a narrow `Dst` (e.g.
+        // a value > 65504 into `f16`) saturates to ±inf, and `@intFromFloat(inf)` traps — a
+        // saturated result is by definition not exactly representable, so report precision loss.
+        if (!std.math.isFinite(f)) return error.PrecisionLoss;
         const back: i128 = @intFromFloat(f);
         if (back != @as(i128, src)) return error.PrecisionLoss;
     }
@@ -121,6 +125,16 @@ test "int→float exact vs inexact (scalar errors, bulk silent)" {
     _ = try cast(f64, big, .bulk); // silent in bulk
     const exact: i64 = (@as(i64, 1) << 52) + 1; // representable
     try testing.expectEqual(@as(f64, @floatFromInt(exact)), try cast(f64, exact, .scalar));
+}
+
+test "int→narrow-float overflow reports PrecisionLoss, never traps on @intFromFloat(inf)" {
+    // A value beyond f16's finite range saturates to +inf; the scalar round-trip check must not
+    // reach `@intFromFloat(inf)` (a trap). Reproduces reading a large integer column cell as f16.
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, 70000), .scalar));
+    try testing.expectError(error.PrecisionLoss, cast(f16, @as(i64, -70000), .scalar));
+    _ = try cast(f16, @as(i64, 70000), .bulk); // bulk still saturates silently (documented)
+    // In-range values still round-trip exactly.
+    try testing.expectEqual(@as(f16, 1024.0), try cast(f16, @as(i64, 1024), .scalar));
 }
 
 test "float→float narrowing precision policy" {
