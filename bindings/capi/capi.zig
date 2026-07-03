@@ -196,6 +196,15 @@ pub export fn zf_read_bytes(h_opt: ?*Handle, offset: u64, dst: [*]u8, len: usize
 /// Close a handle and free all associated resources. Safe to call with null.
 pub export fn zf_close(h: ?*Handle) void {
     const hh = h orelse return;
+    // Invalidate any open table views first: release their resources (while the `Fits` is still
+    // alive) and mark them dead, so a later `zf_table_*`/`zf_table_close` on a still-held `ZfTable*`
+    // cannot use-after-free the freed `Fits`/`Hdu` they borrow. The `TableHandle` memory itself is
+    // caller-owned and freed by `zf_table_close`.
+    for (hh.tables.items) |th| {
+        th.deinit();
+        th.dead = true;
+    }
+    hh.tables.deinit(gpa);
     hh.fits.deinit();
     if (hh.mem_dev) |md| {
         md.deinit();
@@ -291,10 +300,12 @@ pub export fn zf_img_param(h_opt: ?*Handle, bitpix_out: *c_int, naxis_out: *c_in
 // Images
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-fn axesFrom(naxis: c_int, axes: ?[*]const c_long, buf: *[999]u64) []const u64 {
+// `null` when any axis element is negative (a plain `@intCast` of a negative `c_long` would trap
+// across the C boundary); the caller maps that to `error.BadDimensions`.
+fn axesFrom(naxis: c_int, axes: ?[*]const c_long, buf: *[999]u64) ?[]const u64 {
     const nax: usize = if (naxis > 0) @intCast(@min(naxis, 999)) else 0;
     if (axes) |ax| {
-        for (0..nax) |i| buf[i] = @intCast(ax[i]);
+        for (0..nax) |i| buf[i] = std.math.cast(u64, ax[i]) orelse return null;
     }
     return buf[0..nax];
 }
@@ -303,7 +314,8 @@ fn axesFrom(naxis: c_int, axes: ?[*]const c_long, buf: *[999]u64) []const u64 {
 pub export fn zf_create_img(h_opt: ?*Handle, bitpix: c_int, naxis: c_int, axes: ?[*]const c_long) c_int {
     const h = h_opt orelse return abi.failNull();
     var buf: [999]u64 = undefined;
-    const spec = fits.ImageSpec{ .bitpix = @intCast(bitpix), .axes = axesFrom(naxis, axes, &buf) };
+    const ax = axesFrom(naxis, axes, &buf) orelse return abi.fail(&h.diag, error.BadDimensions);
+    const spec = fits.ImageSpec{ .bitpix = @intCast(bitpix), .axes = ax };
     _ = h.fits.appendImageHdu(spec) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
@@ -314,7 +326,8 @@ pub export fn zf_resize_img(h_opt: ?*Handle, bitpix: c_int, naxis: c_int, axes: 
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
     var view = fits.ImageView.of(&h.fits, hdu) catch |e| return abi.fail(&h.diag, e);
     var buf: [999]u64 = undefined;
-    view.reshape(@intCast(bitpix), axesFrom(naxis, axes, &buf)) catch |e| return abi.fail(&h.diag, e);
+    const ax = axesFrom(naxis, axes, &buf) orelse return abi.fail(&h.diag, error.BadDimensions);
+    view.reshape(@intCast(bitpix), ax) catch |e| return abi.fail(&h.diag, e);
     return 0;
 }
 
@@ -447,12 +460,14 @@ fn sectionDispatch(comptime dir: Dir, view: *fits.ImageView, ty: ZfType, lower: 
     };
 }
 
-fn fillBounds(naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, lo: *[999]u64, hi: *[999]u64, st: *[999]u64) usize {
+// `null` when any bound/stride element is negative (a plain `@intCast` of a negative `c_long`
+// would trap across the C boundary); the caller maps that to `error.BadDimensions`.
+fn fillBounds(naxis: c_int, lower: [*]const c_long, upper: [*]const c_long, inc: ?[*]const c_long, lo: *[999]u64, hi: *[999]u64, st: *[999]u64) ?usize {
     const nax: usize = if (naxis > 0) @intCast(@min(naxis, 999)) else 0;
     for (0..nax) |i| {
-        lo[i] = @intCast(lower[i]);
-        hi[i] = @intCast(upper[i]);
-        st[i] = if (inc) |c| @intCast(c[i]) else 1;
+        lo[i] = std.math.cast(u64, lower[i]) orelse return null;
+        hi[i] = std.math.cast(u64, upper[i]) orelse return null;
+        st[i] = if (inc) |c| (std.math.cast(u64, c[i]) orelse return null) else 1;
     }
     return nax;
 }
@@ -466,7 +481,7 @@ pub export fn zf_read_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower:
     var lo: [999]u64 = undefined;
     var hi: [999]u64 = undefined;
     var stb: [999]u64 = undefined;
-    const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb);
+    const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb) orelse return abi.fail(&h.diag, error.BadDimensions);
     const stride: ?[]const u64 = if (inc != null) stb[0..n] else null;
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
     sectionDispatch(.read, &view, @enumFromInt(dtype), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
@@ -482,7 +497,7 @@ pub export fn zf_write_subset(h_opt: ?*Handle, dtype: c_int, naxis: c_int, lower
     var lo: [999]u64 = undefined;
     var hi: [999]u64 = undefined;
     var stb: [999]u64 = undefined;
-    const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb);
+    const n = fillBounds(naxis, lower, upper, inc, &lo, &hi, &stb) orelse return abi.fail(&h.diag, error.BadDimensions);
     const stride: ?[]const u64 = if (inc != null) stb[0..n] else null;
     const sc: ?fits.Scaling = if (scaling) |s| abi.toScaling(s.*) else null;
     sectionDispatch(.write, &view, @enumFromInt(dtype), lo[0..n], hi[0..n], stride, array, @intCast(nelem), nulval, sc) catch |e| return abi.fail(&h.diag, e);
@@ -715,6 +730,9 @@ fn asciiTypeCode(t: tc.AsciiType) abi.ZfType {
 fn createTbl(h: *Handle, table_type: c_int, nrows: c_longlong, ncols: c_int, ttype: [*]const ?[*:0]const u8, tform: [*]const ?[*:0]const u8, tunit: ?[*]const ?[*:0]const u8, extname: ?[*:0]const u8, pcount: c_longlong) fits.Error!void {
     const nc: usize = if (ncols > 0) @intCast(ncols) else 0;
     const ascii = table_type == 1;
+    // TFORM is mandatory for every column; a null entry (caller under-populated the array) must
+    // error cleanly rather than force-unwrap-panic across the C boundary at `tform[i].?` below.
+    for (0..nc) |i| if (tform[i] == null) return error.MissingRequiredKeyword;
 
     var hdr = fits.Header.initEmpty();
     var owned = true;
@@ -806,6 +824,13 @@ pub export fn zf_table_open(h_opt: ?*Handle, out: *?*TableHandle) c_int {
             return abi.fail(&h.diag, error.WrongHduType);
         },
     }
+    // Register the view so `zf_close` can invalidate it (preventing a use-after-free if the file is
+    // closed while the view is still held).
+    h.tables.append(gpa, th) catch {
+        th.deinit();
+        gpa.destroy(th);
+        return abi.fail(null, error.OutOfMemory);
+    };
     out.* = th;
     return 0;
 }
@@ -813,13 +838,32 @@ pub export fn zf_table_open(h_opt: ?*Handle, out: *?*TableHandle) c_int {
 /// Close a table view.
 pub export fn zf_table_close(t: ?*TableHandle) void {
     const th = t orelse return;
+    // Deregister from the owner's live-view list — unless the owner was already closed, which marked
+    // this view dead and dropped the list (so `th.owner` must not be dereferenced).
+    if (!th.dead) {
+        for (th.owner.tables.items, 0..) |v, i| {
+            if (v == th) {
+                _ = th.owner.tables.swapRemove(i);
+                break;
+            }
+        }
+    }
     th.deinit();
     gpa.destroy(th);
 }
 
+// A table handle that is non-null and still live (its owning file open). `zf_close` marks a view
+// `dead` and frees the `Fits`/`Hdu` it borrows, so every table op must reject a dead handle before
+// dereferencing it — otherwise it is a use-after-free. A dead view yields the null-handle status
+// (from the caller's perspective it is no longer usable).
+fn liveTable(t_opt: ?*TableHandle) ?*TableHandle {
+    const t = t_opt orelse return null;
+    return if (t.dead) null else t;
+}
+
 /// Number of rows in the table.
 pub export fn zf_table_nrows(t_opt: ?*TableHandle, out: *c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     out.* = @intCast(switch (t.kind) {
         .binary => t.bin.?.rowCount(),
         .ascii => t.asc.?.rowCount(),
@@ -829,7 +873,7 @@ pub export fn zf_table_nrows(t_opt: ?*TableHandle, out: *c_longlong) c_int {
 
 /// Number of columns in the table.
 pub export fn zf_table_ncols(t_opt: ?*TableHandle, out: *c_int) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     out.* = @intCast(switch (t.kind) {
         .binary => t.bin.?.columnCount(),
         .ascii => t.asc.?.columnCount(),
@@ -852,7 +896,7 @@ fn resolveCol(t: *TableHandle, name: []const u8) fits.Error!u16 {
 
 /// Resolve a column name (case-insensitive, wildcards) to a 0-based index.
 pub export fn zf_table_colnum(t_opt: ?*TableHandle, name_ptr: [*]const u8, name_len: usize, out: *c_int) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const idx = resolveCol(t, name_ptr[0..name_len]) catch |e| return abi.fail(&t.owner.diag, e);
     out.* = @intCast(idx);
     return 0;
@@ -860,7 +904,7 @@ pub export fn zf_table_colnum(t_opt: ?*TableHandle, name_ptr: [*]const u8, name_
 
 /// Fill `info` with metadata for 0-based column `col`.
 pub export fn zf_table_col_info(t_opt: ?*TableHandle, col: c_int, info: *ZfColInfo) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     info.* = .{};
     switch (t.kind) {
@@ -914,7 +958,7 @@ fn colNameUnit(t: *TableHandle, col: usize, want_unit: bool) ?[]const u8 {
 
 /// Copy 0-based column `col`'s name (`TTYPEn`) into `buf`.
 pub export fn zf_table_col_name(t_opt: ?*TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     abi.copyOut(colNameUnit(t, ci, false) orelse "", buf, buf_len, out_len);
     return 0;
@@ -922,7 +966,7 @@ pub export fn zf_table_col_name(t_opt: ?*TableHandle, col: c_int, buf: [*]u8, bu
 
 /// Copy 0-based column `col`'s unit (`TUNITn`) into `buf`.
 pub export fn zf_table_col_unit(t_opt: ?*TableHandle, col: c_int, buf: [*]u8, buf_len: usize, out_len: *usize) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const ci: usize = if (col >= 0) @intCast(col) else return abi.fail(&t.owner.diag, error.NoSuchColumn);
     abi.copyOut(colNameUnit(t, ci, true) orelse "", buf, buf_len, out_len);
     return 0;
@@ -985,7 +1029,7 @@ fn colDispatch(comptime dir: Dir, t: *TableHandle, ty: ZfType, col: u16, first_r
 
 /// Read `nelem` elements of 0-based column `col` starting at 1-based `firstrow`, as `dtype`.
 pub export fn zf_read_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     colDispatch(.read, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
@@ -994,7 +1038,7 @@ pub export fn zf_read_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstr
 
 /// Write `nelem` elements to 0-based column `col` starting at 1-based `firstrow`, from `dtype`.
 pub export fn zf_write_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, firstrow: c_longlong, nelem: c_longlong, nulval: ?*const anyopaque, array: *anyopaque) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     if (nelem <= 0) return 0;
     if (col < 0 or firstrow < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     colDispatch(.write, t, @enumFromInt(dtype), @intCast(col), @intCast(firstrow - 1), array, @intCast(nelem), nulval) catch |e| return abi.fail(&t.owner.diag, e);
@@ -1004,7 +1048,7 @@ pub export fn zf_write_col(t_opt: ?*TableHandle, dtype: c_int, col: c_int, first
 /// Read `nrows` text cells of character column `col` (0-based) starting at 1-based `firstrow`,
 /// each into `buf[i*stride .. i*stride+width]` (raw fixed-width field bytes).
 pub export fn zf_read_col_str(t_opt: ?*TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]u8) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     if (nrows <= 0) return 0;
     if (col < 0 or firstrow < 1 or width < 0 or stride < width) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const w: usize = @intCast(width);
@@ -1027,7 +1071,7 @@ pub export fn zf_read_col_str(t_opt: ?*TableHandle, col: c_int, firstrow: c_long
 /// Write `nrows` text cells of character column `col` (0-based) starting at 1-based `firstrow`,
 /// each from `buf[i*stride .. i*stride+width]`.
 pub export fn zf_write_col_str(t_opt: ?*TableHandle, col: c_int, firstrow: c_longlong, nrows: c_longlong, width: c_longlong, stride: c_longlong, buf: [*]const u8) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     if (nrows <= 0) return 0;
     if (col < 0 or firstrow < 1 or width < 0 or stride < width) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     const w: usize = @intCast(width);
@@ -1054,32 +1098,36 @@ fn requireBinary(t: *TableHandle) fits.Error!*fits.BinTable {
 
 /// Append `n` empty rows to a binary table.
 pub export fn zf_append_rows(t_opt: ?*TableHandle, n: c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (n < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
     tbl.appendRows(@intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Insert `n` empty rows before 0-based `before_row` in a binary table.
 pub export fn zf_insert_rows(t_opt: ?*TableHandle, before_row: c_longlong, n: c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (before_row < 0 or n < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
     tbl.insertRows(@intCast(before_row), @intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Delete `n` rows starting at 0-based `first_row` in a binary table.
 pub export fn zf_delete_rows(t_opt: ?*TableHandle, first_row: c_longlong, n: c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (first_row < 0 or n < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
     tbl.deleteRows(@intCast(first_row), @intCast(n)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
 /// Insert a new column at 0-based `at` in a binary table.
 pub export fn zf_insert_col(t_opt: ?*TableHandle, at: c_int, tform: [*:0]const u8, ttype: ?[*:0]const u8) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (at < 0 or at > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
     const tt: ?[]const u8 = if (ttype) |p| std.mem.span(p) else null;
     tbl.insertColumn(gpa, @intCast(at), std.mem.span(tform), tt) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
@@ -1087,8 +1135,9 @@ pub export fn zf_insert_col(t_opt: ?*TableHandle, at: c_int, tform: [*:0]const u
 
 /// Delete 0-based column `col` from a binary table.
 pub export fn zf_delete_col(t_opt: ?*TableHandle, col: c_int) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
     tbl.deleteColumn(@intCast(col)) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
@@ -1097,8 +1146,9 @@ pub export fn zf_delete_col(t_opt: ?*TableHandle, col: c_int) c_int {
 
 /// Read the (len, offset) descriptor of a VLA cell (1-based `row`).
 pub export fn zf_read_descript(t_opt: ?*TableHandle, col: c_int, row: c_longlong, out_len: *c_longlong, out_off: *c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or row < 1) return abi.fail(&t.owner.diag, error.CellOutOfRange); // mirror zf_read_col_vla
     const d = fits.heap.readDescriptor(tbl, .{ .index = @intCast(col) }, @intCast(row - 1)) catch |e| return abi.fail(&t.owner.diag, e);
     out_len.* = d.len;
     out_off.* = d.off;
@@ -1132,7 +1182,7 @@ fn vlaRead(ty: ZfType, tbl: *fits.BinTable, col: u16, row: u64, array: *anyopaqu
 /// Read a VLA cell (1-based `row`) into `array` (capacity `cap` elements); `out_nelem` gets the
 /// true element count (may exceed `cap`).
 pub export fn zf_read_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, cap: c_longlong, array: *anyopaque, out_nelem: *c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or cap < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     vlaRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(row - 1), array, @intCast(cap), out_nelem) catch |e| return abi.fail(&t.owner.diag, e);
@@ -1163,7 +1213,7 @@ fn vlaWrite(ty: ZfType, tbl: *fits.BinTable, mgr: *fits.heap.HeapManager, col: u
 /// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. Uses a heap manager
 /// created lazily for the table (assumes the heap starts empty / PCOUNT was reserved).
 pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, array: *const anyopaque, nelem: c_longlong) c_int {
-    const t = t_opt orelse return abi.failNull();
+    const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or nelem < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
     if (t.mgr == null) {
@@ -1296,6 +1346,7 @@ pub export fn zf_findings_free(fh: ?*FindingsHandle) void {
 
 fn celestialOf(h: *Handle, alt: c_int) fits.Error!fits.Celestial {
     const hdu = try h.cur();
+    if (alt < 0 or alt > std.math.maxInt(u8)) return error.BadWcs; // guard the u8 cast (alt > 255 traps)
     const a: u8 = if (alt <= ' ') ' ' else @intCast(alt);
     var w = try fits.Wcs.fromHeader(gpa, &hdu.header, a);
     defer w.deinit(gpa);
@@ -1353,7 +1404,7 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
     var axbuf: [999]u64 = undefined;
     var tilebuf: [999]u64 = undefined;
     const nax: usize = @intCast(@min(naxis, 999));
-    for (0..nax) |i| axbuf[i] = @intCast(axes[i]);
+    for (0..nax) |i| axbuf[i] = std.math.cast(u64, axes[i]) orelse return abi.fail(&h.diag, error.BadDimensions);
     var spec = fits.CompressSpec{
         .bitpix = @intCast(bitpix),
         .axes = axbuf[0..nax],
@@ -1363,7 +1414,7 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
     // the `CompressSpec` field types so the shim needs no extra exports.
     spec.codec = @TypeOf(spec.codec).fromName(std.mem.span(codec));
     if (tile) |tl| {
-        for (0..nax) |i| tilebuf[i] = @intCast(tl[i]);
+        for (0..nax) |i| tilebuf[i] = std.math.cast(u64, tl[i]) orelse return abi.fail(&h.diag, error.BadTiling);
         spec.tile = tilebuf[0..nax];
     }
     if (quantize) |q| spec.quantize = @TypeOf(spec.quantize).fromName(std.mem.span(q));
