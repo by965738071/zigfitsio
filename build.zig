@@ -44,6 +44,16 @@ pub fn build(b: *std.Build) void {
         .name = "zigfitsio_capi",
         .root_module = capi_mod,
     });
+    // Force the LLVM backend for the C-ABI shim regardless of optimize mode. Zig 0.16.0's
+    // self-hosted x86_64 backend miscompiles the System V AMD64 argument prologue for an
+    // `export fn` that spills integer args to the stack *and* takes `f32`/`f64` by value
+    // (e.g. `zf_write_compressed2`/`zf_write_compressed3`): it reads the SSE args from `xmm6`
+    // instead of `xmm0`/`xmm1`, so a real C-ABI caller (ctypes/C) passes garbage for those
+    // floats. Zig↔Zig callers agree on the wrong convention, so the capi-test never sees it;
+    // only an external caller does. ReleaseFast already routed through LLVM (why the wheels are
+    // correct), but a Debug `zig build capi` — the local dev + smoke-test flow — was broken.
+    // LLVM emits the correct prologue (`xmm0`/`xmm1`), so pin it here at the ABI boundary.
+    capi_lib.use_llvm = true;
     b.installArtifact(capi_lib);
     // Install the shared library into `zig-out/lib` when `zig build capi` is invoked directly
     // (the compile step alone does not copy the artifact out of the cache).

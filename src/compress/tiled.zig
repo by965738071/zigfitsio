@@ -15,8 +15,10 @@
 //! The read path decodes `GZIP_1`/`GZIP_2` (`compress/gzip.zig`), `RICE_1` (`compress/rice.zig`),
 //! `PLIO_1` (`compress/plio.zig`) and `HCOMPRESS_1` (`compress/hcompress.zig`); only an unrecognized
 //! `ZCMPTYPE` yields `error.UnsupportedCodec` from `readAll` — never a silent mis-read
-//! (`NFR-INTEROP-1`). The write path (`writeCompressed`) emits GZIP for any BITPIX and RICE/PLIO/
-//! HCOMPRESS for integer 8/16/32-bit images. All declared sizes are validated against `Limits` and
+//! (`NFR-INTEROP-1`). The write path (`writeCompressed`) emits GZIP for any BITPIX, RICE/PLIO/
+//! HCOMPRESS for integer 8/16/32-bit images, and RICE/HCOMPRESS additionally for QUANTIZED float
+//! images (CFITSIO `fits_quantize` parity via `compress/quantize.zig`: `NO_DITHER` or subtractive
+//! dithering, per-tile `ZSCALE`/`ZZERO`). All declared sizes are validated against `Limits` and
 //! the device length before allocating (`NFR-SAFE-1`); a tile that decodes to the wrong size is
 //! `error.CorruptTile`. `PLIO_1` uses the standard pixel-list wire format (FITS 4.0 Table 38)
 //! and `HCOMPRESS_1` the standard H-transform stream (White 1992); both round-trip losslessly
@@ -52,6 +54,8 @@ const gzip = @import("gzip.zig");
 const rice = @import("rice.zig");
 const plio = @import("plio.zig");
 const hcompress = @import("hcompress.zig");
+const imgstats = @import("imgstats.zig");
+const quant = @import("quantize.zig");
 const dither = @import("dither.zig");
 const Header = @import("../header/header.zig").Header;
 const Matches = @import("../header/name.zig").Matches;
@@ -118,8 +122,12 @@ pub const Codec = enum {
 /// The floating-point quantization/dither method named by `ZQUANTIZ` (recorded, not applied on
 /// the GZIP read path, which is lossless).
 pub const Quantize = enum {
-    /// No dithering (`NO_DITHER`) or `ZQUANTIZ` absent.
+    /// No quantization at all: `ZQUANTIZ` absent or `'NONE'` (CFITSIO `NO_QUANTIZE`). On the
+    /// write path float pixels are stored losslessly (raw IEEE bytes under GZIP).
     none,
+    /// `NO_DITHER`: quantize floats to scaled integers WITHOUT dithering (`fpack -q0`). On the
+    /// write path this selects the CFITSIO quantizer with plain `NINT` rounding.
+    no_dither,
     /// `SUBTRACTIVE_DITHER_1`.
     subtractive_dither_1,
     /// `SUBTRACTIVE_DITHER_2`.
@@ -130,7 +138,8 @@ pub const Quantize = enum {
     /// Map a `ZQUANTIZ` string (case-insensitive, blank-trimmed) to a `Quantize`.
     pub fn fromName(s_in: []const u8) Quantize {
         const s = std.mem.trim(u8, s_in, " ");
-        if (std.ascii.eqlIgnoreCase(s, "NO_DITHER")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "NONE")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "NO_DITHER")) return .no_dither;
         if (std.ascii.eqlIgnoreCase(s, "SUBTRACTIVE_DITHER_1")) return .subtractive_dither_1;
         if (std.ascii.eqlIgnoreCase(s, "SUBTRACTIVE_DITHER_2")) return .subtractive_dither_2;
         return .unknown;
@@ -140,7 +149,8 @@ pub const Quantize = enum {
     /// `.unknown`.
     pub fn name(self: Quantize) ?[]const u8 {
         return switch (self) {
-            .none => "NO_DITHER",
+            .none => "NONE",
+            .no_dither => "NO_DITHER",
             .subtractive_dither_1 => "SUBTRACTIVE_DITHER_1",
             .subtractive_dither_2 => "SUBTRACTIVE_DITHER_2",
             .unknown => null,
@@ -156,9 +166,14 @@ pub const Quantize = enum {
         };
     }
 
-    /// Whether this method dithers (and therefore quantizes floats to integers).
+    /// Whether this method dithers (consuming §10.2 random draws and needing `ZDITHER0`).
     fn isDithered(self: Quantize) bool {
         return self == .subtractive_dither_1 or self == .subtractive_dither_2;
+    }
+
+    /// Whether this method quantizes floats to scaled integers at all (dithered or not).
+    fn isQuantized(self: Quantize) bool {
+        return self == .no_dither or self == .subtractive_dither_1 or self == .subtractive_dither_2;
     }
 };
 
@@ -694,7 +709,17 @@ pub const TiledImage = struct {
                 const sx = std.mem.readInt(u32, cbytes[2..][0..4], .big);
                 const sy = std.mem.readInt(u32, cbytes[6..][0..4], .big);
                 if (sx != tdim[1] or sy != tdim[0]) return error.CorruptTile;
-                const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile));
+                // `ZNAME2 = 'SMOOTH'`/`ZVAL2` (FITS 4.0 Table 39) requests decode-side
+                // coefficient smoothing (CFITSIO `hcomp_smooth`); absent or zero means none.
+                // The quantization scale itself comes from each tile's embedded stream header —
+                // `ZVAL1` (SCALE) is advisory, exactly as in CFITSIO.
+                // Deliberate divergence: the flag is looked up by NAME ('SMOOTH', any n), while
+                // CFITSIO reads ZVAL2 positionally regardless of what ZNAME2 says. Identical on
+                // every conforming file (CFITSIO always writes ZNAME2='SMOOTH'); on a
+                // hand-crafted header with a mislabeled ZNAME2, honoring the declared name is
+                // the safer reading.
+                const smooth = (self.paramNum("SMOOTH") orelse 0) != 0;
+                const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile), .{ .smooth = smooth });
                 defer alloc.free(dec.data);
                 if (dec.ny != tdim[0] or dec.nx != tdim[1]) return error.CorruptTile;
                 return i32ToBig(alloc, dec.data, w);
@@ -709,6 +734,22 @@ pub const TiledImage = struct {
             if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, p.name, " "), key)) {
                 return switch (p.value) {
                     .int => |v| v,
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    // Like `paramInt`, but also coerces a float-valued card (truncating toward zero). CFITSIO
+    // writes HCOMPRESS `ZVAL1` as a float and reads `ZVAL2` with implicit numeric conversion,
+    // so both card forms occur in the wild for numeric codec parameters.
+    fn paramNum(self: *const TiledImage, key: []const u8) ?i64 {
+        for (self.params) |p| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, p.name, " "), key)) {
+                return switch (p.value) {
+                    .int => |v| v,
+                    .float => |v| if (std.math.isFinite(v)) std.math.lossyCast(i64, @trunc(v)) else null,
                     else => null,
                 };
             }
@@ -966,19 +1007,57 @@ pub const CompressSpec = struct {
     bitpix: i64,
     /// `ZNAXISn` (most-rapidly-varying first); must be non-empty with non-zero extents.
     axes: []const u64,
-    /// `ZTILEn`. `null` selects the default row-strip tiling (full first axis, 1 elsewhere).
+    /// `ZTILEn`. `null` selects the default tiling: row strips (full first axis, 1 elsewhere),
+    /// except HCOMPRESS_1, which uses CFITSIO's 2-D row-block rule (see `writeCompressed`).
+    /// Deliberate divergence for EXPLICIT tiles: CFITSIO's author additionally rejects
+    /// HCOMPRESS tiles/images with a dimension under 4 pixels (`imcomp_init_table`); zigfitsio
+    /// accepts them (they encode/decode correctly here and in CFITSIO/funpack — the *decoders*
+    /// take any dims), but be aware such files sit outside CFITSIO's authoring envelope, and
+    /// Astropy refuses HCOMPRESS tiles that squeeze to one dimension (e.g. `{N, 1}`).
     tile: ?[]const u64 = null,
-    /// `ZCMPTYPE`. The write path implements `GZIP_1`/`GZIP_2` (any BITPIX), and `RICE_1`/`PLIO_1`/
-    /// `HCOMPRESS_1` for integer 8/16/32-bit images (HCOMPRESS additionally requires `ZNAXIS ≥ 2`);
-    /// an invalid codec/BITPIX pairing is `error.DataConstraintViolated` and `.unknown` is
-    /// `error.UnsupportedCodec`.
+    /// `ZCMPTYPE`. The write path implements `GZIP_1`/`GZIP_2` (any BITPIX), `RICE_1`/`PLIO_1`/
+    /// `HCOMPRESS_1` for integer 8/16/32-bit images, and `RICE_1`/`HCOMPRESS_1` additionally for
+    /// QUANTIZED float images (`quantize` set to a quantizing method; HCOMPRESS requires
+    /// `ZNAXIS ≥ 2` either way). Fail-loud rejections: PLIO + floats (`UnsupportedCodec` — its
+    /// 0..2²⁴ range cannot hold quantized output), float + integer codec without quantization
+    /// (`UnsupportedCodec` — CFITSIO would silently truncate floats to ints), HCOMPRESS +
+    /// `subtractive_dither_2` (`DataConstraintViolated` — CFITSIO silently coerces to DITHER_1),
+    /// other invalid codec/BITPIX pairings (`DataConstraintViolated`), and `.unknown`
+    /// (`UnsupportedCodec`).
     codec: Codec = .gzip_1,
-    /// `ZQUANTIZ`. For a float `bitpix`, `subtractive_dither_1`/`_2` quantizes pixels to 32-bit
-    /// integers with a per-tile linear map and the subtractive-dither offset (FITS 4.0 §10.2),
-    /// storing per-tile `ZSCALE`/`ZZERO` columns. Ignored for integer images.
+    /// `ZQUANTIZ`. For a float `bitpix`, `no_dither`/`subtractive_dither_1`/`_2` quantizes
+    /// pixels to 32-bit integers with a per-tile linear map (FITS 4.0 §10.2) — the subtractive
+    /// kinds add the dither offset — storing per-tile `ZSCALE`/`ZZERO` columns; the quantized
+    /// integers then feed the codec (GZIP, RICE, or HCOMPRESS). `.none` stores float pixels
+    /// losslessly (GZIP only). Ignored for integer images.
     quantize: Quantize = .none,
     /// `ZDITHER0` seed (used only when dithering).
     zdither0: i64 = 1,
+    /// CFITSIO quantization level (`fits_set_quantize_level` / `fpack -q`), used when
+    /// `quantize` is a quantizing method: `> 0` sets the per-tile step to `sigma/level` (sigma
+    /// = the tile's MAD background noise, `compress/quantize.zig`), `0` means the CFITSIO
+    /// default (`sigma/4`), `< 0` is the absolute step `|level|`. `null` selects the default
+    /// with one backward-compatibility exception: the pre-existing dithered-GZIP combination
+    /// keeps zigfitsio's legacy fixed `(max−min)/100000` per-tile scheme (bytes unchanged for
+    /// existing callers) — set `quantize_level` explicitly (e.g. `4.0`) for CFITSIO-parity
+    /// quantization there. Non-finite values, or setting this without a quantizing `quantize`
+    /// method, are `error.DataConstraintViolated` (never silently ignored).
+    quantize_level: ?f32 = null,
+    /// HCOMPRESS_1 lossy scale request (CFITSIO `fits_set_hcomp_scale` semantics): `0` (the
+    /// default) is lossless; `> 0` is noise-adaptive — each tile's integer scale becomes
+    /// `round(request × sigma)` where sigma is the tile's background noise
+    /// (`min(noise2, noise3, noise5)` MAD estimates, `imgstats.zig`); `< 0` uses `|request|`
+    /// directly as every tile's absolute scale (deterministic, data-independent). The request
+    /// is recorded as a float in `ZVAL1` (`ZNAME1 = 'SCALE'`), CFITSIO-identical. Non-finite
+    /// values — or setting this on a non-HCOMPRESS codec — are `error.DataConstraintViolated`
+    /// (never silently ignored).
+    hcomp_scale: f32 = 0,
+    /// HCOMPRESS_1 decode-side smoothing request, recorded as `ZNAME2 = 'SMOOTH'`/`ZVAL2`
+    /// (CFITSIO `fits_set_hcomp_smooth`): conforming readers (zigfitsio, CFITSIO/funpack,
+    /// Astropy) apply `hsmooth` when decompressing lossy tiles. It does not change the
+    /// compressed bytes themselves and is a no-op for lossless (`hcomp_scale = 0`) files.
+    /// Setting it on a non-HCOMPRESS codec is `error.DataConstraintViolated`.
+    hcomp_smooth: bool = false,
 };
 
 /// Errors from `writeCompressed`.
@@ -1010,20 +1089,46 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     if (pixels.len != npix) return error.BadDimensions;
 
     const w = bitpixWidth(spec.bitpix);
+    const do_quantize = spec.bitpix < 0 and spec.quantize.isQuantized();
     const do_dither = spec.bitpix < 0 and spec.quantize.isDithered();
+    // Quantizer selection: the CFITSIO fits_quantize port runs whenever the caller sets an
+    // explicit `quantize_level`, uses `NO_DITHER`, or pairs quantization with an integer codec
+    // (RICE/HCOMPRESS — new capability, CFITSIO-parity from day one). Only the pre-existing
+    // combination — dithered GZIP with no `quantize_level` — keeps the legacy fixed
+    // `(max−min)/100000` per-tile scheme, so existing callers' bytes are unchanged.
+    const legacy_quant = do_dither and spec.quantize_level == null and
+        (spec.codec == .gzip_1 or spec.codec == .gzip_2);
     // ZDITHER0 must be a positive integer 1..10000 (FITS 4.0 §10.2). An out-of-range seed writes a
     // non-conformant file and drives a CFITSIO reader's `fits_rand_value[]` index out of bounds.
     if (do_dither and (spec.zdither0 < 1 or spec.zdither0 > 10000)) return error.DataConstraintViolated;
+    // The quantization knobs must never be silently ignored (fail loud): a `quantize_level` is
+    // meaningful only when float pixels are being quantized, and must be finite.
+    if (spec.quantize_level) |q| {
+        if (!std.math.isFinite(q)) return error.DataConstraintViolated;
+        if (!do_quantize) return error.DataConstraintViolated;
+    }
 
     // Validate the codec/BITPIX pairing (CMP-8 write path). GZIP_1/GZIP_2 accept any BITPIX (they
     // store raw big-endian bytes). RICE_1/PLIO_1/HCOMPRESS_1 encode integer stored values, so they
-    // require an integer image of 8/16/32 bits (RICE bytepix ∈ {1,2,4}; PLIO/HCOMPRESS produce i32),
-    // are unavailable on the dithered-float path, and HCOMPRESS additionally requires a 2-D image.
+    // take an integer image of 8/16/32 bits or a QUANTIZED float image (RICE/HCOMPRESS only;
+    // 32-bit stored integers), and HCOMPRESS additionally requires a 2-D image.
     switch (spec.codec) {
         .gzip_1, .gzip_2 => {},
         .rice_1, .plio_1, .hcompress_1 => {
-            if (do_dither) return error.UnsupportedCodec;
-            switch (spec.bitpix) {
+            if (spec.bitpix < 0) {
+                // Float pixels reach an integer codec only through quantization. PLIO stays
+                // excluded: its 0..2²⁴ range cannot hold the quantizer's output (CFITSIO permits
+                // the attempt and errors per tile at runtime; zigfitsio rejects it up front).
+                // A float image with `quantize = .none` is rejected too — CFITSIO would silently
+                // TRUNCATE the floats to integers there (imcomp_nullfloats), a data-corrupting
+                // implicit conversion zigfitsio refuses to perform.
+                if (!do_quantize or spec.codec == .plio_1) return error.UnsupportedCodec;
+                // CFITSIO forbids SUBTRACTIVE_DITHER_2 with HCOMPRESS and silently coerces it to
+                // DITHER_1 (with an stderr warning); zigfitsio fails loud instead — never a
+                // silent rewrite of the caller's stated method.
+                if (spec.codec == .hcompress_1 and spec.quantize == .subtractive_dither_2)
+                    return error.DataConstraintViolated;
+            } else switch (spec.bitpix) {
                 8, 16, 32 => {},
                 else => return error.DataConstraintViolated,
             }
@@ -1031,6 +1136,12 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
         },
         .unknown => return error.UnsupportedCodec,
     }
+    // The HCOMPRESS lossy knobs must never be silently ignored: a non-finite scale request is
+    // meaningless, and setting either knob with a different codec would produce a file that does
+    // not honor the caller's stated intent (fail loud — never a silent mis-write).
+    if (!std.math.isFinite(spec.hcomp_scale)) return error.DataConstraintViolated;
+    if (spec.codec != .hcompress_1 and (spec.hcomp_scale != 0 or spec.hcomp_smooth))
+        return error.DataConstraintViolated;
 
     const tile = try alloc.alloc(u64, znaxis);
     defer alloc.free(tile);
@@ -1043,6 +1154,25 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     } else {
         tile[0] = spec.axes[0];
         for (1..znaxis) |i| tile[i] = 1;
+        if (spec.codec == .hcompress_1) {
+            // CFITSIO's HCOMPRESS default tiling (`imcomp_init_table`): the codec is inherently
+            // 2-D, so row-by-row strips (which Astropy even refuses to decode) are replaced by
+            // row *blocks* — the whole image when it has ≤ 30 rows, otherwise the first block
+            // height in CFITSIO's preference order whose last tile keeps at least 4 rows
+            // (divides evenly or leaves a remainder > 3), falling back to 17.
+            const nrows = spec.axes[1]; // znaxis ≥ 2 was validated above for HCOMPRESS
+            if (nrows <= 30) {
+                tile[1] = nrows;
+            } else {
+                tile[1] = 17;
+                for ([_]u64{ 16, 24, 20, 30, 28, 26, 22, 18, 14 }) |cand| {
+                    if (nrows % cand == 0 or nrows % cand > 3) {
+                        tile[1] = cand;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     const ntiles = try alloc.alloc(u64, znaxis);
@@ -1073,6 +1203,17 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     const table: ?[]f32 = if (do_dither) try dither.fitsRandom(alloc) else null;
     defer if (table) |t| alloc.free(t);
     const kind = spec.quantize.toDitherKind();
+
+    // Scratch for the CFITSIO-parity quantizer (allocated once, reused per tile): the tile's
+    // pixels at their native float width plus the quantized 32-bit stored values.
+    const use_cq = do_quantize and !legacy_quant;
+    const eff_qlevel: f32 = spec.quantize_level orelse 4.0; // fpack's float default (-q 4)
+    const fq32: ?[]f32 = if (use_cq and spec.bitpix == -32) try alloc.alloc(f32, @intCast(tile_prod)) else null;
+    defer if (fq32) |b| alloc.free(b);
+    const fq64: ?[]f64 = if (use_cq and spec.bitpix == -64) try alloc.alloc(f64, @intCast(tile_prod)) else null;
+    defer if (fq64) |b| alloc.free(b);
+    const iq: ?[]i32 = if (use_cq) try alloc.alloc(i32, @intCast(tile_prod)) else null;
+    defer if (iq) |b| alloc.free(b);
 
     var enc_list: std.ArrayList([]u8) = .empty;
     defer {
@@ -1118,7 +1259,56 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
         var this_lossless = false;
         const enc = blk: {
+            if (use_cq) {
+                // CFITSIO-parity quantization (compress/quantize.zig — the fits_quantize_float/
+                // _double port): per-tile noise-based or absolute step, iqfactor-fudged ZZERO,
+                // NINT rounding, §10.2 dither draws. The tile geometry is collapsed to
+                // (fastest-axis extent × everything else), CFITSIO's fits_calc_tile_rows.
+                const nxpix: usize = @intCast(tdim[0]);
+                const nypix: usize = @intCast(npix_tile / tdim[0]);
+                const ivals = iq.?[0..@intCast(npix_tile)];
+                const res = switch (spec.bitpix) {
+                    -32 => res32: {
+                        const fv = fq32.?[0..@intCast(npix_tile)];
+                        for (tile_idx, fv) |full, *v| v.* = anyToF32(T, pixels[@intCast(full)]);
+                        break :res32 try quant.quantizeTile(f32, alloc, fv, nxpix, nypix, eff_qlevel, kind, table, spec.zdither0, row, ivals);
+                    },
+                    -64 => res64: {
+                        const fv = fq64.?[0..@intCast(npix_tile)];
+                        for (tile_idx, fv) |full, *v| v.* = anyToF64(T, pixels[@intCast(full)]);
+                        break :res64 try quant.quantizeTile(f64, alloc, fv, nxpix, nypix, eff_qlevel, kind, table, spec.zdither0, row, ivals);
+                    },
+                    else => unreachable, // do_quantize requires a float bitpix
+                };
+                switch (res) {
+                    .not_quantized => {
+                        // CFITSIO's fallback for an unquantizable tile (0/1 pixels, zero noise,
+                        // range overflow, ±Inf): store the raw floats losslessly, gzipped, in
+                        // GZIP_COMPRESSED_DATA. Its ZSCALE/ZZERO are unused placeholders.
+                        this_lossless = true;
+                        try zscales.append(alloc, 1.0);
+                        try zzeros.append(alloc, 0.0);
+                        const raw_f = try buildRawBytes(T, alloc, spec.bitpix, pixels, tile_idx);
+                        defer alloc.free(raw_f);
+                        break :blk try gzip.gzipEncode(alloc, raw_f);
+                    },
+                    .quantized => |qp| {
+                        if (qp.has_null) any_null = true;
+                        try zscales.append(alloc, qp.bscale);
+                        try zzeros.append(alloc, qp.bzero);
+                        const raw = try alloc.alloc(u8, @intCast(npix_tile * 4));
+                        defer alloc.free(raw);
+                        for (ivals, 0..) |code, j| endian.write(i32, code, raw[j * 4 ..][0..4]);
+                        // The quantized integers feed the codec exactly as CFITSIO's
+                        // imcomp_compress_tile: RICE at bytepix 4, HCOMPRESS through the same
+                        // noise-adaptive/absolute scale mapping over the QUANTIZED values.
+                        break :blk try encodeRaw(alloc, spec.codec, raw, .{ .w = 4, .tdim = tdim, .znaxis = @intCast(znaxis), .hcomp_scale = spec.hcomp_scale });
+                    },
+                }
+            }
             if (do_dither) {
+                // Legacy zigfitsio scheme (pre-existing dithered-GZIP combination with no
+                // `quantize_level`; kept so existing callers' bytes are unchanged).
                 // Per-tile min/max over FINITE pixels only: NaN is excluded (it maps to the null
                 // sentinel), and ±Inf is excluded so one infinite pixel can't poison the scale.
                 var mn: f64 = 0;
@@ -1177,7 +1367,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
             } else {
                 const raw = try buildRawBytes(T, alloc, spec.bitpix, pixels, tile_idx);
                 defer alloc.free(raw);
-                break :blk try encodeRaw(alloc, spec.codec, raw, .{ .w = w, .tdim = tdim, .znaxis = @intCast(znaxis) });
+                break :blk try encodeRaw(alloc, spec.codec, raw, .{ .w = w, .tdim = tdim, .znaxis = @intCast(znaxis), .hcomp_scale = spec.hcomp_scale });
             }
         };
         {
@@ -1186,14 +1376,14 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
             // then hand `enc` to `enc_list` as the last fallible op: if either append OOMs, `enc` is
             // freed exactly once (by the errdefer, since it is not yet in `enc_list`). Doing the
             // `enc_list` append first would let a failing `enc_lossless` append double-free `enc`.
-            if (do_dither) try enc_lossless.append(alloc, this_lossless);
+            if (do_quantize) try enc_lossless.append(alloc, this_lossless);
             try enc_list.append(alloc, enc);
         }
         total_bytes = try limits.add(total_bytes, enc.len);
     }
 
-    const ncols: u64 = if (do_dither) 4 else 1;
-    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_dither, tile, w, any_null);
+    const ncols: u64 = if (do_quantize) 4 else 1;
+    const h = try buildCompressedHeader(alloc, spec, codec_name, ncols * 8, ntiles_total, total_bytes, do_quantize, tile, w, any_null);
     const hdu = try fits.appendHdu(h); // takes ownership of `h` (frees it on its own error)
 
     var bt = try BinTable.of(fits, hdu);
@@ -1201,7 +1391,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
     var mgr = try HeapManager.initForTable(&bt);
     defer mgr.deinit(alloc);
     for (enc_list.items, 0..) |enc, r| {
-        if (do_dither) {
+        if (do_quantize) {
             // Route each tile to its column: quantized tiles fill COMPRESSED_DATA (index 0),
             // lossless-fallback tiles fill GZIP_COMPRESSED_DATA (index 3). The unused column gets
             // an explicit empty cell so its descriptor is length-0 and the reader's precedence
@@ -1228,7 +1418,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
             try writeVlaCell(alloc, &bt, &mgr, .{ .index = 0 }, r, u8, enc);
         }
     }
-    if (do_dither) {
+    if (do_quantize) {
         try bt.writeColumn(f64, .{ .index = 1 }, 0, zscales.items, .{});
         try bt.writeColumn(f64, .{ .index = 2 }, 0, zzeros.items, .{});
     }
@@ -1237,7 +1427,7 @@ pub fn writeCompressed(comptime T: type, fits: *Fits, spec: CompressSpec, pixels
 
 // Build the compressed-image BINTABLE header. Has its own errdefer; on success the caller passes
 // the returned header to `appendHdu`, which then owns (and on its own error frees) it.
-fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_dither: bool, tile: []const u64, w: usize, any_null: bool) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
+fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []const u8, naxis1: u64, ntiles_total: u64, total_bytes: u64, do_quantize: bool, tile: []const u64, w: usize, any_null: bool) (errors.HeaderError || errors.ValueError || Allocator.Error)!Header {
     var h = Header.initEmpty();
     errdefer h.deinit(alloc);
     try h.appendValue(alloc, "XTENSION", .{ .string = "BINTABLE" }, null);
@@ -1247,7 +1437,7 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     try h.appendValue(alloc, "NAXIS2", .{ .int = @intCast(ntiles_total) }, null);
     try h.appendValue(alloc, "PCOUNT", .{ .int = @intCast(total_bytes) }, null);
     try h.appendValue(alloc, "GCOUNT", .{ .int = 1 }, null);
-    try h.appendValue(alloc, "TFIELDS", .{ .int = if (do_dither) 4 else 1 }, null);
+    try h.appendValue(alloc, "TFIELDS", .{ .int = if (do_quantize) 4 else 1 }, null);
     // PLIO_1's COMPRESSED_DATA is a list of 16-bit words: CFITSIO stores it as `1PI` (signed
     // 16-bit VLA) so the big-endian on-disk words are byte-swapped to native on read. The other
     // codecs (GZIP/RICE/HCOMPRESS) produce an opaque byte stream stored as `1PB`. Emitting `1PB`
@@ -1255,7 +1445,7 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
     // loop in `writeCompressed`, which stores the descriptor length in word units to match.
     try h.appendValue(alloc, "TFORM1", .{ .string = if (spec.codec == .plio_1) "1PI" else "1PB" }, null);
     try h.appendValue(alloc, "TTYPE1", .{ .string = "COMPRESSED_DATA" }, null);
-    if (do_dither) {
+    if (do_quantize) {
         try h.appendValue(alloc, "TFORM2", .{ .string = "1D" }, null);
         try h.appendValue(alloc, "TTYPE2", .{ .string = "ZSCALE" }, null);
         try h.appendValue(alloc, "TFORM3", .{ .string = "1D" }, null);
@@ -1288,14 +1478,22 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
             try h.appendValue(alloc, "ZVAL2", .{ .int = @intCast(w) }, null);
         },
         .hcompress_1 => {
+            // ZVAL1 records the float scale REQUEST (CFITSIO `request_hcomp_scale`, ffpkye) —
+            // the authoritative per-tile integer scale lives in each tile's embedded stream
+            // header. ZVAL2 records the SMOOTH decode request (ffpkyj), always present.
             try h.appendValue(alloc, "ZNAME1", .{ .string = "SCALE" }, null);
-            try h.appendValue(alloc, "ZVAL1", .{ .int = default_hcompress_scale }, null);
+            try h.appendValue(alloc, "ZVAL1", .{ .float = spec.hcomp_scale }, null);
+            try h.appendValue(alloc, "ZNAME2", .{ .string = "SMOOTH" }, null);
+            try h.appendValue(alloc, "ZVAL2", .{ .int = @intFromBool(spec.hcomp_smooth) }, null);
         },
         else => {},
     }
-    if (do_dither) {
+    if (do_quantize) {
         try h.appendValue(alloc, "ZQUANTIZ", .{ .string = spec.quantize.name().? }, null);
-        try h.appendValue(alloc, "ZDITHER0", .{ .int = spec.zdither0 }, null);
+        // ZDITHER0 accompanies only the dithered methods (CFITSIO writes no seed for
+        // NO_DITHER — there are no random draws to reproduce).
+        if (spec.quantize.isDithered())
+            try h.appendValue(alloc, "ZDITHER0", .{ .int = spec.zdither0 }, null);
         // Declare the null sentinel so third-party readers substitute NaN for null-coded pixels;
         // without ZBLANK a CFITSIO reader leaves them as the raw reserved value (§10.2 step 5).
         if (any_null) try h.appendValue(alloc, "ZBLANK", .{ .int = dither.null_value }, null);
@@ -1308,16 +1506,36 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
 /// fallback when no `BLOCKSIZE` parameter is present). Recorded as the `BLOCKSIZE` `ZVALn`.
 pub const default_rice_blocksize: u32 = 32;
 
-/// The HCOMPRESS_1 scale emitted on the write path. `0` selects lossless compression so the
-/// integer write→read round-trip is exact. Recorded as the `SCALE` `ZVALn`.
-pub const default_hcompress_scale: i32 = 0;
-
-// Per-tile encode context: the stored element width and the tile geometry HCOMPRESS needs.
+// Per-tile encode context: the stored element width, the tile geometry HCOMPRESS needs, and
+// the HCOMPRESS lossy scale request (`CompressSpec.hcomp_scale`; 0 = lossless).
 const EncodeCtx = struct {
     w: usize,
     tdim: []const u64,
     znaxis: u16,
+    hcomp_scale: f32 = 0,
 };
+
+// Map the float HCOMPRESS scale REQUEST to this tile's integer codec scale — the exact CFITSIO
+// `imcomp_compress_tile` logic: `request > 0` ⇒ `request × sigma` where sigma is the tile's
+// background noise (noise3, replaced by a smaller non-zero noise2/noise5); `request < 0` ⇒
+// `|request|` (absolute); then NINT via `(int)(x + 0.5)`. `row_len` is the tile's fastest-axis
+// extent (CFITSIO `tilenx`), `nrows` the rest. A result outside `0..maxInt(i32)` is a caller
+// error (`DataConstraintViolated`) — CFITSIO would silently wrap; zigfitsio fails loud.
+fn hcompressTileScale(alloc: Allocator, vals: []const i32, row_len: usize, nrows: usize, request: f32) (errors.CompressError || Allocator.Error)!i32 {
+    var hcompscale: f32 = request;
+    if (hcompscale > 0) {
+        const noise = try imgstats.noiseEstimates(alloc, vals, row_len, nrows);
+        var sigma = noise.noise3;
+        if (noise.noise2 != 0 and noise.noise2 < sigma) sigma = noise.noise2;
+        if (noise.noise5 != 0 and noise.noise5 < sigma) sigma = noise.noise5;
+        hcompscale = @floatCast(@as(f64, hcompscale) * sigma);
+    } else if (hcompscale < 0) {
+        hcompscale = -hcompscale;
+    }
+    const rounded = @trunc(@as(f64, hcompscale) + 0.5);
+    if (!(rounded >= 0 and rounded <= std.math.maxInt(i32))) return error.DataConstraintViolated;
+    return @intFromFloat(rounded);
+}
 
 // Encode one tile's big-endian stored values (`raw`, width `ctx.w`) with `codec`, returning the
 // compressed cell bytes the read path's `decodeCompressed` consumes. RICE_1 re-derives native-endian
@@ -1346,7 +1564,16 @@ fn encodeRaw(alloc: Allocator, codec: Codec, raw: []const u8, ctx: EncodeCtx) (e
             // tdim[0] is the fastest axis = columns = ny; tdim[1] = rows = nx (see `decodeCompressed`).
             const ny = std.math.cast(usize, ctx.tdim[0]) orelse return error.DataConstraintViolated;
             const nx = std.math.cast(usize, ctx.tdim[1]) orelse return error.DataConstraintViolated;
-            return hcompress.compress(alloc, vals, nx, ny, default_hcompress_scale);
+            // HCOMPRESS is strictly 2-D: a tile with a non-unit higher dimension has
+            // vals.len != nx*ny and must fail loud HERE — before `hcompressTileScale`, whose
+            // noise estimator asserts this exact geometry precondition — mirroring the check
+            // `hcompress.compress` itself applies on the lossless path.
+            const npix = std.math.mul(usize, nx, ny) catch return error.DataConstraintViolated;
+            if (vals.len != npix) return error.DataConstraintViolated;
+            // Per-tile integer scale from the float request (0 = lossless; CFITSIO-identical
+            // noise-adaptive/absolute mapping — the scale is embedded in the tile stream).
+            const scale = try hcompressTileScale(alloc, vals, ny, nx, ctx.hcomp_scale);
+            return hcompress.compress(alloc, vals, nx, ny, scale);
         },
         .unknown => return error.UnsupportedCodec,
     }
@@ -1623,6 +1850,10 @@ const ZSpec = struct {
     zscale: ?f64 = null,
     zzero: ?f64 = null,
     zblank: ?i64 = null,
+    /// Optional `ZNAMEn` codec-parameter names (paired with `zvals`, n = 1..).
+    znames: []const []const u8 = &.{},
+    /// Optional `ZVALn` integer values (paired with `znames`).
+    zvals: []const i64 = &.{},
 };
 
 fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
@@ -1660,6 +1891,10 @@ fn buildZHeader(alloc: Allocator, spec: ZSpec) !Header {
     if (spec.zscale) |s| try h.appendValue(alloc, "ZSCALE", .{ .float = s }, null);
     if (spec.zzero) |z| try h.appendValue(alloc, "ZZERO", .{ .float = z }, null);
     if (spec.zblank) |b| try h.appendValue(alloc, "ZBLANK", .{ .int = b }, null);
+    for (spec.znames, spec.zvals, 1..) |name, val, idx| {
+        try h.appendValue(alloc, std.fmt.bufPrint(&nb, "ZNAME{d}", .{idx}) catch unreachable, .{ .string = name }, null);
+        try h.appendValue(alloc, std.fmt.bufPrint(&nb, "ZVAL{d}", .{idx}) catch unreachable, .{ .int = val }, null);
+    }
     try h.ensureEnd(alloc);
     return h;
 }
@@ -1709,7 +1944,7 @@ test "of: structure parse + single-tile GZIP_1 round-trip (i16 stored → i32 ou
     try testing.expectEqualSlices(u64, &.{ 4, 3 }, ti.dims());
     try testing.expectEqual(@as(u64, 12), ti.elementCount());
     try testing.expectEqual(@as(u64, 1), ti.tileCount());
-    try testing.expectEqual(Quantize.none, ti.quantize);
+    try testing.expectEqual(Quantize.no_dither, ti.quantize); // ZQUANTIZ='NO_DITHER'
 
     var out: [12]i32 = undefined;
     try ti.readAll(i32, &out);
@@ -2240,6 +2475,91 @@ test "HCOMPRESS_1 tile produced by the codec decodes via TiledImage" {
     try testing.expectEqualSlices(i32, &vals, &out);
 }
 
+test "HCOMPRESS_1 lossy tile: ZNAME2='SMOOTH'/ZVAL2 drives decode-side hsmooth" {
+    const alloc = testing.allocator;
+
+    // A curved 16×16 surface, lossy scale 16 — a stream where smoothing visibly changes pixels.
+    const nx = 16; // rows
+    const ny = 16; // cols (fastest)
+    var vals: [nx * ny]i32 = undefined;
+    for (0..nx) |r| {
+        for (0..ny) |c| vals[r * ny + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const enc = try hcompress.compress(alloc, &vals, nx, ny, 16);
+    defer alloc.free(enc);
+
+    // Codec-level references for both decode modes.
+    const plain = try hcompress.decompress(alloc, enc, nx * ny, .{});
+    defer alloc.free(plain.data);
+    const smoothed = try hcompress.decompress(alloc, enc, nx * ny, .{ .smooth = true });
+    defer alloc.free(smoothed.data);
+    try testing.expect(!std.mem.eql(i32, plain.data, smoothed.data)); // non-vacuous fixture
+
+    // ZVAL2 = 1 → the container decode must produce the SMOOTHED pixels…
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+            .znames = &.{ "SCALE", "SMOOTH" },
+            .zvals = &.{ 16, 1 },
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, smoothed.data, &out);
+    }
+    // …ZVAL2 = 0 (and the absent-param default) must produce the PLAIN pixels.
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+            .znames = &.{ "SCALE", "SMOOTH" },
+            .zvals = &.{ 16, 0 },
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, plain.data, &out);
+    }
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeRawTileCell(alloc, &fx, .{
+            .ztype = "HCOMPRESS_1",
+            .zbitpix = 32,
+            .znaxisn = &.{ ny, nx },
+            .ztilen = &.{ ny, nx },
+            .nrows = 1,
+            .pcount = 4096,
+            .tforms = &.{"1PB"},
+            .ttypes = &.{"COMPRESSED_DATA"},
+        }, enc);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [nx * ny]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, plain.data, &out);
+    }
+}
+
 test "HCOMPRESS_1 tile with forged oversized nx/ny is CorruptTile, not an unbounded allocation" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
@@ -2456,7 +2776,10 @@ test "writeCompressed HCOMPRESS_1 round-trips a 2-D integer image (lossless)" {
     var ti = try TiledImage.of(&fx.f, hdu);
     defer ti.deinit(alloc);
     try testing.expectEqual(Codec.hcompress_1, ti.ztype);
-    try testing.expectEqual(@as(?i64, default_hcompress_scale), ti.paramInt("SCALE"));
+    // ZVAL1 records the float scale request (0.0 = lossless, CFITSIO card form); ZVAL2 the
+    // SMOOTH request. Both are coerced by paramNum.
+    try testing.expectEqual(@as(?i64, 0), ti.paramNum("SCALE"));
+    try testing.expectEqual(@as(?i64, 0), ti.paramNum("SMOOTH"));
 
     var out: [12]i32 = undefined;
     try ti.readAll(i32, &out);
@@ -2484,6 +2807,231 @@ test "writeCompressed HCOMPRESS_1 round-trips across multiple 2-D tiles" {
     var out: [20]i32 = undefined;
     try ti.readAll(i32, &out);
     try testing.expectEqualSlices(i32, &src, &out);
+}
+
+test "writeCompressed HCOMPRESS_1 lossy (absolute scale): bounded round-trip, ZVAL1/ZVAL2 recorded" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Curved 16×16 surface; hcomp_scale = -16 ⇒ every tile uses absolute scale 16.
+    var src: [256]i32 = undefined;
+    for (0..16) |r| {
+        for (0..16) |c| src[r * 16 + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 16, 16 },
+        .tile = &.{ 16, 16 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -16,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(?i64, -16), ti.paramNum("SCALE")); // the float REQUEST, as CFITSIO records it
+    try testing.expectEqual(@as(?i64, 0), ti.paramNum("SMOOTH"));
+
+    var out: [256]i32 = undefined;
+    try ti.readAll(i32, &out);
+    var maxerr: i64 = 0;
+    var ndiff: usize = 0;
+    for (src, out) |o, g| {
+        const e: i64 = @intCast(@abs(@as(i64, o) - @as(i64, g)));
+        if (e > maxerr) maxerr = e;
+        if (o != g) ndiff += 1;
+    }
+    try testing.expect(maxerr > 0 and maxerr <= 64 * 16); // genuinely lossy, but bounded
+    try testing.expect(ndiff > 0);
+}
+
+test "writeCompressed HCOMPRESS_1 hcomp_smooth: readers smooth, and it changes pixels" {
+    const alloc = testing.allocator;
+    var src: [256]i32 = undefined;
+    for (0..16) |r| {
+        for (0..16) |c| src[r * 16 + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const spec_base = CompressSpec{
+        .bitpix = 32,
+        .axes = &.{ 16, 16 },
+        .tile = &.{ 16, 16 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -16,
+    };
+
+    var plain: [256]i32 = undefined;
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        const hdu = try writeCompressed(i32, &fx.f, spec_base, &src);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        try ti.readAll(i32, &plain);
+    }
+    var smoothed: [256]i32 = undefined;
+    {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        var spec = spec_base;
+        spec.hcomp_smooth = true;
+        const hdu = try writeCompressed(i32, &fx.f, spec, &src);
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        try testing.expectEqual(@as(?i64, 1), ti.paramNum("SMOOTH"));
+        try ti.readAll(i32, &smoothed);
+    }
+    // Identical compressed pixels, differing only in the recorded SMOOTH request ⇒ the smoothed
+    // read must differ (hsmooth engaged) yet stay within the same quantization bound.
+    try testing.expect(!std.mem.eql(i32, &plain, &smoothed));
+    for (src, smoothed) |o, g| {
+        try testing.expect(@abs(@as(i64, o) - @as(i64, g)) <= 64 * 16);
+    }
+}
+
+test "writeCompressed HCOMPRESS_1 noise-adaptive scale (request > 0) matches the CFITSIO mapping" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Noisy 16×16 field (deterministic LCG) — background sigma is well above zero, so a
+    // request of 4.0 must select a per-tile integer scale of round(4 × min-noise) > 1.
+    var src: [256]i32 = undefined;
+    var seed: u64 = 0xFEEDFACE12345678;
+    for (&src) |*v| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @rem(@as(i32, @bitCast(@as(u32, @truncate(seed >> 32)))), 20000);
+    }
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 16, 16 },
+        .tile = &.{ 16, 16 }, // single tile ⇒ one noise estimate over the whole image
+        .codec = .hcompress_1,
+        .hcomp_scale = 4.0,
+    }, &src);
+
+    // The expected integer scale, computed independently via the same public estimators.
+    const noise = try imgstats.noiseEstimates(alloc, &src, 16, 16);
+    var sigma = noise.noise3;
+    if (noise.noise2 != 0 and noise.noise2 < sigma) sigma = noise.noise2;
+    if (noise.noise5 != 0 and noise.noise5 < sigma) sigma = noise.noise5;
+    const expect_scale: i64 = @intFromFloat(@trunc(@as(f64, @floatCast(@as(f32, @floatCast(4.0 * sigma)))) + 0.5));
+    try testing.expect(expect_scale > 1);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(?i64, 4), ti.paramNum("SCALE")); // request recorded, not the per-tile value
+
+    // The authoritative per-tile scale is embedded in the tile stream (bytes 10..14, big-endian).
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    const cell = try readVlaRawBytes(&t, alloc, 0, 0);
+    defer alloc.free(cell);
+    const stream_scale = std.mem.readInt(u32, cell[10..][0..4], .big);
+    try testing.expectEqual(@as(u32, @intCast(expect_scale)), stream_scale);
+
+    // And the decode stays within the derived bound.
+    var out: [256]i32 = undefined;
+    try ti.readAll(i32, &out);
+    for (src, out) |o, g| {
+        try testing.expect(@abs(@as(i64, o) - @as(i64, g)) <= 64 * expect_scale);
+    }
+
+    // Drift pin: the CFITSIO-dylib-derived literal for this exact field. The re-derivation
+    // above is self-consistent (it would move if the estimator chain drifted); this literal —
+    // authored by calling the real fits_img_stats_int over the same data and applying
+    // (int)(float(4 × sigma) + 0.5) — cannot. It pins the FULL noise → f32-cast → NINT chain,
+    // FP knife edges included, against any future regression.
+    try testing.expectEqual(@as(i64, 39478), expect_scale);
+}
+
+test "hcompressTileScale: absolute-mode rounding boundaries pin the (int)(x + 0.5) truncation" {
+    const alloc = testing.allocator;
+    const vals = [_]i32{ 0, 1, 2, 3 }; // noise path unused for request <= 0
+    // request < 0 ⇒ |request|, then trunc(x + 0.5): half-integers round AWAY from zero (2.5→3,
+    // 0.5→1 — a round-to-nearest-even port would give 2 and 0), and the largest f32 below 0.5
+    // (0x3EFFFFFF ≈ 0.49999997) truncates to 0 — the f64 sum 0.99999997… does NOT round up.
+    try testing.expectEqual(@as(i32, 3), try hcompressTileScale(alloc, &vals, 2, 2, -2.5));
+    try testing.expectEqual(@as(i32, 1), try hcompressTileScale(alloc, &vals, 2, 2, -0.5));
+    try testing.expectEqual(@as(i32, 0), try hcompressTileScale(alloc, &vals, 2, 2, -@as(f32, @bitCast(@as(u32, 0x3EFFFFFF)))));
+    try testing.expectEqual(@as(i32, 0), try hcompressTileScale(alloc, &vals, 2, 2, 0.0));
+}
+
+test "writeCompressed HCOMPRESS_1 default tiling follows CFITSIO's row-block rule" {
+    const alloc = testing.allocator;
+    // ≤ 30 rows ⇒ whole image (24 → 24); > 30 ⇒ CFITSIO's preference order: 64 % 16 == 0 ⇒ 16,
+    // 37 % 16 == 5 > 3 (last tile keeps ≥ 4 rows) ⇒ 16, and 51 rejects 16 (51 % 16 == 3) and
+    // 24 (51 % 24 == 3) before accepting 20 (51 % 20 == 11) — pinning the chain ORDER, not just
+    // the first candidate. Asserted through the written header (ZTILEn) — the authoritative
+    // record — plus an exact lossless round-trip.
+    inline for (.{ .{ 24, 24 }, .{ 64, 16 }, .{ 37, 16 }, .{ 51, 20 } }) |tc| {
+        const rows = tc[0];
+        const want: i64 = tc[1];
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        var src: [8 * rows]i32 = undefined;
+        for (&src, 0..) |*v, i| v.* = @intCast(i % 97);
+        const hdu = try writeCompressed(i32, &fx.f, .{
+            .bitpix = 32,
+            .axes = &.{ 8, rows },
+            .codec = .hcompress_1, // no .tile: the default rule applies
+        }, &src);
+        try testing.expectEqual(@as(i64, 8), try hdu.header.getValue(i64, "ZTILE1"));
+        try testing.expectEqual(want, try hdu.header.getValue(i64, "ZTILE2"));
+        var ti = try TiledImage.of(&fx.f, hdu);
+        defer ti.deinit(alloc);
+        var out: [8 * rows]i32 = undefined;
+        try ti.readAll(i32, &out);
+        try testing.expectEqualSlices(i32, &src, &out);
+    }
+}
+
+test "writeCompressed rejects misused/invalid HCOMPRESS lossy knobs (fail loud)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+    const src = [_]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+
+    // Knobs on a non-HCOMPRESS codec would be silently ignored — refuse instead.
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .codec = .gzip_1,
+        .hcomp_scale = -4,
+    }, &src));
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .codec = .rice_1,
+        .hcomp_smooth = true,
+    }, &src));
+    // A non-finite scale request is meaningless.
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .hcompress_1,
+        .hcomp_scale = std.math.nan(f32),
+    }, &src));
+}
+
+test "writeCompressed HCOMPRESS_1 with a 3-D tile fails loud, even on the lossy path" {
+    // Regression (review M1): a tile with a non-unit higher dimension used to reach the noise
+    // estimator's geometry assert when hcomp_scale > 0 (SIGABRT in Debug/ReleaseSafe) instead
+    // of erroring; the lossless path already returned DataConstraintViolated. Both must error.
+    const alloc = testing.allocator;
+    var src: [4 * 4 * 2]i32 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(i);
+    inline for (.{ 0.0, 4.0, -8.0 }) |scale| {
+        var fx = try Fixture.init(alloc);
+        defer fx.deinit(alloc);
+        try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+            .bitpix = 32,
+            .axes = &.{ 4, 4, 2 },
+            .tile = &.{ 4, 4, 2 },
+            .codec = .hcompress_1,
+            .hcomp_scale = scale,
+        }, &src));
+    }
 }
 
 // ── CMP-7 subtractive dithering on the write→read float path ──────────────────────────────────
@@ -2603,6 +3151,215 @@ test "writeCompressed float SUBTRACTIVE_DITHER_2 round-trips (exact zero preserv
         if (i == 7) continue;
         try testing.expect(@abs(o - s) <= 0.01);
     }
+}
+
+// ── CMP-8 quantized-float writes through the integer codecs (CFITSIO fits_quantize parity) ──
+
+// Deterministic noise+gradient field (the same LCG family as the golden generator).
+fn fillNoiseField(comptime FT: type, out: []FT, w: usize, base: f64) void {
+    var state: u32 = 12345;
+    for (out, 0..) |*v, i| {
+        state = state *% 1664525 +% 1013904223;
+        const u = @as(f64, @floatFromInt(state >> 8)) / 16777216.0;
+        const r: f64 = @floatFromInt(i / w);
+        const c: f64 = @floatFromInt(i % w);
+        const x = base + (r + c) * 0.5 + (u - 0.5) * 8.0;
+        v.* = if (FT == f32) @floatCast(x) else x;
+    }
+}
+
+test "writeCompressed quantized-float HCOMPRESS_1: dithered write round-trips within the absolute step" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [32 * 32]f32 = undefined;
+    fillNoiseField(f32, &src, 32, 10.0);
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 32, 32 }, // default HCOMPRESS tiling ⇒ 32×32 (≤ 30 rows rule ⇒ whole image? 32 > 30 ⇒ 16-row blocks)
+        .codec = .hcompress_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+        .quantize_level = -0.25, // absolute step ⇒ deterministic |err| ≤ 0.125 bound
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Codec.hcompress_1, ti.ztype);
+    try testing.expectEqual(Quantize.subtractive_dither_1, ti.quantize);
+    try testing.expectEqual(@as(?i64, 1), ti.zdither0);
+    var out: [32 * 32]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (src, out) |s, o| try testing.expect(@abs(o - s) <= 0.125 + 1e-5);
+}
+
+test "writeCompressed quantized-float RICE_1: NO_DITHER write emits no ZDITHER0 and round-trips" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [16 * 8]f32 = undefined;
+    fillNoiseField(f32, &src, 16, 50.0);
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 16, 8 },
+        .codec = .rice_1,
+        .quantize = .no_dither,
+        .quantize_level = -0.5,
+    }, &src);
+
+    // NO_DITHER: ZQUANTIZ present, ZDITHER0 absent (no draws to reproduce — CFITSIO writes none).
+    const zq = try hdu.header.getString(alloc, "ZQUANTIZ");
+    defer alloc.free(zq);
+    try testing.expectEqualStrings("NO_DITHER", std.mem.trim(u8, zq, " "));
+    try testing.expect(!hdu.header.has("ZDITHER0"));
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Quantize.no_dither, ti.quantize);
+    var out: [16 * 8]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (src, out) |s, o| try testing.expect(@abs(o - s) <= 0.25 + 1e-5);
+}
+
+test "writeCompressed quantized-float: noise-based default level, f64 pixels, lossy HCOMPRESS stage" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [32 * 32]f64 = undefined;
+    fillNoiseField(f64, &src, 32, 10.0);
+    // Default quantize_level (fpack -q 4) + an additional lossy HCOMPRESS stage over the
+    // quantized integers (hcomp_scale > 0, noise-adaptive) — both CFITSIO-parity paths.
+    const hdu = try writeCompressed(f64, &fx.f, .{
+        .bitpix = -64,
+        .axes = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 7,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [32 * 32]f64 = undefined;
+    try ti.readAll(f64, &out);
+    // Noise-based q=4 ⇒ step ≈ sigma/4 where sigma ≈ the (u−0.5)·8 noise MAD; generous sanity
+    // bound (the exact step is pinned separately by the quantizer's reference vectors).
+    for (src, out) |s, o| try testing.expect(@abs(o - s) <= 1.5);
+}
+
+test "writeCompressed quantized-float: NaN emits ZBLANK, ±Inf tile falls back lossless (HCOMPRESS)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [32 * 32]f32 = undefined;
+    fillNoiseField(f32, &src, 32, 10.0);
+    src[40] = std.math.nan(f32); // in the first 16-row tile block
+    src[32 * 20 + 3] = std.math.inf(f32); // second tile ⇒ whole tile stored losslessly
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 3,
+        .quantize_level = -0.25,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expect(ti.zblank_kw != null or ti.zblank_col != null);
+    var out: [32 * 32]f32 = undefined;
+    try ti.readAll(f32, &out);
+    try testing.expect(std.math.isNan(out[40]));
+    try testing.expect(std.math.isInf(out[32 * 20 + 3]));
+    for (src, out, 0..) |s, o, i| {
+        if (i == 40) continue;
+        if (i / (32 * 16) == 1) {
+            // The ±Inf tile is a lossless raw-float fallback: bit-exact, Inf included.
+            if (!std.math.isInf(s)) try testing.expectEqual(s, o);
+        } else {
+            try testing.expect(@abs(o - s) <= 0.125 + 1e-5);
+        }
+    }
+}
+
+test "writeCompressed quantized-float GZIP: explicit quantize_level engages the CFITSIO quantizer" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [16 * 16]f32 = undefined;
+    fillNoiseField(f32, &src, 16, 10.0);
+    const hdu = try writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 16, 16 }, // default GZIP tiling ⇒ 16 row strips
+        .codec = .gzip_2,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+        .quantize_level = -0.25,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    // The CFITSIO quantizer records the ABSOLUTE step as ZSCALE — the legacy scheme would have
+    // written (max−min)/100000 (a far smaller value); this distinguishes the two paths.
+    var bt = try BinTable.of(&fx.f, hdu);
+    defer bt.deinit(alloc);
+    var zs: [1]f64 = undefined;
+    try bt.readColumn(f64, .{ .name = "ZSCALE" }, 0, &zs, .{});
+    try testing.expectEqual(@as(f64, 0.25), zs[0]);
+    var out: [16 * 16]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (src, out) |s, o| try testing.expect(@abs(o - s) <= 0.125 + 1e-5);
+}
+
+test "writeCompressed quantized-float: fail-loud gates (PLIO, DITHER_2+HCOMPRESS, truncation, stray knobs)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [64]f32 = undefined;
+    fillNoiseField(f32, &src, 8, 10.0);
+    // PLIO cannot hold the quantizer's output range: rejected up front.
+    try testing.expectError(error.UnsupportedCodec, writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 8, 8 },
+        .codec = .plio_1,
+        .quantize = .subtractive_dither_1,
+    }, &src));
+    // CFITSIO silently coerces DITHER_2→DITHER_1 under HCOMPRESS; zigfitsio fails loud.
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 8, 8 },
+        .codec = .hcompress_1,
+        .quantize = .subtractive_dither_2,
+    }, &src));
+    // Float RICE/HCOMPRESS without quantization would be CFITSIO's silent float→int
+    // truncation; zigfitsio refuses.
+    try testing.expectError(error.UnsupportedCodec, writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 8, 8 },
+        .codec = .rice_1,
+    }, &src));
+    // quantize_level on a non-quantizing write is never silently ignored.
+    var ints: [64]i32 = undefined;
+    for (&ints, 0..) |*v, i| v.* = @intCast(i);
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 8, 8 },
+        .codec = .rice_1,
+        .quantize_level = 4.0,
+    }, &ints));
+    // Non-finite quantize_level is meaningless.
+    try testing.expectError(error.DataConstraintViolated, writeCompressed(f32, &fx.f, .{
+        .bitpix = -32,
+        .axes = &.{ 8, 8 },
+        .codec = .hcompress_1,
+        .quantize = .subtractive_dither_1,
+        .quantize_level = std.math.nan(f32),
+    }, &src));
 }
 
 // ── CMP-9 tile-compressed table read ─────────────────────────────────────────────────────────

@@ -19,6 +19,36 @@ def test_golden_tile_codecs_decode_to_ramp(golden_dir, codec):
         np.testing.assert_array_equal(data.astype(np.int64), ramp)
 
 
+@pytest.mark.parametrize("name", ["lossy16", "lossy32", "smooth"])
+def test_golden_lossy_hcompress_matches_funpack(golden_dir, name):
+    """Lossy HCOMPRESS tiles (incl. the ZVAL2=1 hsmooth request) decode exactly like funpack."""
+    fz = os.path.join(str(golden_dir), "compress", f"tile_hcompress_{name}.fits")
+    exp = os.path.join(str(golden_dir), "compress", f"tile_hcompress_{name}_expected.fits")
+    if not (os.path.exists(fz) and os.path.exists(exp)):
+        pytest.skip(f"missing tile_hcompress_{name}")
+    with zf.open(fz) as hdul:
+        data = hdul[1].data
+    with zf.open(exp) as hdul:
+        want = hdul[0].data
+    np.testing.assert_array_equal(data.astype(np.int64), want.astype(np.int64))
+
+
+@pytest.mark.parametrize("name", ["hcompress_fdith", "hcompress_fq0", "rice_fdith"])
+def test_golden_quantized_float_matches_funpack(golden_dir, name):
+    """Quantized-float tiles (SUBTRACTIVE_DITHER_1 / NO_DITHER, q=4) dequantize exactly like funpack."""
+    fz = os.path.join(str(golden_dir), "compress", f"tile_{name}.fits")
+    exp = os.path.join(str(golden_dir), "compress", f"tile_{name}_expected.fits")
+    if not (os.path.exists(fz) and os.path.exists(exp)):
+        pytest.skip(f"missing tile_{name}")
+    with zf.open(fz) as hdul:
+        data = hdul[1].data
+    with zf.open(exp) as hdul:
+        want = hdul[0].data
+    assert data.dtype == np.float32 and want.dtype == np.float32
+    # Bit-pattern equality: the dequantization must be funpack-identical, not merely close.
+    np.testing.assert_array_equal(data.view(np.uint32), want.view(np.uint32))
+
+
 def test_golden_image_i16(golden_dir):
     path = os.path.join(str(golden_dir), "images", "img_i16.fits")
     if not os.path.exists(path):

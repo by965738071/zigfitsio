@@ -220,6 +220,85 @@ def test_compimage_other_codecs_roundtrip(tmp_fits, codec):
         np.testing.assert_array_equal(hdul[1].data, ramp)
 
 
+def test_compimage_hcompress_lossy_kwargs(tmp_fits):
+    """hcomp_scale/hcomp_smooth (astropy-compatible kwargs) drive lossy HCOMPRESS."""
+    r, c = np.mgrid[0:32, 0:32].astype("i4")
+    curved = r * r + 2 * c * c + r * c
+    p_plain = tmp_fits("lossy.fits")
+    p_smooth = tmp_fits("smooth.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(curved, compression="HCOMPRESS_1", hcomp_scale=-16)]).writeto(p_plain, overwrite=True)
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(curved, compression="HCOMPRESS_1", hcomp_scale=-16, hcomp_smooth=True)]).writeto(p_smooth, overwrite=True)
+    with zf.open(p_plain) as hdul:
+        plain = hdul[1].data.astype("i8")
+        assert float(hdul[1].header["ZVAL1"]) == -16.0  # the recorded float request
+        assert int(hdul[1].header["ZVAL2"]) == 0
+    with zf.open(p_smooth) as hdul:
+        smooth = hdul[1].data.astype("i8")
+        assert int(hdul[1].header["ZVAL2"]) == 1
+    # Lossy but bounded; the smoothing request visibly changes the decode (non-vacuous).
+    assert 0 < np.abs(plain - curved).max() <= 64 * 16
+    assert np.abs(smooth - curved).max() <= 64 * 16
+    assert not np.array_equal(plain, smooth)
+
+
+@pytest.mark.parametrize("codec,quantize", [
+    ("HCOMPRESS_1", "SUBTRACTIVE_DITHER_1"),
+    ("HCOMPRESS_1", "NO_DITHER"),
+    ("RICE_1", "SUBTRACTIVE_DITHER_1"),
+])
+def test_compimage_quantized_float_roundtrip(tmp_fits, codec, quantize):
+    """Quantized-float writes through the integer codecs (CFITSIO fits_quantize parity)."""
+    rng = np.random.default_rng(42)
+    field = (10.0 + np.mgrid[0:32, 0:32].sum(axis=0) * 0.5 + rng.random((32, 32)) * 8.0).astype("f4")
+    p = tmp_fits()
+    zf.HDUList([
+        zf.PrimaryHDU(),
+        zf.CompImageHDU(field, compression=codec, quantize=quantize, quantize_level=-0.25),
+    ]).writeto(p, overwrite=True)
+    with zf.open(p) as hdul:
+        hdr = hdul[1].header
+        assert str(hdr["ZQUANTIZ"]).strip() == quantize
+        # ZDITHER0 accompanies only the dithered methods.
+        assert (hdr.get("ZDITHER0") is not None) == (quantize != "NO_DITHER")
+        out = hdul[1].data
+        assert out.dtype.kind == "f"
+        # Absolute step 0.25 ⇒ |err| ≤ 0.125 (+ f32 rounding slack).
+        assert np.abs(out.astype("f8") - field.astype("f8")).max() <= 0.125 + 1e-5
+
+
+def test_compimage_quantize_level_rejected_without_quantization(tmp_fits):
+    """quantize_level must never be silently ignored on a non-quantizing write."""
+    ramp = np.arange(256, dtype="i4").reshape(16, 16)
+    with pytest.raises(zf.FitsError):
+        zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(ramp, compression="RICE_1", quantize_level=4.0)]).writeto(
+            tmp_fits("bad_qlevel.fits"), overwrite=True
+        )
+
+
+def test_compimage_lossy_reemit_preserves_request(tmp_fits):
+    """writeto() of a scanned lossy HCOMPRESS image keeps its SCALE/SMOOTH request."""
+    r, c = np.mgrid[0:32, 0:32].astype("i4")
+    curved = r * r + 2 * c * c + r * c
+    p1 = tmp_fits("orig.fits")
+    p2 = tmp_fits("reemit.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(curved, compression="HCOMPRESS_1", hcomp_scale=-16, hcomp_smooth=True)]).writeto(p1, overwrite=True)
+    with zf.open(p1) as hdul:
+        hdul.writeto(p2, overwrite=True)
+    with zf.open(p2) as hdul:
+        assert str(hdul[1].header["ZCMPTYPE"]).strip() == "HCOMPRESS_1"
+        assert float(hdul[1].header["ZVAL1"]) == -16.0
+        assert int(hdul[1].header["ZVAL2"]) == 1
+
+
+def test_compimage_hcomp_kwargs_rejected_for_other_codecs(tmp_fits):
+    """The lossy knobs must never be silently ignored on a non-HCOMPRESS codec."""
+    ramp = np.arange(256, dtype="i4").reshape(16, 16)
+    with pytest.raises(zf.FitsError):
+        zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(ramp, compression="RICE_1", hcomp_scale=-4)]).writeto(
+            tmp_fits("bad.fits"), overwrite=True
+        )
+
+
 def test_compimage_explicit_tile_shape(tmp_fits):
     ramp = np.arange(256, dtype="i4").reshape(16, 16)
     p = tmp_fits()

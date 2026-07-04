@@ -195,5 +195,8 @@ jobs:
         run: |
           make -C interop golden
           git diff --stat -- test/golden
+          # Name the ambient toolchain in the warning so a skew is self-explaining from the log.
+          FPACK_V="$(fpack -V 2>&1 | head -1 || true)"
+          CFITSIO_V="$(pkg-config --modversion cfitsio 2>/dev/null || echo unknown)"
           git diff --exit-code -- test/golden \
-            || echo "::warning::regenerated goldens differ from committed bytes (likely a CFITSIO version skew vs 4.6.4); the semantic interop checks above are authoritative"
+            || echo "::warning::regenerated goldens differ from committed bytes (committed: CFITSIO 4.6.4; ambient: cfitsio ${CFITSIO_V}, fpack ${FPACK_V}); the semantic interop checks above are authoritative"

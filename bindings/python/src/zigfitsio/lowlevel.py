@@ -20,6 +20,7 @@ INT = _c.c_int
 LONG = _c.c_long
 LL = _c.c_longlong
 SZ = _c.c_size_t
+FLT = _c.c_float
 DBL = _c.c_double
 U32 = _c.c_uint32
 U64 = _c.c_uint64
@@ -310,6 +311,8 @@ _PROTOS = [
     ("zf_wcs_world2pix", INT, [VOID, INT, DBL, DBL, PDBL, PDBL]),
     # compression
     ("zf_write_compressed", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, VOID, LL]),
+    ("zf_write_compressed2", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, VOID, LL]),
+    ("zf_write_compressed3", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, FLT, INT, VOID, LL]),
 ]
 
 

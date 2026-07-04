@@ -95,7 +95,9 @@ full-feature round-trip (`test/e2e.zig`) mirrors CFITSIO's `testprog.c`, and a d
 CI job opens every zigfitsio-written file with CFITSIO `funpack`, Astropy, and `fitsverify`.
 Authoring this corpus closed two real interop bugs that self-round-trips could not catch (the PLIO
 line-list header + `COMPRESSED_DATA` `1PB`→`1PI`, and an unregistered `checksum_on_close` hook).
-The one remaining codec limit is `HCOMPRESS_1` lossy smoothing (`hsmooth`) — lossless only. See
+`HCOMPRESS_1` is complete including the lossy path: decode-side smoothing (`hsmooth`) reproduces
+`funpack` bit-for-bit on committed lossy/smoothed goldens, and the write path supports CFITSIO's
+absolute and noise-adaptive lossy scaling (`CompressSpec.hcomp_scale`/`.hcomp_smooth`). See
 `CAVEATS.md` and `tasks.md`.
 
 ## Examples

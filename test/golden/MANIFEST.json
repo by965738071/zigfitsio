@@ -29,6 +29,90 @@
       "expected": "HDU 2 ZIMAGE/HCOMPRESS_1; TiledImage.readAll(i32) yields pixel[i] == i for i in 0..255 (lossless)"
     },
     {
+      "path": "compress/tile_hcompress_lossy16.fits",
+      "sha256": "619ce8c1622671b9cfcd97287150d51585f8f7378b34b0f5446f1bcced07728c",
+      "generator": "fpack -C -h -s -16 (HCOMPRESS_1, ABSOLUTE lossy scale 16, SMOOTH=0) over a CFITSIO 32x32 BITPIX-16 curved surface (pixel[r*32+c] = r*r + 2*c*c + r*c), 32x16 tiles",
+      "consumer": "CMP-6 lossy / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1; TiledImage.readAll(i32) reproduces tile_hcompress_lossy16_expected.fits (funpack's decode) bit-exactly"
+    },
+    {
+      "path": "compress/tile_hcompress_lossy16_expected.fits",
+      "sha256": "cfca2123781b1346a6c96e0a4dea231c29db7ec6dc0f03838f805f4a0ebe2c65",
+      "generator": "funpack -C over tile_hcompress_lossy16.fits (the authoritative CFITSIO lossy decode)",
+      "consumer": "CMP-6 lossy (expected pixels)",
+      "expected": "HDU 1 BITPIX-16 32x32 image; the exact pixels zigfitsio must produce from the paired .fz"
+    },
+    {
+      "path": "compress/tile_hcompress_lossy32.fits",
+      "sha256": "a6a5d180a34f4badb9f3fffcc2ba237b0de74c720ba0af259e5a9448a5d47830",
+      "generator": "CFITSIO gen_sources.c fits_img_compress (HCOMPRESS_1, fits_set_hcomp_scale(-16) = ABSOLUTE 16, fits_set_hcomp_smooth(0)) over the 32x32 BITPIX-32 curved surface, 32x16 tiles",
+      "consumer": "CMP-6 lossy / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1 ZVAL2=0; TiledImage.readAll(i32) reproduces tile_hcompress_lossy32_expected.fits bit-exactly"
+    },
+    {
+      "path": "compress/tile_hcompress_lossy32_expected.fits",
+      "sha256": "eca0b6c5648c3605027d98c88bedaf3e44948cc4c97608c23b2051aacc7d5ac9",
+      "generator": "funpack -C over tile_hcompress_lossy32.fits",
+      "consumer": "CMP-6 lossy (expected pixels)",
+      "expected": "HDU 1 BITPIX-32 32x32 image; the exact pixels zigfitsio must produce from the paired .fz"
+    },
+    {
+      "path": "compress/tile_hcompress_smooth.fits",
+      "sha256": "a9c607efadb26769e2a768255c980b163012667d2e5de1f8a60529736572a6eb",
+      "generator": "CFITSIO gen_sources.c fits_img_compress (HCOMPRESS_1, ABSOLUTE scale 16, fits_set_hcomp_smooth(1)) — identical stream to tile_hcompress_lossy32.fits, differing ONLY in ZNAME2='SMOOTH'/ZVAL2=1 (fpack has no smooth flag, hence the API author)",
+      "consumer": "CMP-6 lossy hsmooth / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1 ZVAL2=1; TiledImage.readAll(i32) applies hsmooth and reproduces tile_hcompress_smooth_expected.fits bit-exactly; must DIFFER from the lossy32 expected pixels (non-vacuous)"
+    },
+    {
+      "path": "compress/tile_hcompress_smooth_expected.fits",
+      "sha256": "c2dbc69361f58c3a9b48549ff2cfda2d3c0f889161faccc6a4650f5131301a37",
+      "generator": "funpack -C over tile_hcompress_smooth.fits (funpack honors ZVAL2 and applies hsmooth)",
+      "consumer": "CMP-6 lossy hsmooth (expected pixels)",
+      "expected": "HDU 1 BITPIX-32 32x32 image; the exact smoothed pixels zigfitsio must produce from the paired .fz"
+    },
+    {
+      "path": "compress/tile_hcompress_fdith.fits",
+      "sha256": "463e171ab747db4ee44d49151abfd971bf19c08b959fa12b80eda676f7f63c98",
+      "generator": "CFITSIO gen_sources.c fits_img_compress (HCOMPRESS_1, SUBTRACTIVE_DITHER_1, quantize level 4, fits_set_dither_seed(1) — fpack's clock-derived ZDITHER0 is non-deterministic) over a 32x32 BITPIX--32 LCG noise+gradient field, default 32x16 tiles",
+      "consumer": "CMP-6 quantized-float / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1 ZQUANTIZ=SUBTRACTIVE_DITHER_1 ZDITHER0=1; TiledImage.readAll(f32) reproduces tile_hcompress_fdith_expected.fits (funpack's dequantized decode) bit-exactly"
+    },
+    {
+      "path": "compress/tile_hcompress_fdith_expected.fits",
+      "sha256": "17d184571d655b5c8a9dde9f942bb74712a8fb0656eb6b86c74862b4333e4f82",
+      "generator": "funpack -C over tile_hcompress_fdith.fits (the authoritative CFITSIO dequantized decode)",
+      "consumer": "CMP-6 quantized-float (expected pixels)",
+      "expected": "HDU 1 BITPIX--32 32x32 image; the exact f32 pixels zigfitsio must produce from the paired .fz"
+    },
+    {
+      "path": "compress/tile_hcompress_fq0.fits",
+      "sha256": "17728c1d7df97b32ce20b2225d5efe39384e601e5fed7864adea4babf8f90211",
+      "generator": "fpack -C -h -q0 4 (HCOMPRESS_1, NO_DITHER quantization, level 4 — seed-free, so fpack authors it deterministically) over the same 32x32 BITPIX--32 noise field",
+      "consumer": "CMP-6 quantized-float / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1 ZQUANTIZ=NO_DITHER; TiledImage.readAll(f32) reproduces tile_hcompress_fq0_expected.fits bit-exactly"
+    },
+    {
+      "path": "compress/tile_hcompress_fq0_expected.fits",
+      "sha256": "9bfdeea6462130c42b182a9680c7bbcbb8c48d3872c7932ff1dfe061a94e08e2",
+      "generator": "funpack -C over tile_hcompress_fq0.fits",
+      "consumer": "CMP-6 quantized-float (expected pixels)",
+      "expected": "HDU 1 BITPIX--32 32x32 image; the exact f32 pixels zigfitsio must produce from the paired .fz"
+    },
+    {
+      "path": "compress/tile_rice_fdith.fits",
+      "sha256": "78cc47a96042687a29d8215d50e64f5e68c25cd23750c0e132e4d3649fc06711",
+      "generator": "CFITSIO gen_sources.c fits_img_compress (RICE_1, SUBTRACTIVE_DITHER_1, quantize level 4, fits_set_dither_seed(1)) over the same 32x32 BITPIX--32 noise field, default 32x1 row-strip tiles",
+      "consumer": "CMP-4 quantized-float / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/RICE_1 ZQUANTIZ=SUBTRACTIVE_DITHER_1 ZDITHER0=1; TiledImage.readAll(f32) reproduces tile_rice_fdith_expected.fits bit-exactly"
+    },
+    {
+      "path": "compress/tile_rice_fdith_expected.fits",
+      "sha256": "9cd49b8987b231fbde78e8d2317d788943f09c1636ecd7466883240381e2dc51",
+      "generator": "funpack -C over tile_rice_fdith.fits",
+      "consumer": "CMP-4 quantized-float (expected pixels)",
+      "expected": "HDU 1 BITPIX--32 32x32 image; the exact f32 pixels zigfitsio must produce from the paired .fz"
+    },
+    {
       "path": "compress/tile_plio.fits",
       "sha256": "076c41db5eeb9448fe5dc42b179fc1057ca6b8476fabbd8f5e96fbae04fb4776",
       "generator": "fpack -C -p (PLIO_1) over a CFITSIO 16x16 BITPIX-16 positive identity ramp",
