@@ -39,7 +39,7 @@
     "koffi": "^3.1.0"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   },
