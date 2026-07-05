@@ -1,94 +1,63 @@
 /**
- * Locate the `zigfitsio_capi` shared library (mirror of the Python
- * `_loader.py`). Search order:
+ * Locate and load the bundled `zigfitsio.wasm` on Node and Bun, both
+ * synchronously (so the classic no-`await` API keeps working there) and
+ * asynchronously (parity with the browser loader).
  *
- *   1. `ZIGFITSIO_LIBRARY` env var (an explicit path to the shared library).
- *   2. The bundled `zigfitsio-<platform>` npm package.
- *   3. A development build under `<repo>/zig-out/{lib|bin}` discovered by
- *      walking parents of this file and of the working directory.
+ * Browsers use the `./loader.browser.js` variant instead — selected by the
+ * package's `browser` export condition — which `fetch`es the wasm rather than
+ * reading it off disk. Keep the two files' exported surface identical.
+ *
+ * Search order for the wasm bytes:
+ *   1. `ZIGFITSIO_WASM` env var (an explicit path to the module).
+ *   2. `zigfitsio.wasm` next to this file (the packaged `dist/`).
+ *   3. `<repo>/zig-out/bin/zigfitsio.wasm` — a dev build (`zig build wasm`)
+ *      discovered by walking parents of this file and of the working directory.
  */
-import { existsSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export function libFilename(): string {
-  if (process.platform === "darwin") return "libzigfitsio_capi.dylib";
-  if (process.platform === "win32") return "zigfitsio_capi.dll";
-  return "libzigfitsio_capi.so";
-}
+function candidatePaths(): string[] {
+  const out: string[] = [];
+  const env = process.env.ZIGFITSIO_WASM;
+  if (env) out.push(env);
 
-function isMusl(): boolean {
-  try {
-    // Node and Bun both implement process.report on linux.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const report: any = (process as any).report?.getReport?.();
-    if (report?.header) return !report.header.glibcVersionRuntime;
-  } catch {
-    /* fall through to the loader-file probe */
-  }
-  try {
-    return readdirSync("/lib").some((f) => f.startsWith("ld-musl-"));
-  } catch {
-    return false;
-  }
-}
+  const here = dirname(fileURLToPath(import.meta.url));
+  out.push(join(here, "zigfitsio.wasm")); // packaged: dist/zigfitsio.wasm
 
-/** `<platform>-<arch>[-musl]`, the suffix of the platform npm package name. */
-export function platformKey(): string {
-  const base = `${process.platform}-${process.arch}`;
-  return process.platform === "linux" && isMusl() ? `${base}-musl` : base;
-}
-
-export function candidatePaths(): string[] {
-  const name = libFilename();
-  const candidates: string[] = [];
-
-  const env = process.env.ZIGFITSIO_LIBRARY;
-  if (env) candidates.push(env);
-
-  // Bundled platform package. Resolved via its package.json so the package
-  // needs no exports map for the library file itself.
-  try {
-    const req = createRequire(import.meta.url);
-    const pkgJson = req.resolve(`zigfitsio-${platformKey()}/package.json`);
-    candidates.push(join(dirname(pkgJson), name));
-  } catch {
-    /* platform package not installed */
-  }
-
-  // Development fallback: zig-out/{bin|lib} somewhere above. Zig installs the
-  // Windows DLL under bin/ (only the import .lib lands in lib/); .so/.dylib
-  // live under lib/.
-  const subdir = process.platform === "win32" ? "bin" : "lib";
-  const roots = [dirname(fileURLToPath(import.meta.url)), process.cwd()];
-  outer: for (const root of roots) {
+  // Dev fallback: zig-out/bin/zigfitsio.wasm somewhere above this file or the cwd.
+  for (const root of [here, process.cwd()]) {
     let dir = resolve(root);
     for (;;) {
-      const cand = join(dir, "zig-out", subdir, name);
-      if (existsSync(cand)) {
-        candidates.push(cand);
-        break outer;
-      }
+      out.push(join(dir, "zig-out", "bin", "zigfitsio.wasm"));
       const parent = dirname(dir);
       if (parent === dir) break;
       dir = parent;
     }
   }
-
-  return candidates;
+  return out;
 }
 
-/** Return the first existing candidate path, or throw listing every path tried. */
-export function findLibrary(): string {
+/** Absolute path of the first `zigfitsio.wasm` found, or throw listing every path tried. */
+export function findWasm(): string {
   const tried: string[] = [];
-  for (const path of candidatePaths()) {
-    tried.push(path);
-    if (existsSync(path)) return path;
+  for (const p of candidatePaths()) {
+    tried.push(p);
+    if (existsSync(p)) return p;
   }
   throw new Error(
-    "could not locate the zigfitsio_capi shared library. Build it with " +
-      "`zig build capi` or set ZIGFITSIO_LIBRARY. Searched:\n  " +
+    "could not locate zigfitsio.wasm. Build it with `zig build wasm` or set ZIGFITSIO_WASM. Searched:\n  " +
       tried.join("\n  "),
   );
+}
+
+/** Read the wasm bytes synchronously (Node/Bun). Enables the no-`await` init path. */
+export function wasmBytesSync(): Uint8Array<ArrayBuffer> {
+  // Copy into a fresh (non-shared) ArrayBuffer so the result satisfies `BufferSource`.
+  return new Uint8Array(readFileSync(findWasm()));
+}
+
+/** Async wasm source, mirroring `loader.browser.ts` (here it is the same on-disk read). */
+export function wasmSourceAsync(): Promise<BufferSource> {
+  return Promise.resolve(wasmBytesSync());
 }

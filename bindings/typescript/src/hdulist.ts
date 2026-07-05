@@ -3,7 +3,7 @@
  * behind an open file, with the atomic `writeTo` (pristine byte-copy fast
  * path + reconstruction), `toBytes`, and the flush-on-close lifecycle.
  */
-import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, renameSync, rmSync, writeFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { BaseHDU, CompImageHDU, ImageHDU, PrimaryHDU } from "./hdu.js";
@@ -21,6 +21,13 @@ export class HDUList implements Iterable<AnyHDU> {
   /** @internal */ _handle: bigint | null = null;
   /** @internal */ _mode: number = ll.READONLY;
   /** @internal */ _owns = false;
+  /**
+   * @internal The on-disk path this list was opened from, or null when it was
+   * opened from bytes / built in memory. A writable open writes the updated
+   * in-memory bytes back here on `close()` (the wasm module has no filesystem,
+   * so update-on-close is a JS-side write-back rather than an in-place file edit).
+   */
+  _path: string | null = null;
   /** @internal HDUs scanned from the source (for the pristine-copy fast path). */
   _scannedCount = 0;
   /**
@@ -213,10 +220,15 @@ export class HDUList implements Iterable<AnyHDU> {
 
   close(): void {
     if (this._handle === null) return;
-    // Persist pending edits before closing (astropy flushes on close in
-    // update mode); always release the handle even if the flush fails.
+    // Persist pending edits before closing (astropy flushes on close in update
+    // mode). The wasm handle's device is in RAM, so a writable open opened from a
+    // path also writes the resulting bytes back to that file here. Always release
+    // the handle even if the flush/write-back fails.
     try {
-      if (this._mode !== ll.READONLY) this.flush();
+      if (this._mode !== ll.READONLY) {
+        this.flush();
+        if (this._path !== null) writeFile(this._path, this._sourceBytes());
+      }
     } finally {
       ll.lib.zf_close(this._handle);
       this._handle = null;
@@ -233,23 +245,14 @@ export class HDUList implements Iterable<AnyHDU> {
     // Write to a temp file in the same directory, then atomically rename into
     // place: a failure never leaves a partial/corrupt file at `path`, and
     // overwrite does not destroy the existing file until the new one is done.
+    // Build the bytes in memory (the wasm module has no filesystem), then write
+    // to a temp file and atomically rename into place: a failure never leaves a
+    // partial/corrupt file at `path`, and overwrite does not destroy the existing
+    // file until the new one is complete.
     const tmp = path + ".zigfitsio.tmp";
     try {
-      if (!checksum && this._isPristineAttached()) {
-        writeFileSync(tmp, this._sourceBytes());
-      } else {
-        const opts = checksum ? ll.encodeOpenOpts({ checksumOnClose: true }) : null;
-        const out = ll.outU64();
-        const pb = enc(tmp);
-        ll.check(ll.lib.zf_create_file(pb, pb.length, opts, out));
-        const handle = out[0];
-        try {
-          this._emit(handle, checksum);
-          ll.check(ll.lib.zf_flush(handle));
-        } finally {
-          ll.lib.zf_close(handle);
-        }
-      }
+      const bytes = !checksum && this._isPristineAttached() ? this._sourceBytes() : this._emitBytes(checksum);
+      writeFile(tmp, bytes);
       renameSync(tmp, path);
     } catch (e) {
       try {
@@ -264,11 +267,21 @@ export class HDUList implements Iterable<AnyHDU> {
   /** Serialize the HDU list to an in-memory FITS byte buffer. */
   toBytes(): Uint8Array {
     if (this._isPristineAttached()) return this._sourceBytes();
+    return this._emitBytes(false);
+  }
+
+  /**
+   * @internal Reconstruct the whole file into a fresh in-memory device and read
+   * back its bytes. Shared by `toBytes` and `writeTo` (replacing the old
+   * `zf_create_file` path, which the wasm build cannot use).
+   */
+  _emitBytes(checksum: boolean): Uint8Array {
+    const opts = checksum ? ll.encodeOpenOpts({ checksumOnClose: true }) : null;
     const out = ll.outU64();
-    ll.check(ll.lib.zf_create_memory(null, out));
+    ll.check(ll.lib.zf_create_memory(opts, out));
     const handle = out[0];
     try {
-      this._emit(handle, false);
+      this._emit(handle, checksum);
       ll.check(ll.lib.zf_flush(handle));
       const size = ll.outU64();
       ll.check(ll.lib.zf_data_size(handle, size));

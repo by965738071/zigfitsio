@@ -6,6 +6,8 @@
 import { describe, expect, test } from "./_harness/index.js";
 import { FitsError, FitsOverflowError, KeywordNotFound } from "../src/errors.js";
 import * as ll from "../src/lowlevel/index.js";
+import { BUF_DIRS } from "../src/ffi/wasm.js";
+import { PROTOS } from "../src/lowlevel/protos.js";
 import { enc } from "../src/util.js";
 
 function createMemory(optsBuf: Uint8Array | null = null): bigint {
@@ -285,4 +287,20 @@ describe("allocate-and-return", () => {
       ll.lib.zf_close(h);
     }
   });
+});
+
+// Tripwire for the WASM backend's copy-direction optimization: every index it annotates as a
+// one-way ("in"/"out") buffer must actually be a `buf` argument at that position in the proto,
+// so a future reordering of the C ABI can never silently skip a needed copy-in/copy-back.
+describe("wasm buf-direction map", () => {
+  const byName = new Map(PROTOS.map((p) => [p.name, p]));
+  for (const [name, dirs] of Object.entries(BUF_DIRS)) {
+    test(`${name}: annotated indices are buf args`, () => {
+      const proto = byName.get(name);
+      expect(proto, `unknown symbol ${name}`).toBeDefined();
+      for (const idx of Object.keys(dirs).map(Number)) {
+        expect(proto!.args[idx], `${name} arg[${idx}] must be "buf"`).toBe("buf");
+      }
+    });
+  }
 });

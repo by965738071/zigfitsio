@@ -62,6 +62,32 @@ pub export fn zf_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |p| gpa.free(p[0..len]);
 }
 
+// ── Foreign scratch allocator ────────────────────────────────────────────────────────────────
+// A caller that shares no address space with the shim — the WebAssembly binding, which must
+// stage every string/buffer/out-parameter *inside* the module's own linear memory — needs to
+// allocate through this allocator (picking arbitrary offsets would clobber the shim heap). Both
+// are no-ops for a native ctypes/koffi caller, which passes real pointers directly, but they are
+// exported unconditionally so the ABI surface is identical across targets.
+
+/// Allocate `len` bytes of 16-byte-aligned scratch (enough for every ABI struct and any
+/// `f64`/`i64` buffer). The block carries a length header so `zf_wfree` needs only the pointer.
+/// Returns null on out-of-memory (or `len == 0`).
+pub export fn zf_walloc(len: usize) ?[*]u8 {
+    const total = std.mem.alignForward(usize, len + 16, 16);
+    const slice = gpa.alignedAlloc(u8, .@"16", total) catch return null;
+    std.mem.writeInt(u64, slice.ptr[0..8], total, .little);
+    return slice.ptr + 16;
+}
+
+/// Free a block returned by `zf_walloc`. Safe to call with null.
+pub export fn zf_wfree(ptr: ?[*]u8) void {
+    const p = ptr orelse return;
+    const base = p - 16;
+    const total: usize = @intCast(std.mem.readInt(u64, base[0..8], .little));
+    const aligned: [*]align(16) u8 = @alignCast(base);
+    gpa.free(aligned[0..total]);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // Lifecycle
 // ════════════════════════════════════════════════════════════════════════════════════════════

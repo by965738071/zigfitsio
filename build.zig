@@ -205,4 +205,33 @@ pub fn build(b: *std.Build) void {
     });
     const wasm_step = b.step("wasm-check", "Compile the core for wasm32-freestanding");
     wasm_step.dependOn(&wasm_lib.step);
+
+    // `zig build wasm` — the shippable single-package artifact: the C-ABI shim compiled to a
+    // wasm32-freestanding *reactor* module (no `_start`; `zf_*` + `memory` exported). This is
+    // the one binary the npm `zigfitsio` package loads on every platform (Bun/Node/browser)
+    // through the WebAssembly FFI backend, replacing the seven native `zigfitsio-*` packages.
+    // `openFile`/`createFile`/`saveGzipFile` degrade to `error.NotWritable` here (fits.zig
+    // gates the OS leaves out under freestanding); the JS layer routes file I/O through the
+    // in-memory open/create + read-bytes APIs instead.
+    const wasm_capi_libmod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_capi_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/capi/capi.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_capi_mod.addImport("zigfitsio", wasm_capi_libmod);
+    const wasm_reactor = b.addExecutable(.{
+        .name = "zigfitsio",
+        .root_module = wasm_capi_mod,
+    });
+    wasm_reactor.entry = .disabled; // reactor: no entry point
+    wasm_reactor.rdynamic = true; // export the `export fn zf_*` symbols
+    wasm_reactor.export_memory = true; // export linear `memory` for the JS backend
+    const wasm_install = b.addInstallArtifact(wasm_reactor, .{});
+    const wasm_build_step = b.step("wasm", "Build the wasm32-freestanding C-ABI reactor (zigfitsio.wasm)");
+    wasm_build_step.dependOn(&wasm_install.step);
 }

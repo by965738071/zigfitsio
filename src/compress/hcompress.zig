@@ -411,7 +411,8 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize, smooth: bool, scale: i
     var nytop: usize = 1;
     var nxf: usize = nx;
     var nyf: usize = ny;
-    var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+    // Shift amount must be `Log2Int(usize)` (u5 on wasm32, u6 on 64-bit); let `@intCast` infer it.
+    var c: usize = @as(usize, 1) << @intCast(log2n);
 
     var k: usize = log2n;
     while (k > 0) {
@@ -1115,7 +1116,7 @@ const Decoder = struct {
             var ny: usize = 1;
             var nfx = nqx;
             var nfy = nqy;
-            var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+            var c: usize = @as(usize, 1) << @intCast(log2n);
             var k: usize = 1;
             while (k < log2n) : (k += 1) {
                 c >>= 1;
@@ -1143,7 +1144,7 @@ const Decoder = struct {
                 var ny: usize = 1;
                 var nfx = nqx;
                 var nfy = nqy;
-                var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+                var c: usize = @as(usize, 1) << @intCast(log2n);
                 var k: usize = 1;
                 while (k < log2n) : (k += 1) {
                     c >>= 1;

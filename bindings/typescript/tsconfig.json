@@ -3,7 +3,7 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023", "ESNext.Disposable"],
+    "lib": ["ES2023", "ESNext.Disposable", "WebWorker"],
     "types": ["node"],
     "strict": true,
     "declaration": true,

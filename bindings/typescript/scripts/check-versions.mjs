@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * Assert the TS package version matches the canonical Zig version
- * (build.zig.zon / src/version.zig), plus any generated npm/<key> packages.
- * Run by CI (typescript.yml version-check) and by prepack.
+ * (build.zig.zon / src/version.zig). Run by CI (typescript.yml version-check)
+ * and by prepack.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,16 +22,6 @@ const failures = [];
 if (!zonVersion) failures.push("could not parse .version from build.zig.zon");
 if (zonVersion !== zigVersion) failures.push(`src/version.zig version_string ${zigVersion} != build.zig.zon ${zonVersion}`);
 if (pkgVersion !== zonVersion) failures.push(`bindings/typescript/package.json ${pkgVersion} != build.zig.zon ${zonVersion}`);
-
-const npmDir = join(PKG_ROOT, "npm");
-if (existsSync(npmDir)) {
-  for (const entry of readdirSync(npmDir)) {
-    const pj = join(npmDir, entry, "package.json");
-    if (!existsSync(pj)) continue;
-    const v = JSON.parse(readFileSync(pj, "utf8")).version;
-    if (v !== zonVersion) failures.push(`npm/${entry}/package.json ${v} != build.zig.zon ${zonVersion} (regenerate: npm run build:native)`);
-  }
-}
 
 if (failures.length > 0) {
   console.error("version check FAILED:");

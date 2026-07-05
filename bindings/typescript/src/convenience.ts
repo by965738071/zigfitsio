@@ -1,5 +1,5 @@
 /** Module-level conveniences (port of the Python `core.py` module functions). */
-import { readFileSync } from "node:fs";
+import { gunzip, readFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { FitsArray } from "./fitsarray.js";
@@ -8,7 +8,7 @@ import { Header } from "./header.js";
 import { PrimaryHDU } from "./hdu.js";
 import { HDUList } from "./hdulist.js";
 import { TableData } from "./table.js";
-import { decOut, enc } from "./util.js";
+import { decOut } from "./util.js";
 
 export type OpenMode = "readonly" | "update" | "append";
 
@@ -21,6 +21,10 @@ const MODE_CODES: Record<OpenMode, number> = {
 /**
  * Open a FITS file. `mode`: "readonly", "update" (read-write), or "append".
  * A `.fits.gz` path opens read-only through an in-memory inflate.
+ *
+ * The bytes are read on the JS side and handed to the in-memory ABI (the wasm
+ * module has no filesystem); a writable open remembers the path and writes the
+ * updated bytes back to it on `close()` (astropy update-on-close semantics).
  */
 export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOptions): HDUList {
   const modeCode = MODE_CODES[mode];
@@ -29,6 +33,14 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
   }
   const optBuf = opts === undefined ? null : ll.encodeOpenOpts(opts);
   const out = ll.outU64();
+  let bytes: Uint8Array;
+  try {
+    bytes = readFile(path);
+  } catch (e) {
+    // Surface a missing/unreadable file as a typed FITS error (parity with the old
+    // path-based zf_open_file, which returned a FITS status rather than a raw fs error).
+    throw new FitsIOError(104, `could not open file ${JSON.stringify(path)}: ${(e as Error).message}`);
+  }
   if (path.endsWith(".gz")) {
     // A .gz opens into an in-memory handle that cannot write back to the
     // compressed file; reject a writable mode up front rather than failing
@@ -36,14 +48,14 @@ export function open(path: string, mode: OpenMode = "readonly", opts?: ll.OpenOp
     if (modeCode !== ll.READONLY) {
       throw new FitsIOError(112, "a .gz file can only be opened in 'readonly' mode");
     }
-    const raw = readFileSync(path);
-    const bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-    ll.check(ll.lib.zf_open_gzip(bytes, bytes.length, optBuf, out));
-  } else {
-    const pb = enc(path);
-    ll.check(ll.lib.zf_open_file(pb, pb.length, modeCode, optBuf, out));
+    const plain = gunzip(bytes);
+    ll.check(ll.lib.zf_open_memory(plain, plain.length, ll.READONLY, optBuf, out));
+    return HDUList._fromHandle(out[0], modeCode);
   }
-  return HDUList._fromHandle(out[0], modeCode);
+  ll.check(ll.lib.zf_open_memory(bytes, bytes.length, modeCode, optBuf, out));
+  const hdul = HDUList._fromHandle(out[0], modeCode);
+  hdul._path = path; // origin for update/append write-back on close()
+  return hdul;
 }
 
 /** Open a FITS file held in a byte buffer. */

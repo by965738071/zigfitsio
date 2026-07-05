@@ -1,5 +1,7 @@
 /** Mirror of `bindings/python/tests/test_api_surface.py` (JS-adapted). */
 import { afterAll, describe, expect, test } from "./_harness/index.js";
+import { readFileSync, writeFileSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import * as zf from "../src/index.js";
 import * as ll from "../src/lowlevel/index.js";
 import { enc } from "../src/util.js";
@@ -449,13 +451,10 @@ describe("open modes and gzip", () => {
     const data = new zf.FitsArray(fill(new Int16Array(6), (i) => i), [2, 3]);
     zf.writeTo(p, data);
 
+    // Whole-file gzip the FITS bytes on the JS side (the wasm build has no on-disk
+    // gzip export); zf.open then inflates them JS-side (node:zlib) into zf_open_memory.
     const gzPath = p + ".out.fits.gz";
-    const out = ll.outU64();
-    const pb = enc(p);
-    ll.check(ll.lib.zf_open_file(pb, pb.length, ll.READONLY, null, out));
-    const gb = enc(gzPath);
-    ll.check(ll.lib.zf_save_gzip(out[0], gb, gb.length));
-    ll.lib.zf_close(out[0]);
+    writeFileSync(gzPath, gzipSync(readFileSync(p)));
 
     const hdul = zf.open(gzPath);
     try {

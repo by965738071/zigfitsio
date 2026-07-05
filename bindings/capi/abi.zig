@@ -10,13 +10,20 @@
 //! into private state beyond the documented handle fields (`Fits` exposes no field visibility
 //! modifiers, so the lazily-scanned HDU list is reachable for the current-HDU guard).
 const std = @import("std");
+const builtin = @import("builtin");
 const fits = @import("zigfitsio");
+
+/// True for the `wasm32-freestanding` build (the single-package WebAssembly binding). There is
+/// no OS there, so the thread-backed `smp_allocator` is unavailable; `wasm_allocator`
+/// (`@wasmMemoryGrow`-backed) is the freestanding heap.
+const freestanding_wasm = builtin.target.cpu.arch.isWasm() and builtin.target.os.tag == .freestanding;
 
 /// Process-global, thread-safe allocator for everything the shim allocates (handles, decode
 /// scratch, returned strings). `smp_allocator` needs no libc, so the shared library stays
 /// self-contained. Each `Fits` handle is single-threaded by contract, but distinct handles on
-/// distinct threads share only this allocator, which is itself thread-safe.
-pub const gpa: std.mem.Allocator = std.heap.smp_allocator;
+/// distinct threads share only this allocator, which is itself thread-safe. On
+/// wasm32-freestanding (single-threaded, no OS) the WebAssembly heap allocator is used instead.
+pub const gpa: std.mem.Allocator = if (freestanding_wasm) std.heap.wasm_allocator else std.heap.smp_allocator;
 
 // ── Opaque handles ─────────────────────────────────────────────────────────────────────────
 

@@ -1,17 +1,28 @@
 # zigfitsio (TypeScript/JavaScript bindings)
 
 TypeScript bindings for [zigfitsio](https://github.com/anhydrous99/zigfitsio), a pure-Zig
-FITS 4.0 I/O library. Same two-layer design as the Python bindings: a low-level 1:1 FFI
-mapping of the `zf_*` C ABI (`zigfitsio/lowlevel`), and a high-level astropy-style API on
-top (`open`, `HDUList`, HDU classes, `Header`, `Column`, `verify`).
+FITS 4.0 I/O library. Same two-layer design as the Python bindings: a low-level 1:1 mapping
+of the `zf_*` C ABI (`zigfitsio/lowlevel`), and a high-level astropy-style API on top
+(`open`, `HDUList`, HDU classes, `Header`, `Column`, `verify`).
 
-**Runtimes:** Bun ≥1.1 (via `bun:ffi`) and Node ≥18 (via [koffi](https://koffi.dev/)).
-The right backend is picked automatically; Bun never loads koffi. The prebuilt shared
-library ships in `zigfitsio-<platform>` packages installed automatically as
-optionalDependencies (linux x64/arm64 glibc+musl, macOS x64/arm64, Windows x64).
+**One package, everywhere.** The whole library ships as a single, platform-independent
+WebAssembly module (`zigfitsio.wasm`) bundled inside the package — no native addons, no
+per-platform packages, and no runtime dependencies. It runs on Bun, Node ≥18, and modern
+browsers.
 
 ```sh
 npm install zigfitsio     # or: bun add zigfitsio
+```
+
+On **Node and Bun** the module loads synchronously at import, so the API is fully synchronous
+and you can use it immediately. In the **browser**, WebAssembly must be fetched and compiled
+asynchronously, so call `await zf.ready()` once before anything else:
+
+```ts
+import * as zf from "zigfitsio";
+
+await zf.ready();                 // browser: fetches + compiles zigfitsio.wasm (no-op on Node/Bun)
+// ...then every call below is synchronous.
 ```
 
 ## Quickstart
@@ -163,31 +174,50 @@ ll.check(ll.lib.zf_create_memory(null, out));
 ll.lib.zf_close(out[0]);
 ```
 
+## Browsers
+
+There is no filesystem in the browser, so the path-based `open()` / `writeTo()` are not
+available there — use the in-memory primitives instead (`fromBytes` / `toBytes`) with your
+own `fetch` / `File` I/O:
+
+```ts
+import * as zf from "zigfitsio";
+
+await zf.ready(); // or await zf.ready({ wasm: myBytesOrModule }) to host the .wasm yourself
+
+const bytes = new Uint8Array(await (await fetch("/data/image.fits")).arrayBuffer());
+const hdul = zf.fromBytes(bytes);
+const img = hdul.image(0).data;
+hdul.close();
+```
+
+Bundlers (Vite, webpack 5, esbuild, Rollup) resolve `zigfitsio.wasm` from the
+`new URL("./zigfitsio.wasm", import.meta.url)` asset reference and honor the package's
+`browser` export condition (which swaps the Node filesystem/loader modules for
+browser-safe ones) — so `node:fs`/`node:zlib` never enter the browser bundle. Gzip
+(`.fits.gz`) inflation is a Node/Bun-only convenience; in the browser inflate with
+`DecompressionStream("gzip")` and pass the result to `fromBytes`.
+
 ## Bundlers / Electron
 
-Mark `zigfitsio`, `koffi`, and `zigfitsio-*` as external — the platform packages and
-koffi's addon must stay on disk, and `bun:ffi` is required lazily (never bundle it into
-a Node build).
+Nothing needs to be marked external — the package is pure JS plus one `.wasm` asset with no
+native addons or runtime dependencies. For a **browser/renderer** build, let the bundler apply
+the `browser` export condition (the default for web targets). For a **Node/main-process**
+build, the default condition reads the wasm off disk synchronously.
 
 ## Development
 
 ```sh
-zig build capi          # build the shared library into zig-out/ (Debug)
+zig build wasm          # build zigfitsio.wasm into zig-out/bin/ (ReleaseSmall)
 cd bindings/typescript
 npm ci
-bun test tests          # Bun lane (bun:ffi)
-npx vitest run          # Node lane (koffi)
-npm run build           # tsc -> dist/
-node scripts/build-native.mjs --target=darwin-arm64   # generate a platform package
+bun test tests          # Bun lane
+npx vitest run          # Node lane
+npm run build           # clean + tsc -> dist/ + build & copy zigfitsio.wasm
 ```
 
-The loader searches `ZIGFITSIO_LIBRARY` → the installed `zigfitsio-<platform>` package
-→ a `zig-out/{lib,bin}` dev build found by walking parent directories.
-
-Note: bun:ffi ≤1.3.14 mislays stack-passed arguments on macOS arm64 (Apple's ABI packs
-them naturally; bun uses 8-byte slots). The bun backend transparently works around this
-(`src/ffi/bun.ts`); do not remove the fix when bun updates — it is layout-identical
-either way.
+The loader searches `ZIGFITSIO_WASM` → `zigfitsio.wasm` next to the package's `dist/` →
+a `zig-out/bin/zigfitsio.wasm` dev build found by walking parent directories.
 
 ## Known gaps (mirrors the Python bindings; see CAVEATS.md §3)
 
@@ -200,9 +230,14 @@ either way.
 - `writeTo()` of a *scanned* quantized-float compressed image re-quantizes at the
   default level (the FITS header does not record the level).
 - Signed-byte (`i1`) images are not mapped to the BZERO=-128 convention yet (typed error).
-- On **Alpine/musl**, prefer Bun: the `zigfitsio-*-musl` library packages are published,
-  but koffi ships no musl prebuilds, so the Node path falls back to a source build that
-  needs a C++ toolchain.
+- **WebAssembly execution**: the compute-heavy codecs (RICE/HCOMPRESS/quantize) run in wasm,
+  ~1.5–3× slower than a native build, and large image/table transfers copy through linear
+  memory. The wasm module is single-threaded and its heap only grows (never returns pages to
+  the OS) for the life of the instance.
+- **No filesystem inside the module**: path-based file I/O is a JS-side convenience
+  (`node:fs`) available on Node/Bun only; browsers use `fromBytes`/`toBytes`. Writing a
+  `.fits.gz` via the C ABI (`zf_save_gzip`) and the raw `zf_open_file`/`zf_create_file`
+  return `NotWritable` in the wasm build — the high-level `open`/`writeTo` route around them.
 
 ### TS-native surface (see CAVEATS.md §3 for the full list)
 

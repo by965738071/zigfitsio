@@ -1,10 +1,10 @@
 /**
  * zigfitsio — TypeScript/JavaScript bindings for the pure-Zig FITS 4.0 I/O
- * library (Bun via bun:ffi, Node ≥18 via koffi).
+ * library, shipped as a single WebAssembly module (Bun, Node ≥18, and browsers).
  *
- * Layering mirrors the Python bindings: `loader` finds the shared library,
- * `lowlevel` is a 1:1 typed mapping of `bindings/c/zigfitsio.h`, and this
- * module re-exports the high-level astropy-style API.
+ * Layering mirrors the Python bindings: `loader` locates/instantiates the wasm,
+ * `lowlevel` is a 1:1 typed mapping of `bindings/c/zigfitsio.h`, and this module
+ * re-exports the high-level astropy-style API.
  */
 export { open, fromBytes, getData, getHeader, getVal, writeTo, verify, Finding, type HDUData, type OpenMode } from "./convenience.js";
 export { HDUList, type AnyHDU } from "./hdulist.js";
@@ -68,7 +68,30 @@ export * as lowlevel from "./lowlevel/index.js";
 export * as dtypes from "./dtypes.js";
 export * as loader from "./loader.js";
 
-import { version } from "./lowlevel/index.js";
+import { ready as readyLowlevel, isReady, type ReadyOptions } from "./lowlevel/index.js";
 
-/** The native library's version string (matches the npm package version). */
-export const VERSION: string = version();
+export { isReady, type ReadyOptions };
+
+/**
+ * The native library's version string (matches the npm package version). Populated
+ * synchronously on Node/Bun; empty in the browser until {@link ready} resolves. This is a
+ * live binding cached when the wasm module is adopted on any init path.
+ */
+export { VERSION } from "./lowlevel/index.js";
+
+/**
+ * Ensure the WebAssembly module is loaded, then resolve. **Required once in the
+ * browser** before any other API call; a no-op on Node and Bun, which load the
+ * module synchronously at import. After it resolves, every call is synchronous.
+ *
+ * ```ts
+ * await zf.ready();               // browser: fetches zigfitsio.wasm
+ * await zf.ready({ wasm: bytes }); // or supply the bytes / a compiled module yourself
+ * ```
+ *
+ * The `wasm` option only takes effect when the module has not already been loaded
+ * (browser, or Node/Bun when the on-disk wasm was not found at import).
+ */
+export async function ready(options?: ReadyOptions): Promise<void> {
+  await readyLowlevel(options);
+}

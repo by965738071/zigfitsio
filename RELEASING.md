@@ -5,8 +5,8 @@ which gates on version consistency and the core Zig suite, builds wheels + sdist
 them to PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no
 API tokens anywhere), and then creates a GitHub Release with the tag's CHANGELOG section as
 notes and all artifacts attached. The same tag also runs
-`.github/workflows/typescript.yml`, which cross-compiles the 7 `zigfitsio-*` platform
-packages and publishes them + the main `zigfitsio` npm package via npm trusted publishing.
+`.github/workflows/typescript.yml`, which builds the single `zigfitsio.wasm` module and
+publishes the one `zigfitsio` npm package via npm trusted publishing.
 
 ```
 version-check ──┐
@@ -16,9 +16,8 @@ sdist ──────────┤ └─► publish-testpypi              
 smoke ──────────┘
 
 version-check ──┐
-test (×8) ──────┼──► publish-npm                            [tag pushes]
-interop ────────┤ └─► publish-rehearsal (--dry-run)         [manual dispatch]
-build-natives ──┘
+test (×6) ──────┼──► publish-npm                            [tag pushes]
+interop ────────┘ └─► publish-rehearsal (--dry-run)         [manual dispatch]
 ```
 
 `version-check` fails within seconds of a bad tag (version mismatch or missing CHANGELOG
@@ -52,23 +51,20 @@ Done once per index/repo; nothing here stores a secret.
      uses it).
 
 4. **npm** — trusted publishing is configured **per existing package** (npm has no
-   PyPI-style pending publishers), so the first release of all 8 packages must be
-   bootstrapped by hand. All 8 are unscoped — `zigfitsio` (main) and
-   `zigfitsio-<platform>` (the 7 platform packages) — first-come-first-served like PyPI,
-   so confirm none of the 8 names are already taken and do this promptly.
+   PyPI-style pending publishers), so the first release of `zigfitsio` must be bootstrapped
+   by hand. The name is unscoped and first-come-first-served like PyPI, so confirm it is not
+   already taken and do this promptly.
    - Bootstrap once from a logged-in machine (or a short-lived granular automation token,
-     deleted afterwards):
+     deleted afterwards) — `prepack` builds `dist/` + `zigfitsio.wasm`, so the zig toolchain
+     must be on PATH:
 
      ```sh
      cd bindings/typescript
-     npm ci && node scripts/build-native.mjs        # all 7 platform packages
-     for d in npm/*/; do npm publish "$d" --access public; done
-     node scripts/prepare-publish.mjs               # inject optionalDependencies
+     npm ci
      npm publish --access public
-     git checkout package.json                      # discard the injected block
      ```
 
-   - Then, for **each of the 8 packages** on npmjs.com: Settings → Trusted Publisher →
+   - Then, on npmjs.com for the `zigfitsio` package: Settings → Trusted Publisher →
      GitHub Actions with owner `anhydrous99`, repository `zigfitsio`, workflow
      `typescript.yml`, environment `npm`. Subsequent tag releases publish via OIDC with
      provenance, no tokens.
@@ -79,8 +75,7 @@ Done once per index/repo; nothing here stores a secret.
    - `build.zig.zon` — `.version`
    - `src/version.zig` — `version_string` **and** the `expectEqualStrings` test literal
    - `pyproject.toml` — `[project] version`
-   - `bindings/typescript/package.json` — `version` (the generated `npm/*` platform
-     packages and the injected optionalDependencies pins inherit it automatically)
+   - `bindings/typescript/package.json` — `version`
 2. Move the `## [Unreleased]` content in `CHANGELOG.md` into a new
    `## [X.Y.Z] - YYYY-MM-DD` section (leave `_Nothing yet._` under Unreleased). This section
    becomes the GitHub Release notes verbatim. Don't add link-reference lines
@@ -145,4 +140,4 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 PyPI's and npm's trusted publishers match owner / repository / workflow filename /
 environment **exactly**. Renaming the repo, a workflow file (`python-wheels.yml`,
 `typescript.yml`), or the `pypi`/`npm` environments breaks publishing until the publisher
-config on the respective registry is updated (npm: per package, all 8).
+config on the respective registry is updated.
