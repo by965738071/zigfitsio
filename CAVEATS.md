@@ -136,13 +136,16 @@ merged, or reset at batch granularity:
 This section is a snapshot of the delivery state and becomes moot once the branch is
 merged.
 
-## 3. Language bindings (Python / C ABI) — scope & known gaps
+## 3. Language bindings (Python / TypeScript / C ABI) — scope & known gaps
 
 The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/capi/`, built by
-`zig build capi`) over the public Zig module, a low-level `ctypes` binding, and a high-level
-NumPy/Astropy-style API. `src/` is unchanged and contains **no C** (the `.h` contract lives under
-`bindings/c/`, outside the `GC-1` guard's `src tools test` scope). Interoperability is verified
-both directions against Astropy and the committed golden corpus. Honest limits as delivered:
+`zig build capi`) over the public Zig module, a low-level `ctypes` binding, a high-level
+NumPy/Astropy-style API, and a TypeScript package (`bindings/typescript/`) mirroring the same two
+layers (Bun `bun:ffi` / Node koffi under an astropy-style TypedArray API). `src/` is unchanged
+and contains **no C** (the `.h` contract lives under `bindings/c/`, outside the `GC-1` guard's
+`src tools test` scope). Interoperability is verified both directions against Astropy and the
+committed golden corpus, plus a TS↔Python cross-check in CI. Honest limits as delivered (they
+apply to both language bindings unless noted; TypeScript-specific ones are listed at the end):
 
 - **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
   purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
@@ -168,6 +171,61 @@ both directions against Astropy and the committed golden corpus. Honest limits a
   quantizes them *again* (a second, bounded lossy pass at the default level; the codec, tiling
   and method are preserved, and the result is a fully valid file). Integer-codec and lossless
   copies are unaffected; copying compressed HDUs verbatim (no re-quantization) is a follow-up.
+- **TypeScript-specific.** 64-bit integer data uses `BigInt64Array`/`BigUint64Array` (`bigint`
+  values); complex values are interleaved float pairs (no complex array type in JS); header
+  integers parse to `number` when exactly double-representable, else `bigint`;
+  `KeywordNotFound` is not also a `KeyError` (no such JS class); handles need an explicit
+  `close()` (or `using` on runtimes with `Symbol.dispose`) — there is no GC-based freeing.
+  bun:ffi ≤1.3.14 mislays stack-passed arguments on darwin-arm64 (Apple packs them at natural
+  alignment; bun uses 8-byte slots — hit by `zf_write_compressed3`'s two adjacent `int` stack
+  args); the bun backend fuses such pairs into one `u64` transparently
+  (`bindings/typescript/src/ffi/bun.ts`), which stays byte-identical on a fixed bun. Do not
+  remove the workaround.
+
+### TypeScript high-level ergonomics (the TS-native surface)
+
+The TypeScript package layers a TS-idiomatic surface (discriminated `kind`, typed `image()`/
+`table()` accessors, a columnar-plus-row `TableData`, `Header` Map semantics, the
+`tableFromArrays`/`imageFromArray` factories, and `ImageHDU.section()`) over the astropy-shaped
+classes. It is **additive sugar** — the Python-parity classes and the `lowlevel` escape hatch are
+unchanged and always sufficient. Honest boundaries of that sugar:
+
+- **HDU `kind` narrowing is exact for `"image"`/`"bintable"`/`"asciitable"`, partial for
+  `"primary"`/`"compimage"`.** Because `PrimaryHDU`/`CompImageHDU` extend `ImageHDU`, narrowing
+  `AnyHDU` on `kind === "primary"` yields `PrimaryHDU | ImageHDU` (and `"compimage"` →
+  `CompImageHDU | ImageHDU`). Harmless — every image kind shares the same `FitsArray | null`
+  `.data` — and the typed `image()`/`table()` accessors sidestep it entirely.
+- **`TableData<T>` / `HDUList.table<T>()` column shapes are a compile-time contract only.** `T`
+  is never checked at runtime: a wrong `T` mis-types reads without throwing, and a column name
+  outside `T` falls through to the untyped `ColumnValues` overload. The **runtime**-checked reads
+  are `numeric()/strings()/vla()/complex()`, which throw `FitsTypeError` on a kind mismatch.
+- **A `Row<T>` numeric cell is typed `ElementOf<V> | V`** (scalar *or* TypedArray slice), because
+  repeat-1-vs-vector is a runtime distinction TypeScript cannot see. Row slices are **zero-copy
+  views** over the column buffer — mutating a returned slice mutates the column (and, in update
+  mode, is written back on `flush()`). For a statically-known element type, prefer the column
+  accessors.
+- **`ImageHDU.section()` (strided cutout) is image-data only.** It reads the plain image data
+  unit via `zf_read_subset`, so it fails loud (`NotSupportedError`) on a tile-compressed image —
+  read the whole array through `.data`. In update mode it flushes pending in-place `.data` edits
+  first, so a section never lags `.data`; in read-only mode it reads the file **as opened**, so
+  unflushed in-memory edits are not visible. Windows are 0-based, half-open `[start, stop)` in
+  C-order; negative, out-of-bounds, or empty windows throw `RangeError`.
+- **In-place table write-back matches columns by name and cannot add columns.** Setting a
+  reordered `TableData` in update mode writes each changed column to its true on-disk slot; a
+  `TableData` carrying a column name absent from the file fails loud (`NotSupportedError`) rather
+  than silently mis-writing (an index-based match would corrupt a reordered table). Row-count,
+  VLA, and scaled/unsigned-column in-place edits remain unsupported (fail-loud) — use `writeTo()`.
+- **`Header` iteration is Map-style over `[keyword, value]` entries.** A parsed header may repeat
+  a keyword across cards: iteration yields **every** card, `get()` returns the **first**, and
+  `size` counts them **all**, so `new Map([...header]).size` can be smaller. Commentary
+  (`COMMENT`/`HISTORY`/blank) cards are excluded from iteration — see `.comments`/`.history`.
+- **`tableFromArrays` TFORM inference is a convenience, not exhaustive.** `Int8Array` (no FITS
+  binary signed-byte code) is rejected fail-loud, complex columns are not inferable, and a
+  uniformly-empty cell array infers a variable-length column (`1P<t>`) rather than a 0-repeat
+  fixed one. Pass an explicit `Column[]` via `BinTableHDU.fromColumns` for complex (`C`/`M`),
+  signed-byte, or hand-tuned formats. Arbitrary `BSCALE`/`BZERO` scaling is **not** expressible
+  through the high-level image writer (it derives scaling from the array dtype and emits only the
+  unsigned `u2/u4/u8` `BZERO` convention) — use `lowlevel` for a custom `BSCALE`/`BZERO`.
 
 None of these require ABI changes to address — they are extension points, not design constraints.
 

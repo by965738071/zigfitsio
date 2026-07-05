@@ -18,6 +18,10 @@ updates:
     directory: / # pyproject.toml (bindings runtime dep: numpy)
     schedule:
       interval: monthly
+  - package-ecosystem: npm
+    directory: /bindings/typescript # koffi runtime dep + TS/vitest dev deps
+    schedule:
+      interval: monthly
   - package-ecosystem: pip
     directory: /interop # CI-only interop lane (astropy/numpy caps)
     schedule:

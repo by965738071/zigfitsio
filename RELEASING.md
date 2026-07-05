@@ -4,7 +4,9 @@ Releases are tag-driven. Pushing a tag `vX.Y.Z` runs `.github/workflows/python-w
 which gates on version consistency and the core Zig suite, builds wheels + sdist, publishes
 them to PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no
 API tokens anywhere), and then creates a GitHub Release with the tag's CHANGELOG section as
-notes and all artifacts attached.
+notes and all artifacts attached. The same tag also runs
+`.github/workflows/typescript.yml`, which cross-compiles the 7 `@zigfitsio/*` platform
+packages and publishes them + the main `zigfitsio` npm package via npm trusted publishing.
 
 ```
 version-check ──┐
@@ -12,6 +14,11 @@ zig-test ───────┤  (tag/dispatch only)
 wheels (×5) ────┼──► publish-pypi ──► github-release        [tag pushes]
 sdist ──────────┤ └─► publish-testpypi                      [manual dispatch]
 smoke ──────────┘
+
+version-check ──┐
+test (×8) ──────┼──► publish-npm                            [tag pushes]
+interop ────────┤ └─► publish-rehearsal (--dry-run)         [manual dispatch]
+build-natives ──┘
 ```
 
 `version-check` fails within seconds of a bad tag (version mismatch or missing CHANGELOG
@@ -41,13 +48,40 @@ Done once per index/repo; nothing here stores a secret.
      and add a **tag** rule `v*`. Optionally add yourself as a required reviewer — each
      release then pauses for one approval click (sensible for the first release).
    - Create `testpypi`; optionally restrict it to branch `main`.
+   - Create `npm` with the same tag rule `v*` (the `publish-npm` job in `typescript.yml`
+     uses it).
+
+4. **npm** — trusted publishing is configured **per existing package** (npm has no
+   PyPI-style pending publishers), so the first release of all 8 packages must be
+   bootstrapped by hand:
+   - Create the npm org **`zigfitsio`** (owns the `@zigfitsio/*` platform-package scope)
+     and confirm the unscoped name `zigfitsio` is still free — like PyPI, it stays
+     claimable until the first publish, so do this promptly.
+   - Bootstrap once from a logged-in machine (or a short-lived granular automation token,
+     deleted afterwards):
+
+     ```sh
+     cd bindings/typescript
+     npm ci && node scripts/build-native.mjs        # all 7 platform packages
+     for d in npm/*/; do npm publish "$d" --access public; done
+     node scripts/prepare-publish.mjs               # inject optionalDependencies
+     npm publish --access public
+     git checkout package.json                      # discard the injected block
+     ```
+
+   - Then, for **each of the 8 packages** on npmjs.com: Settings → Trusted Publisher →
+     GitHub Actions with owner `anhydrous99`, repository `zigfitsio`, workflow
+     `typescript.yml`, environment `npm`. Subsequent tag releases publish via OIDC with
+     provenance, no tokens.
 
 ## Cutting a release
 
-1. Bump the version in all four spots (CI's `version-check` job enforces they agree):
+1. Bump the version in all five spots (CI's `version-check` jobs enforce they agree):
    - `build.zig.zon` — `.version`
    - `src/version.zig` — `version_string` **and** the `expectEqualStrings` test literal
    - `pyproject.toml` — `[project] version`
+   - `bindings/typescript/package.json` — `version` (the generated `npm/*` platform
+     packages and the injected optionalDependencies pins inherit it automatically)
 2. Move the `## [Unreleased]` content in `CHANGELOG.md` into a new
    `## [X.Y.Z] - YYYY-MM-DD` section (leave `_Nothing yet._` under Unreleased). This section
    becomes the GitHub Release notes verbatim. Don't add link-reference lines
@@ -61,12 +95,15 @@ Done once per index/repo; nothing here stores a secret.
    git push origin vX.Y.Z
    ```
 
-5. Watch the run (`gh run watch`), then verify: <https://pypi.org/project/zigfitsio/>, the
-   GitHub Release, and a clean-venv install:
+5. Watch the run (`gh run watch`), then verify: <https://pypi.org/project/zigfitsio/>,
+   <https://www.npmjs.com/package/zigfitsio>, the GitHub Release, and clean installs:
 
    ```sh
    pip install zigfitsio==X.Y.Z
    python -c "import zigfitsio; print(zigfitsio.__version__)"   # must print X.Y.Z
+
+   npm install zigfitsio@X.Y.Z
+   node -e "import('zigfitsio').then(zf => console.log(zf.VERSION))"   # must print X.Y.Z
    ```
 
 ## TestPyPI rehearsal
@@ -106,6 +143,7 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 
 ## Renames break trusted publishing
 
-PyPI's trusted publisher matches owner / repository / workflow filename / environment
-**exactly**. Renaming the repo, the workflow file (`python-wheels.yml`), or the `pypi`
-environment breaks publishing with `invalid-publisher` until the PyPI config is updated.
+PyPI's and npm's trusted publishers match owner / repository / workflow filename /
+environment **exactly**. Renaming the repo, a workflow file (`python-wheels.yml`,
+`typescript.yml`), or the `pypi`/`npm` environments breaks publishing until the publisher
+config on the respective registry is updated (npm: per package, all 8).

@@ -38,10 +38,11 @@ const fits = b.dependency("zigfitsio", .{ .target = target, .optimize = optimize
 exe.root_module.addImport("zigfitsio", fits.module("zigfitsio"));
 ```
 
-## Language bindings (C ABI + Python)
+## Language bindings (C ABI + Python + TypeScript)
 
-A stable **C ABI** and a **Python** package live under [`bindings/`](./bindings). They are
-additive — the pure-Zig library in `src/` is unchanged — and are layered:
+A stable **C ABI**, a **Python** package, and a **TypeScript/JavaScript** package live under
+[`bindings/`](./bindings). They are additive — the pure-Zig library in `src/` is unchanged —
+and are layered:
 
 - **C-ABI shim** ([`bindings/capi/`](./bindings/capi), `zig build capi`): a dynamic library
   `zigfitsio_capi` exporting `zf_*` symbols. The comptime-generic Zig API is monomorphized behind
@@ -54,6 +55,14 @@ additive — the pure-Zig library in `src/` is unchanged — and are layered:
   `HDUList`, the HDU classes, `Column`, a dict-like `Header`, `getdata`/`getheader`/`writeto`/
   `verify`, and celestial WCS transforms. Interoperability is verified **both directions** against
   Astropy and the committed CFITSIO golden corpus.
+- **TypeScript/JavaScript** ([`bindings/typescript/`](./bindings/typescript), npm `zigfitsio`):
+  the same two layers over the same shared library — a 1:1 FFI mapping (`zigfitsio/lowlevel`,
+  Bun `bun:ffi` / Node [koffi](https://koffi.dev/)) and the astropy-style high-level API with
+  TypedArray data, plus a TS-native surface layered on top (discriminated HDU `kind` with typed
+  `image()`/`table<T>()` accessors, a columnar-plus-row `TableData`, Map-style `Header`,
+  `tableFromArrays`/`imageFromArray` factories, and strided `ImageHDU.section()` cutouts) so
+  idiomatic callers avoid `as` casts. Prebuilt libraries ship as `@zigfitsio/<platform>`
+  packages; a TS↔Python interop cross-check runs in CI.
 
 ```python
 import numpy as np, zigfitsio as zf
@@ -63,8 +72,22 @@ with zf.open("img.fits") as hdul:
     print(hdul[0].data, hdul[0].header["NAXIS1"])
 ```
 
-See [`bindings/python/README.md`](./bindings/python/README.md) for install, the full API, and the
-packaging/wheel workflow.
+```ts
+import * as zf from "zigfitsio";
+
+zf.writeTo("img.fits", new zf.FitsArray(Float32Array.from({ length: 12 }, (_, i) => i), [3, 4]), { overwrite: true });
+const hdul = zf.open("img.fits");
+try {
+  // `image()`/`table()` assert the HDU flavor, so `.data` is typed (no cast).
+  console.log(hdul.image(0).data, hdul.image(0).header.get("NAXIS1"));
+} finally {
+  hdul.close(); // or `using hdul = zf.open(...)` on TypeScript / Bun / Node ≥24
+}
+```
+
+See [`bindings/python/README.md`](./bindings/python/README.md) and
+[`bindings/typescript/README.md`](./bindings/typescript/README.md) for install, the full APIs,
+and the packaging workflows.
 
 ## Status
 

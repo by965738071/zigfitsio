@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Versions agree across build.zig.zon / src/version.zig / pyproject.toml
+      - name: Versions agree across build.zig.zon / src/version.zig / pyproject.toml / package.json
         run: |
           set -euo pipefail
           zon="$(grep -Eo '\.version = "[^"]+"' build.zig.zon | cut -d'"' -f2)"
@@ -62,9 +62,10 @@ jobs:
           # keeps the script runnable locally on older interpreters.
           py="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null ||
             grep -Eo '^version *= *"[^"]+"' pyproject.toml | head -n1 | cut -d'"' -f2)"
-          echo "build.zig.zon=$zon  src/version.zig=$zig  pyproject.toml=$py"
-          if [ "$zon" != "$zig" ] || [ "$zon" != "$py" ]; then
-            echo "::error::version mismatch: build.zig.zon=$zon src/version.zig=$zig pyproject.toml=$py"
+          ts="$(grep -Eo '"version": *"[^"]+"' bindings/typescript/package.json | head -n1 | cut -d'"' -f4)"
+          echo "build.zig.zon=$zon  src/version.zig=$zig  pyproject.toml=$py  package.json=$ts"
+          if [ "$zon" != "$zig" ] || [ "$zon" != "$py" ] || [ "$zon" != "$ts" ]; then
+            echo "::error::version mismatch: build.zig.zon=$zon src/version.zig=$zig pyproject.toml=$py package.json=$ts"
             exit 1
           fi
           if ! grep -qF "expectEqualStrings(\"$zon\"" src/version.zig; then

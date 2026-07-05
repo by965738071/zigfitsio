@@ -1,0 +1,852 @@
+/**
+ * Table HDUs (method-for-method port of the Python `core.py` table layer).
+ *
+ * Data model: columnar. `TableData` maps column name → `ColumnData` where
+ * `values` is a flat TypedArray (numeric; `nrows*repeat` elements, complex
+ * interleaved re/im), a `string[]`, or a per-row array of TypedArrays (VLA).
+ */
+import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
+import * as ll from "./lowlevel/index.js";
+import * as dt from "./dtypes.js";
+import { BaseHDU, writeConventionOffset, type HDUOptions } from "./hdu.js";
+import type { ElementOf } from "./fitsarray.js";
+import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
+
+// ════════════════════════════════════════════════════════════════════════
+// Data model
+// ════════════════════════════════════════════════════════════════════════
+
+export type ColumnKind = "numeric" | "string" | "complex" | "vla";
+
+/** A fixed-width or scaled numeric column: a flat `nrows*repeat` TypedArray. */
+export interface NumericColumn {
+  kind: "numeric";
+  dtype: dt.Dtype;
+  repeat: number;
+  values: dt.TypedArray;
+}
+
+/** A complex column: interleaved re/im float pairs (2 floats per element). */
+export interface ComplexColumn {
+  kind: "complex";
+  /** `c8` (Float32) or `c16` (Float64). */
+  dtype: dt.Dtype;
+  repeat: number;
+  values: Float32Array | Float64Array;
+}
+
+/** A character column: one fixed-width string per row. */
+export interface StringColumn {
+  kind: "string";
+  dtype: dt.Dtype;
+  /** The field width in characters. */
+  repeat: number;
+  values: string[];
+}
+
+/** A variable-length-array column: one TypedArray cell per row. */
+export interface VlaColumn {
+  kind: "vla";
+  dtype: dt.Dtype;
+  repeat: number;
+  values: dt.TypedArray[];
+}
+
+/**
+ * One materialized table column. Discriminated on `kind`, so a
+ * `switch (col.kind)` narrows `values` to the exact array type.
+ */
+export type ColumnData = NumericColumn | ComplexColumn | StringColumn | VlaColumn;
+
+/** The value array a column exposes, by kind. */
+export type ColumnValues = dt.TypedArray | string[] | dt.TypedArray[];
+
+/**
+ * A column-name → value-array shape, used as the optional type parameter of
+ * `TableData<T>` (and `HDUList.table<T>()`) for typed column/row reads. This
+ * is a compile-time contract only — the runtime never checks it.
+ */
+export type ColumnShape = Record<string, ColumnValues>;
+
+/**
+ * The element yielded for one column cell in a `Row<T>` (see `TableData.row`).
+ * A numeric column resolves to `ElementOf<V> | V` — a scalar for a repeat-1
+ * column, or a (zero-copy) slice of the same TypedArray type for a vector
+ * column — a runtime distinction TypeScript cannot see, so both are offered.
+ */
+export type RowCell<V> = V extends string[]
+  ? string
+  : V extends (infer E extends dt.TypedArray)[]
+    ? E
+    : V extends dt.TypedArray
+      ? ElementOf<V> | V
+      : never;
+
+/**
+ * One row as a plain object keyed by column name. Numeric cells are a scalar
+ * when the column's repeat is 1, else a (zero-copy) TypedArray slice — a
+ * runtime distinction TypeScript cannot see, hence the `ElementOf<V> | V`
+ * union. For a statically known shape, prefer the column accessors
+ * (`numeric`/`strings`/`vla`/`complex`).
+ */
+export type Row<T extends ColumnShape = ColumnShape> = { [K in keyof T]: RowCell<T[K]> };
+
+export class TableData<T extends ColumnShape = ColumnShape> implements Iterable<Row<T>> {
+  readonly names: readonly string[];
+  readonly columns: ReadonlyMap<string, ColumnData>;
+  readonly nrows: number;
+
+  constructor(names: readonly string[], columns: ReadonlyMap<string, ColumnData>, nrows: number) {
+    this.names = names;
+    this.columns = columns;
+    this.nrows = nrows;
+  }
+
+  /** Row count (alias of `nrows`, matching Arrow's `Table.numRows`). */
+  get numRows(): number {
+    return this.nrows;
+  }
+
+  /** Column count (matching Arrow's `Table.numCols`). */
+  get numCols(): number {
+    return this.names.length;
+  }
+
+  column(name: string): ColumnData {
+    const c = this.columns.get(name);
+    if (c === undefined) throw new FitsTableError(302, `no such column: ${name}`);
+    return c;
+  }
+
+  /** The raw values of one column (typed by the column shape `T` when known). */
+  get<K extends keyof T & string>(name: K): T[K];
+  get(name: string): ColumnValues;
+  get(name: string): ColumnValues {
+    return this.column(name).values;
+  }
+
+  private _typed<C extends ColumnData>(name: string, kind: C["kind"], expected: string): C["values"] {
+    const c = this.column(name);
+    if (c.kind !== kind) {
+      throw new FitsTypeError(410, `column ${name} is ${c.kind}, expected ${expected}`);
+    }
+    return (c as C).values;
+  }
+
+  /** A fixed-width/scaled numeric column's flat TypedArray (throws otherwise). */
+  numeric(name: string): dt.TypedArray {
+    return this._typed<NumericColumn>(name, "numeric", "numeric");
+  }
+
+  /** A character column's per-row strings (throws otherwise). */
+  strings(name: string): string[] {
+    return this._typed<StringColumn>(name, "string", "string");
+  }
+
+  /** A variable-length-array column's per-row TypedArrays (throws otherwise). */
+  vla(name: string): dt.TypedArray[] {
+    return this._typed<VlaColumn>(name, "vla", "vla");
+  }
+
+  /** A complex column's interleaved re/im floats (throws otherwise). */
+  complex(name: string): Float32Array | Float64Array {
+    return this._typed<ComplexColumn>(name, "complex", "complex");
+  }
+
+  /** One cell of a column for a 0-based row (scalar, slice, string, or VLA). */
+  private _cell(cd: ColumnData, r: number): number | bigint | string | dt.TypedArray {
+    if (cd.kind === "string") return cd.values[r];
+    if (cd.kind === "vla") return cd.values[r];
+    if (cd.kind === "complex") {
+      const w = cd.repeat * 2; // 2 floats per complex element
+      return cd.values.subarray(r * w, (r + 1) * w);
+    }
+    // numeric: scalar when repeat === 1, else a zero-copy row slice.
+    if (cd.repeat === 1) return cd.values[r];
+    return cd.values.subarray(r * cd.repeat, (r + 1) * cd.repeat) as dt.TypedArray;
+  }
+
+  /**
+   * One row as a plain object keyed by column name (0-based). Numeric cells
+   * are scalars for repeat-1 columns and (zero-copy) TypedArray slices
+   * otherwise; mutating a returned slice mutates the column.
+   */
+  row(i: number): Row<T> {
+    if (i < 0 || i >= this.nrows) throw new RangeError(`row ${i} out of range (${this.nrows} rows)`);
+    const out: Record<string, unknown> = {};
+    for (const name of this.names) out[name] = this._cell(this.column(name), i);
+    return out as Row<T>;
+  }
+
+  /** Lazily yield every row as a plain object (see `row`). */
+  *rows(): IterableIterator<Row<T>> {
+    for (let i = 0; i < this.nrows; i++) yield this.row(i);
+  }
+
+  /** Iterating a `TableData` yields rows (matching Arrow's `Table`). */
+  [Symbol.iterator](): IterableIterator<Row<T>> {
+    return this.rows();
+  }
+
+  /** Every row as an array of plain objects. */
+  toArray(): Row<T>[] {
+    return [...this.rows()];
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Column builder (for writing tables)
+// ════════════════════════════════════════════════════════════════════════
+
+export type ColumnArray =
+  | dt.TypedArray
+  | string[]
+  | boolean[]
+  | number[]
+  | bigint[]
+  | (dt.TypedArray | number[] | bigint[])[];
+
+export interface ColumnOptions {
+  array?: ColumnArray | null;
+  unit?: string;
+}
+
+/** A table column specification (name + FITS `format` + optional data/unit). */
+export class Column {
+  readonly name: string;
+  readonly format: string;
+  readonly unit: string | null;
+  readonly array: ColumnArray | null;
+
+  constructor(name: string, format: string, options: ColumnOptions = {}) {
+    this.name = name;
+    this.format = format;
+    this.unit = options.unit ?? null;
+    this.array = options.array ?? null;
+  }
+}
+
+// ── format helpers ──
+
+const firstLetter = (fmt: string): string => {
+  for (const ch of fmt) if (/[A-Z]/.test(ch)) return ch;
+  return "";
+};
+
+const formatDigits = (fmt: string): string => fmt.replace(/[^0-9]/g, "");
+
+/** (element dtype, is_complex) for a VLA TFORM like '1PJ' / '1QE(max)'. */
+function vlaElemDtype(fmt: string): { dtype: dt.Dtype; isComplex: boolean } {
+  const marker = fmt.includes("P") ? "P" : "Q";
+  const after = fmt.slice(fmt.indexOf(marker) + 1);
+  const letter = firstLetter(after);
+  return letter ? dt.binElemDtype(letter) : { dtype: "f8", isComplex: false };
+}
+
+/**
+ * Rebuild a binary-table TFORM string from column metadata (for
+ * reconstructing an attached table on copy). The unsigned-integer convention
+ * is reproducible; fractional/other scaling is not reproducible value-only.
+ */
+export function tformOf(info: ll.ColInfo): string {
+  if (info.typecode === ll.ZF_STRING) return `${Math.max(info.width, 1)}A`;
+  const isUnsigned = info.tscal === 1 && (info.tzero === 32768 || info.tzero === 2147483648 || info.tzero === 9223372036854775808);
+  if ((info.tscal !== 1 || info.tzero !== 0) && !isUnsigned) {
+    throw new NotSupportedError(
+      410,
+      "cannot reconstruct a scaled table column into a new table; copy the file through the " +
+        "raw-passthrough path (writeTo without checksum on a freshly opened file)",
+    );
+  }
+  const letter = dt.ZF_TO_TFORM[info.typecode];
+  if (letter === undefined) throw new NotSupportedError(410, `cannot reconstruct TFORM for ZfType ${info.typecode}`);
+  if (info.isVla) return `1P${letter}`;
+  return `${info.repeat}${letter}`;
+}
+
+/**
+ * Rebuild an ASCII-table TFORM (`Iw` / `Ew.d` / `Aw`) from column metadata.
+ * ASCII TFORMs carry an explicit width, so a copied ASCII table needs these
+ * rather than binary `1J`-style formats.
+ */
+export function asciiTformOf(info: ll.ColInfo): string {
+  const w = Math.max(info.width, 1);
+  if (info.typecode === ll.ZF_STRING) return `A${w}`;
+  if (info.typecode === ll.ZF_FLOAT32 || info.typecode === ll.ZF_FLOAT64) {
+    return `E${w}.${Math.max(w - 7, 1)}`; // leave room for sign, decimal point, and E±dd exponent
+  }
+  return `I${w}`; // integer column of any width
+}
+
+// ── write-side array normalization ──
+
+const isTypedArray = (v: unknown): v is dt.TypedArray => ArrayBuffer.isView(v) && !(v instanceof DataView);
+
+/**
+ * A plain JS value destined for an int64 slot: rounds (the same net behavior
+ * as Python routing floats through the library's float→int conversion) and
+ * fails loud on non-finite/out-of-range instead of BigInt64Array wrap-around.
+ */
+function numToBigInt(v: number | bigint): bigint {
+  if (typeof v === "bigint") return v;
+  if (typeof v !== "number") throw new FitsTypeError(410, `non-numeric value ${JSON.stringify(v)} in a numeric column`);
+  const r = Math.round(v);
+  if (!Number.isFinite(r) || r < -(2 ** 63) || r >= 2 ** 63) {
+    throw new FitsOverflowError(412, `integer column value ${v} out of signed-64-bit range`);
+  }
+  return BigInt(r);
+}
+
+function numToNumber(v: number | bigint): number {
+  if (typeof v !== "number" && typeof v !== "bigint") {
+    throw new FitsTypeError(410, `non-numeric value ${JSON.stringify(v)} in a numeric column`);
+  }
+  return Number(v);
+}
+
+/** Convert a per-cell/plain JS array to a TypedArray of `elem`. */
+function toTypedArray(values: readonly (number | bigint)[] | dt.TypedArray, elem: dt.Dtype): dt.TypedArray {
+  if (isTypedArray(values)) return values;
+  const out = dt.allocDtype(elem, values.length);
+  const big = dt.usesBigInt(elem);
+  for (let i = 0; i < values.length; i++) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (out as any)[i] = big ? numToBigInt(values[i]) : numToNumber(values[i]);
+  }
+  return out;
+}
+
+/** Element-wise cast of a TypedArray/plain array to exactly `elem` (bigint-safe). */
+function castTypedArray(values: readonly (number | bigint)[] | dt.TypedArray, elem: dt.Dtype): dt.TypedArray {
+  const src = toTypedArray(values, elem);
+  if (dt.dtypeOf(src) === elem) return src;
+  const out = dt.allocDtype(elem, src.length);
+  const big = dt.usesBigInt(elem);
+  for (let k = 0; k < src.length; k++) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (out as any)[k] = big ? numToBigInt(src[k]) : Number(src[k]);
+  }
+  return out;
+}
+
+/** Rows represented by a column's array, given its format. */
+function colRowCount(col: Column): number {
+  const arr = col.array;
+  if (arr === null) return 0;
+  const fmt = col.format.trim().toUpperCase();
+  if (fmt.includes("P") || fmt.includes("Q")) return arr.length; // VLA: one cell per row
+  if (fmt.includes("A")) return arr.length; // string rows
+  if (Array.isArray(arr)) return arr.length; // rows-of-arrays or flat plain scalars
+  // A binary repeat is the LEADING digits ("3J"); ASCII formats are
+  // letter-first ("I6", "F12.4") with width digits and always one per row.
+  const m = fmt.match(/^(\d+)/);
+  const repeat = m ? Math.max(parseInt(m[1], 10), 1) : 1;
+  const perRow = dt.binElemDtype(firstLetter(fmt)).isComplex ? repeat * 2 : repeat;
+  return Math.floor(arr.length / Math.max(perRow, 1));
+}
+
+/** Total heap bytes to reserve (PCOUNT) for the VLA columns of a to-be-written table. */
+function vlaHeapBytes(cols: readonly Column[]): number {
+  let total = 0;
+  for (const col of cols) {
+    const fmt = col.format.trim().toUpperCase();
+    if ((fmt.includes("P") || fmt.includes("Q")) && col.array !== null) {
+      const { dtype } = vlaElemDtype(fmt);
+      const esize = dt.itemBytes(dtype);
+      for (const cell of col.array as readonly (dt.TypedArray | readonly number[])[]) {
+        total += cell.length * esize;
+      }
+    }
+  }
+  return total;
+}
+
+/** TZERO for an unsigned column stored under a matching signed TFORM (I/J/K), else null. */
+function unsignedColTzeroOf(col: Column): number | null {
+  if (col.array === null || !isTypedArray(col.array)) return null;
+  return dt.unsignedColTzero(dt.dtypeOf(col.array), firstLetter(col.format.trim().toUpperCase()));
+}
+
+// ── fingerprints ──
+
+const FNV_PRIME = 0x100000001b3n;
+const U64_MASK = 0xffffffffffffffffn;
+
+const mix = (h: bigint, v: bigint): bigint => (((h ^ (v & U64_MASK)) * FNV_PRIME) & U64_MASK);
+
+/** A change-detection fingerprint for one materialized table column. */
+export function colFp(cd: ColumnData): bigint {
+  if (cd.kind === "string") {
+    // NUL separator (written as an escape — a literal NUL byte here made the
+    // file read as binary and was one accidental "cleanup" away from
+    // fingerprint collisions).
+    return fnv1a64(enc((cd.values as string[]).join("\u0000")));
+  }
+  if (cd.kind === "vla") {
+    let h = 0xcbf29ce484222325n;
+    for (const cell of cd.values as dt.TypedArray[]) {
+      h = mix(h, BigInt(cell.length));
+      h = mix(h, fnv1a64(viewBytes(cell)));
+    }
+    return h;
+  }
+  return fnv1a64(viewBytes(cd.values as dt.TypedArray));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Table HDU base
+// ════════════════════════════════════════════════════════════════════════
+
+/** Run `fn` with an open table view over the current HDU, closing it after. */
+function withTable<T>(handle: bigint, fn: (t: bigint) => T): T {
+  const tout = ll.outU64();
+  ll.check(ll.lib.zf_table_open(handle, tout));
+  const t = tout[0];
+  try {
+    return fn(t);
+  } finally {
+    ll.lib.zf_table_close(t);
+  }
+}
+
+function colName(t: bigint, i: number): string {
+  const buf = new Uint8Array(80);
+  const out = ll.outU64();
+  ll.check(ll.lib.zf_table_col_name(t, i, buf, 80, out));
+  return decOut(buf, out[0]).trim();
+}
+
+function readColInfo(t: bigint, i: number): ll.ColInfo {
+  const buf = ll.newColInfoBuf();
+  ll.check(ll.lib.zf_table_col_info(t, i, buf));
+  return ll.decodeColInfo(buf);
+}
+
+export interface FromColumnsOptions {
+  nrows?: number;
+  name?: string;
+}
+
+export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends BaseHDU {
+  // Abstract + widened to the table subtree: every concrete subclass must
+  // supply its own narrower literal (no silently-wrong default), while callers
+  // can still discriminate on the union (TS override-variance requirement).
+  abstract override readonly kind: "bintable" | "asciitable";
+  /** @internal */ abstract readonly _tableType: number;
+
+  // Stored untyped (default shape); the column-shape `T` is a compile-time
+  // contract surfaced only at the public `data` boundary.
+  /** @internal */ _data: TableData | null = null;
+  /** @internal */ _columns: Column[] = [];
+  /** @internal */ _nrows = 0;
+  /** @internal Per-column baselines for update-mode in-place write-back. */
+  _colFingerprints: Map<string, bigint> | null = null;
+
+  get data(): TableData<T> | null {
+    if (this._hdulist !== null && this._data === null) this._data = this._readTable();
+    return this._data as TableData<T> | null;
+  }
+
+  /**
+   * Replace the table's rows wholesale (e.g. a filtered TableData).
+   * writeTo/toBytes reconstruct from this; an in-place update-mode flush of
+   * a row-count change fails loud. If the table was never read, there is no
+   * per-column baseline, so every column counts as changed on the next flush.
+   */
+  set data(value: TableData<T> | null) {
+    this._data = value as TableData | null;
+    if (this._data !== null && this._colFingerprints === null) this._colFingerprints = new Map();
+    this._markDirty();
+  }
+
+  override _dataChanged(): boolean {
+    if (this._data === null || this._colFingerprints === null) return false;
+    for (const name of this._data.names) {
+      if (colFp(this._data.column(name)) !== this._colFingerprints.get(name)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * @internal Write back in-place edits to a materialized table's cell values
+   * (update mode). Only changed columns are rewritten; changing the row count
+   * or editing a VLA/scaled column in place is not supported.
+   */
+  override _flushData(): void {
+    if (this._data === null || this._colFingerprints === null) return;
+    const rec = this._data;
+    const h = this._select();
+    withTable(h, (t) => {
+      const nrowsOut = ll.outI64();
+      ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
+      const nrows = Number(nrowsOut[0]);
+      // Resolve each column to its slot in the FILE, not its position in this
+      // (possibly reordered) TableData — writing by iteration index would put a
+      // changed column's values into the wrong on-disk column. First card wins,
+      // matching TableData.column()/get().
+      const ncolsOut = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      const fileIndex = new Map<string, number>();
+      for (let j = 0; j < ncolsOut[0]; j++) {
+        const nm = colName(t, j) || `col${j + 1}`;
+        if (!fileIndex.has(nm)) fileIndex.set(nm, j);
+      }
+      for (let i = 0; i < rec.names.length; i++) {
+        const name = rec.names[i];
+        const newFp = colFp(rec.column(name));
+        if (newFp === this._colFingerprints!.get(name)) continue; // column unchanged
+        if (nrows !== rec.nrows) {
+          throw new NotSupportedError(
+            410,
+            "in-place table update cannot change the row count; use writeTo() to a new file",
+          );
+        }
+        const j = fileIndex.get(name);
+        if (j === undefined) {
+          throw new NotSupportedError(
+            410,
+            `in-place update cannot add column '${name}' (not present in the file); use writeTo() to a new file`,
+          );
+        }
+        const info = readColInfo(t, j);
+        if (info.isVla) {
+          throw new NotSupportedError(
+            410,
+            "in-place update of a variable-length-array column is not supported; use writeTo()",
+          );
+        }
+        if (info.tscal !== 1 || info.tzero !== 0) {
+          throw new NotSupportedError(
+            410,
+            "in-place update of a scaled/unsigned (TSCAL/TZERO) column is not supported; use writeTo()",
+          );
+        }
+        const fmt = this._tableType === ll.ASCII_TBL ? asciiTformOf(info) : tformOf(info);
+        writeColumn(t, j, new Column(name, fmt, { array: rec.get(name) as ColumnArray }), nrows);
+        this._colFingerprints!.set(name, newFp);
+      }
+    });
+  }
+
+  /** Column names for an attached table; the builder `Column`s for a detached one. */
+  get columns(): string[] | Column[] {
+    return this._hdulist !== null ? this._readColumnsMeta() : this._columns;
+  }
+
+  private _readColumnsMeta(): string[] {
+    const h = this._select();
+    return withTable(h, (t) => {
+      const ncols = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncols));
+      const names: string[] = [];
+      for (let i = 0; i < ncols[0]; i++) names.push(colName(t, i));
+      return names;
+    });
+  }
+
+  /** @internal */
+  _readTable(): TableData {
+    const h = this._select();
+    return withTable(h, (t) => {
+      const nrowsOut = ll.outI64();
+      ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
+      const nrows = Number(nrowsOut[0]);
+      const ncolsOut = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      const ncols = ncolsOut[0];
+
+      const names: string[] = [];
+      const columns = new Map<string, ColumnData>();
+      for (let col = 0; col < ncols; col++) {
+        const info = readColInfo(t, col);
+        const name = colName(t, col) || `col${col + 1}`;
+        names.push(name);
+        columns.set(name, this._columnPlan(t, col, info, nrows));
+      }
+      const data = new TableData(names, columns, Math.max(nrows, 0));
+      // Baselines for write-back AND the writeTo pristine gate (all modes).
+      this._colFingerprints = new Map(names.map((n) => [n, colFp(data.column(n))]));
+      return data;
+    });
+  }
+
+  /** @internal Read one column (port of `core.py _column_plan`, executed eagerly). */
+  _columnPlan(t: bigint, col: number, info: ll.ColInfo, nrows: number): ColumnData {
+    // Character column -> fixed-width strings.
+    if (info.typecode === ll.ZF_STRING) {
+      const width = info.width; // may be 0: a '0A' column reads as empty strings
+      const buf = new Uint8Array(Math.max(nrows * width, 1));
+      if (nrows > 0) {
+        ll.check(ll.lib.zf_read_col_str(t, col, 1n, BigInt(nrows), BigInt(width), BigInt(width), buf));
+      }
+      const values: string[] = [];
+      const decoder = new TextDecoder("ascii");
+      for (let r = 0; r < nrows; r++) {
+        let end = (r + 1) * width;
+        while (end > r * width && (buf[end - 1] === 0x20 || buf[end - 1] === 0x00)) end--;
+        values.push(decoder.decode(buf.subarray(r * width, end)));
+      }
+      return { kind: "string", dtype: "u1", repeat: Math.max(width, 1), values };
+    }
+
+    // VLA column -> per-row arrays. Element type comes from info.typecode
+    // (the TFORM char is 'P'/'Q', the descriptor kind — not the element type).
+    if (info.isVla) {
+      const code = info.typecode;
+      const isComplex = code === ll.ZF_COMPLEX64 || code === ll.ZF_COMPLEX128;
+      const elem: dt.Dtype = isComplex ? (code === ll.ZF_COMPLEX64 ? "c8" : "c16") : dt.zfToDtype(code);
+      const floatElem: dt.Dtype = code === ll.ZF_COMPLEX64 ? "f4" : "f8";
+      const readCode = isComplex ? dt.zfCode(floatElem) : dt.zfCode(elem);
+      const values: dt.TypedArray[] = [];
+      for (let r = 0; r < nrows; r++) {
+        const len = ll.outI64();
+        const off = ll.outI64();
+        ll.check(ll.lib.zf_read_descript(t, col, BigInt(r + 1), len, off));
+        const count = Number(len[0]);
+        if (count < 0) throw new FitsError(412, `corrupt VLA descriptor: negative length ${count}`);
+        const got = ll.outI64();
+        if (isComplex) {
+          const cap = count * 2; // ABI returns 2 float slots per complex element
+          if (count > 0) {
+            const cell = dt.allocDtype(floatElem, cap);
+            ll.check(ll.lib.zf_read_col_vla(t, readCode, col, BigInt(r + 1), BigInt(cap), cell, got));
+            values.push(cell.subarray(0, Number(got[0])) as dt.TypedArray);
+          } else {
+            values.push(dt.allocDtype(floatElem, 0));
+          }
+        } else {
+          const cell = dt.allocDtype(elem, count);
+          if (count > 0) {
+            ll.check(ll.lib.zf_read_col_vla(t, readCode, col, BigInt(r + 1), BigInt(count), cell, got));
+          }
+          values.push(cell);
+        }
+      }
+      return { kind: "vla", dtype: elem, repeat: 1, values };
+    }
+
+    // ASCII-table columns: the TFORM letter does not encode width, so take
+    // the element dtype from the authoritative typecode. Scalar, never
+    // complex/VLA (handled above); scaled ints read as physical float64.
+    if (this._tableType === ll.ASCII_TBL) {
+      let elem = dt.zfToDtype(info.typecode);
+      if (dt.isIntegerDtype(elem) && (info.tscal !== 1 || info.tzero !== 0)) elem = "f8";
+      const flat = dt.allocDtype(elem, nrows);
+      if (nrows > 0) {
+        ll.check(ll.lib.zf_read_col(t, dt.zfCode(elem), col, 1n, BigInt(nrows), null, flat));
+      }
+      return { kind: "numeric", dtype: elem, repeat: 1, values: flat };
+    }
+
+    const { dtype: binElem, isComplex } = dt.binElemDtype(info.tformChar);
+    const repeat = Math.max(info.repeat, 0);
+    if (isComplex) {
+      const cdtype: dt.Dtype = binElem === "f4" ? "c8" : "c16";
+      // c8/c16 allocate a Float32Array/Float64Array (2 floats per element).
+      const flat = dt.allocDtype(cdtype, nrows * repeat) as Float32Array | Float64Array;
+      if (flat.length > 0) {
+        ll.check(ll.lib.zf_read_col(t, dt.zfCode(binElem), col, 1n, BigInt(nrows * repeat * 2), null, flat));
+      }
+      return { kind: "complex", dtype: cdtype, repeat, values: flat };
+    }
+
+    // Honor per-column scaling (TSCAL/TZERO): the unsigned convention widens
+    // to an unsigned dtype; any other non-trivial linear scaling reads as
+    // physical float64. The C layer applies the scaling; we only choose a
+    // destination dtype wide enough to hold it.
+    let elem = binElem;
+    if (dt.isIntegerDtype(elem)) {
+      const uns = info.tscal === 1 ? dt.unsignedColDtype(elem, info.tzero) : null;
+      if (uns !== null) elem = uns;
+      else if (info.tscal !== 1 || info.tzero !== 0) elem = "f8";
+    }
+    const flat = dt.allocDtype(elem, nrows * repeat);
+    if (flat.length > 0) {
+      ll.check(ll.lib.zf_read_col(t, dt.zfCode(elem), col, 1n, BigInt(nrows * repeat), null, flat));
+    }
+    return { kind: "numeric", dtype: elem, repeat, values: flat };
+  }
+
+  // ── writing ──
+
+  /**
+   * @internal (columns, nrows) to serialize: the builder columns for a
+   * detached HDU, or columns reconstructed from the live table for an
+   * attached one (so a copied table keeps its rows).
+   */
+  _emitColumns(): { cols: Column[]; nrows: number } {
+    if (this._columns.length > 0 || this._hdulist === null) {
+      return { cols: [...this._columns], nrows: this._nrows };
+    }
+    const data = this.data;
+    if (data === null) return { cols: [], nrows: 0 };
+    const h = this._select();
+    return withTable(h, (t) => {
+      const cols: Column[] = [];
+      for (let i = 0; i < data.names.length; i++) {
+        const info = readColInfo(t, i);
+        const fmt = this._tableType === ll.ASCII_TBL ? asciiTformOf(info) : tformOf(info);
+        cols.push(new Column(data.names[i], fmt, { array: data.get(data.names[i]) as ColumnArray }));
+      }
+      return { cols, nrows: data.nrows };
+    });
+  }
+
+  /** @internal */
+  _writeTo(handle: bigint, _primary: boolean): void {
+    const { cols, nrows } = this._emitColumns();
+    const n = cols.length;
+    const ttype = cols.map((c) => c.name);
+    const tform = cols.map((c) => c.format);
+    const tunit = cols.map((c) => c.unit);
+    const extname = this._name ?? null;
+    const pcount = vlaHeapBytes(cols);
+    if (pcount > 0) {
+      // Reserve heap up front so VLA cells can be written.
+      ll.check(
+        ll.lib.zf_create_tbl_heap(handle, this._tableType, BigInt(nrows), n, ttype, tform, tunit, extname, BigInt(pcount)),
+      );
+    } else {
+      ll.check(ll.lib.zf_create_tbl(handle, this._tableType, BigInt(nrows), n, ttype, tform, tunit, extname));
+    }
+
+    // Unsigned columns use the TZEROn convention; set it before opening the
+    // table view so the write path stores (value − TZERO) as a signed int.
+    for (let i = 0; i < cols.length; i++) {
+      const tz = unsignedColTzeroOf(cols[i]);
+      if (tz !== null) writeConventionOffset(handle, `TZERO${i + 1}`, tz);
+    }
+
+    withTable(handle, (t) => {
+      for (let i = 0; i < cols.length; i++) {
+        if (cols[i].array === null) continue;
+        writeColumn(t, i, cols[i], nrows);
+      }
+    });
+  }
+
+  static fromColumnsInto<H extends TableHDU<ColumnShape>>(hdu: H, columns: readonly Column[], options: FromColumnsOptions = {}): H {
+    hdu._columns = [...columns];
+    hdu._name = options.name ?? hdu._name;
+    const present = columns.filter((c) => c.array !== null).map((c) => colRowCount(c));
+    const distinct = [...new Set(present)];
+    if (distinct.length > 1) {
+      throw new RangeError(`columns have differing lengths [${distinct.sort((a, b) => a - b).join(", ")}]; all must match`);
+    }
+    const dataLen = present.length > 0 ? present[0] : 0;
+    let nrows = options.nrows;
+    if (nrows === undefined) nrows = dataLen;
+    else if (present.length > 0 && nrows !== dataLen) {
+      throw new RangeError(`nrows=${nrows} does not match the ${dataLen}-row column data`);
+    }
+    hdu._nrows = nrows;
+    return hdu;
+  }
+}
+
+/** @internal Write one column's cells into an open table view. */
+function writeColumn(t: bigint, i: number, col: Column, nrows: number): void {
+  const arr = col.array;
+  if (arr === null) return;
+  const fmt = col.format.trim().toUpperCase();
+  // Variable-length array column 'rP<t>(max)' / 'rQ<t>(max)'.
+  if (fmt.includes("P") || fmt.includes("Q")) {
+    writeVlaColumn(t, i, col, nrows);
+    return;
+  }
+  // Character column 'wA' or 'Aw'. Non-ASCII is not representable in a FITS string field.
+  if (fmt.includes("A")) {
+    const width = Math.max(parseInt(formatDigits(fmt) || "1", 10), 1);
+    const buf = new Uint8Array(Math.max(nrows * width, 1)).fill(0x20);
+    const rows = arr as readonly string[];
+    for (let r = 0; r < nrows; r++) {
+      const s = String(rows[r] ?? "");
+      for (let k = 0; k < Math.min(s.length, width); k++) {
+        const code = s.charCodeAt(k);
+        if (code > 127) throw new FitsTableError(310, `non-ASCII string in column ${col.name}: ${JSON.stringify(s)}`);
+        buf[r * width + k] = code;
+      }
+    }
+    ll.check(ll.lib.zf_write_col_str(t, i, 1n, BigInt(nrows), BigInt(width), BigInt(width), buf));
+    return;
+  }
+  const { dtype: elem, isComplex } = dt.binElemDtype(firstLetter(fmt));
+  if (isComplex) {
+    // Interleaved float pairs (2*nrows*repeat floats). The transfer code MUST
+    // describe the actual buffer: keep a float buffer's own width (the library
+    // converts to the column's disk type, mirroring Python's a.view(base));
+    // cast anything else to the column's element type.
+    let flat = isTypedArray(arr) ? arr : toTypedArray(arr as readonly (number | bigint)[], elem);
+    const own = dt.dtypeOf(flat);
+    if (own !== "f4" && own !== "f8") flat = castTypedArray(flat, elem);
+    ll.check(ll.lib.zf_write_col(t, dt.zfCode(dt.dtypeOf(flat)), i, 1n, BigInt(flat.length), null, flat));
+    return;
+  }
+  let flat: dt.TypedArray;
+  if (isTypedArray(arr)) {
+    flat = arr;
+  } else if (Array.isArray(arr) && arr.length > 0 && typeof arr[0] === "boolean") {
+    // A logical (L) column transfers as 0/1 bytes.
+    flat = Uint8Array.from(arr as boolean[], (b) => (b ? 1 : 0));
+  } else if (Array.isArray(arr) && arr.length > 0 && (isTypedArray(arr[0]) || Array.isArray(arr[0]))) {
+    // Rows-of-arrays for a vector column: flatten into the column's element type.
+    const cells = (arr as readonly (dt.TypedArray | readonly number[])[]).map((c) => castTypedArray(c, elem));
+    const total = cells.reduce((a, c) => a + c.length, 0);
+    flat = dt.allocDtype(elem, total);
+    let off = 0;
+    for (const cell of cells) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (flat as any).set(cell, off);
+      off += cell.length;
+    }
+  } else {
+    // Plain scalar array: exact (safe) integers → i8, everything else → f8 so
+    // the library's float→int conversion rounds and range-checks (a value like
+    // 1e20 raises FitsOverflowError instead of wrapping in a BigInt64Array).
+    const plain = arr as readonly (number | bigint)[];
+    const allInts = plain.every((v) => typeof v === "bigint" || (typeof v === "number" && Number.isSafeInteger(v)));
+    flat = toTypedArray(plain, allInts ? "i8" : "f8");
+  }
+  ll.check(ll.lib.zf_write_col(t, dt.zfCode(dt.dtypeOf(flat)), i, 1n, BigInt(flat.length), null, flat));
+}
+
+/** @internal */
+function writeVlaColumn(t: bigint, i: number, col: Column, nrows: number): void {
+  const { dtype: elem, isComplex } = vlaElemDtype(col.format.trim().toUpperCase());
+  if (isComplex) throw new NotSupportedError(410, "writing complex VLA columns is not supported");
+  const arr = col.array as readonly (dt.TypedArray | readonly number[])[];
+  for (let r = 0; r < nrows; r++) {
+    const cell = castTypedArray(arr[r], elem);
+    ll.check(ll.lib.zf_write_col_vla(t, dt.zfCode(elem), i, BigInt(r + 1), cell, BigInt(cell.length)));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Concrete table HDUs
+// ════════════════════════════════════════════════════════════════════════
+
+export class BinTableHDU<T extends ColumnShape = ColumnShape> extends TableHDU<T> {
+  override readonly kind = "bintable" as const;
+  readonly _tableType = ll.BINARY_TBL;
+
+  static fromColumns<T extends ColumnShape = ColumnShape>(
+    columns: readonly Column[],
+    options: FromColumnsOptions = {},
+  ): BinTableHDU<T> {
+    return TableHDU.fromColumnsInto(new BinTableHDU<T>(), columns, options);
+  }
+}
+
+export class AsciiTableHDU<T extends ColumnShape = ColumnShape> extends TableHDU<T> {
+  override readonly kind = "asciitable" as const;
+  readonly _tableType = ll.ASCII_TBL;
+
+  static fromColumns<T extends ColumnShape = ColumnShape>(
+    columns: readonly Column[],
+    options: FromColumnsOptions = {},
+  ): AsciiTableHDU<T> {
+    return TableHDU.fromColumnsInto(new AsciiTableHDU<T>(), columns, options);
+  }
+}
+
+export type { HDUOptions };

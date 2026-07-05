@@ -408,7 +408,7 @@ application needing to consume or produce FITS data without linking a C library.
 
 ### 7.1 Out of Scope (initial)
 
-- `@cImport` usage or bundling CFITSIO C source (the library stays pure Zig, `GC-1`/`GC-2`). A CFITSIO **drop-in** shim exporting `fits_*`/`ff*` symbols remains out of scope. *(Update: a purpose-built `zf_*` C ABI for language bindings — distinct from a CFITSIO drop-in — now ships under `bindings/`, with Python bindings on top; it imports the public module and adds no C to `src/`.)*
+- `@cImport` usage or bundling CFITSIO C source (the library stays pure Zig, `GC-1`/`GC-2`). A CFITSIO **drop-in** shim exporting `fits_*`/`ff*` symbols remains out of scope. *(Update: a purpose-built `zf_*` C ABI for language bindings — distinct from a CFITSIO drop-in — now ships under `bindings/`, with Python and TypeScript bindings on top; it imports the public module and adds no C to `src/`.)*
 - GUI/visualization, image display, and plotting.
 - Non-FITS input formats that CFITSIO can ingest (e.g. IRAF `.imh/.pix`, raw/foreign-file encapsulation) — candidate for a much later, optional add-on.
 - The full CFITSIO row-filter expression calculator is **MAY**-only (FR-EFN-3); a complete expression engine is not committed.

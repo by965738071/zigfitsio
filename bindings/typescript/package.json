@@ -1,0 +1,55 @@
+{
+  "name": "zigfitsio",
+  "version": "0.1.1",
+  "description": "TypeScript/JavaScript bindings for zigfitsio — a pure-Zig FITS 4.0 I/O library (Bun + Node)",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anhydrous99/zigfitsio.git",
+    "directory": "bindings/typescript"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./lowlevel": {
+      "types": "./dist/lowlevel/index.d.ts",
+      "default": "./dist/lowlevel/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "fits",
+    "astronomy",
+    "astrophysics",
+    "zig",
+    "ffi",
+    "bun"
+  ],
+  "dependencies": {
+    "koffi": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:native": "node scripts/build-native.mjs",
+    "test": "bun test tests",
+    "test:node": "vitest run",
+    "typecheck:tests": "tsc -p tsconfig.test.json",
+    "check-versions": "node scripts/check-versions.mjs",
+    "prepack": "node scripts/prepack.mjs"
+  }
+}
