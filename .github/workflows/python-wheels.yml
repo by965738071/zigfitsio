@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "master"
 
 jobs:
   # Release gate: the version literal lives in four places (build.zig.zon, src/version.zig
@@ -104,7 +104,14 @@ jobs:
       matrix:
         # macos-15-intel: GitHub's last x86_64 macOS image (macos-13 retired 2025-12-04);
         # sunsets August 2027, at which point Intel wheels need a new build strategy.
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+        os:
+          [
+            ubuntu-latest,
+            ubuntu-24.04-arm,
+            macos-latest,
+            macos-15-intel,
+            windows-latest,
+          ]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
