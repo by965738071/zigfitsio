@@ -6,6 +6,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.2] - 2026-07-05
+
 ### Added
 - **TypeScript/JavaScript bindings** (`bindings/typescript/`, npm package `zigfitsio`):
   full parity with the Python bindings over the same `zf_*` C ABI, mirroring the two-layer
@@ -21,7 +25,7 @@ All notable changes to `zigfitsio` are documented here. The format follows
   memory (`src/ffi/wasm.ts`); on **Node/Bun** the module loads synchronously at import
   (classic no-`await` API), while **browsers** call `await ready()` once. File I/O is a
   JS-side convenience over the in-memory ABI (path-based on Node/Bun; `fromBytes`/`toBytes`
-  in the browser). 178 tests mirror the pytest suites (incl. the golden corpus) on both
+  in the browser). 149 tests mirror the pytest suites (incl. the golden corpus) on both
   runtimes, plus a TS↔Python interop cross-check; published via npm trusted publishing in
   `.github/workflows/typescript.yml`.
 - **TypeScript bindings — TS-native ergonomic layer** over the same astropy-shaped classes,

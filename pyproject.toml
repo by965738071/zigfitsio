@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zigfitsio"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python bindings for zigfitsio — a pure-Zig FITS 4.0 I/O library"
 readme = "bindings/python/README.md"
 requires-python = ">=3.10"
