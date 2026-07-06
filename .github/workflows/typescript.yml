@@ -66,8 +66,31 @@ jobs:
             exit 1
           fi
 
+  # `zig build wasm` is hard-coded ReleaseSmall and byte-identical on every host, so build the
+  # module once and share it via artifact instead of installing Zig and compiling in all six
+  # test cells — that matrix exercises the JS layer + host engines, not the wasm bytes.
+  build-wasm:
+    name: build wasm (shared)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build wasm
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zigfitsio-wasm
+          path: zig-out/bin/zigfitsio.wasm
+          # Fail here if the build output moved, not later as a confusing loader error.
+          if-no-files-found: error
+          # v4 artifacts are immutable within a run; without this, "Re-run all jobs" dies on
+          # the name conflict (same reason as the wheels artifacts in python-wheels.yml).
+          overwrite: true
+
   test:
     name: test ${{ matrix.os }} (node ${{ matrix.node }})
+    needs: build-wasm # every cell consumes the one shared wasm artifact
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -83,11 +106,13 @@ jobs:
             node: "20"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      # Shared wasm from build-wasm, landed at the loader's dev-fallback path
+      # (<repo>/zig-out/bin/zigfitsio.wasm) so tests exercise the same lookup as a local
+      # `zig build wasm`. No Zig toolchain is present in these cells.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: Build the wasm module
-        run: zig build wasm
+          name: zigfitsio-wasm
+          path: zig-out/bin
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: ${{ matrix.node }}

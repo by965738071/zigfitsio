@@ -111,6 +111,17 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
+      # PRs build a single CPython per OS (cp312, matching the smoke job) — the bindings are
+      # pure ctypes so the per-interpreter wheels differ only in tag, and this lane is the only
+      # ReleaseFast coverage in CI, so at least one wheel build+test per OS must stay. Main
+      # pushes, tags, and dispatch runs skip this step, leaving CIBW_BUILD unset so the full
+      # [tool.cibuildwheel].build matrix from pyproject.toml applies (env vars override the
+      # config file only when defined). Do NOT refactor to an always-set env var with an empty
+      # else-arm: cibuildwheel treats CIBW_BUILD="" as "*" (build everything).
+      - name: Restrict PR builds to CPython 3.12
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo 'CIBW_BUILD=cp312-*' >> "$GITHUB_ENV"
       - name: Build wheels
         uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
         env:
