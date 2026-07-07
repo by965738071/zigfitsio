@@ -8,7 +8,7 @@
 import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
-import { BaseHDU, writeConventionOffset, type HDUOptions } from "./hdu.js";
+import { BaseHDU, writeConventionOffset, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
 import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
@@ -716,6 +716,12 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       const tz = unsignedColTzeroOf(cols[i]);
       if (tz !== null) writeConventionOffset(handle, `TZERO${i + 1}`, tz);
     }
+
+    // Re-emit the user header cards (science keywords, COMMENT/HISTORY, HIERARCH)
+    // that zf_create_tbl does not carry, skipping the column descriptors it
+    // already wrote — mirroring ImageHDU._writeTo so a reconstruction save does
+    // not silently drop table metadata.
+    this._applyUserKeys(handle, isTableStructuralKeyword);
 
     withTable(handle, (t) => {
       for (let i = 0; i < cols.length; i++) {

@@ -703,3 +703,137 @@ describe("misc parity", () => {
     }
   });
 });
+
+// BUGHUNT-2026-07-06 CRIT #1 (table) and HIGH #7 (compressed image): the
+// reconstruction write path rebuilt the HDU via the C ABI but never re-emitted
+// the user's non-structural header cards, so every writeTo/toBytes silently
+// erased scientific metadata while the data survived. Mirrors the image path,
+// which has always called _applyUserKeys.
+describe("user header keywords survive reconstruction (table + compressed image)", () => {
+  const dup = (h: zf.Header, kw: string): number => h.keys().filter((k) => k === kw).length;
+
+  test("#1 detached table: user keyword + COMMENT + HISTORY survive writeTo", () => {
+    const idx = Int32Array.from([10, 20, 30]);
+    const hdu = zf.BinTableHDU.fromColumns([new zf.Column("INDEX", "J", { array: idx })], { name: "EVENTS" });
+    hdu.header.set("OBSERVER", "Hubble", "who");
+    hdu.header.set("COMMENT", "provenance note");
+    hdu.header.set("HISTORY", "reduced with pipeline");
+    const p = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU(), hdu]).writeTo(p);
+    const hdul = zf.open(p);
+    try {
+      const h = hdul.get(1).header;
+      expect(h.get("OBSERVER")).toBe("Hubble");
+      expect(h.commentOf("OBSERVER")).toBe("who");
+      expect(h.comments).toContain("provenance note");
+      expect(h.history).toContain("reduced with pipeline");
+      // Data still round-trips, and the structural cards zf_create_tbl emits are
+      // not duplicated by the re-applied user header.
+      expect(asNums((hdul.get(1).data as zf.TableData).get("INDEX") as Int32Array)).toEqual([10, 20, 30]);
+      expect(dup(h, "EXTNAME")).toBe(1);
+      expect(dup(h, "TFORM1")).toBe(1);
+      expect(dup(h, "TTYPE1")).toBe(1);
+    } finally {
+      hdul.close();
+    }
+  });
+
+  test("#1 attached table: checksum:true on an untouched file reconstructs without dropping keys", () => {
+    // Fixture: a plain table (the columns/EXTNAME path was never broken), then
+    // add OBSERVER in update mode — an in-place write independent of the
+    // reconstruction path, so the source provably carries the keyword.
+    const src = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU(), zf.BinTableHDU.fromColumns([new zf.Column("INDEX", "J", { array: Int32Array.from([1, 2, 3]) })], { name: "EVENTS" })]).writeTo(src);
+    {
+      const up = zf.open(src, "update");
+      up.get(1).header.set("OBSERVER", "Kepler", "who");
+      up.close();
+    }
+    const out = tmp.path();
+    const ro = zf.open(src); // read-only, untouched
+    try {
+      expect(ro.get(1).header.get("OBSERVER")).toBe("Kepler"); // sanity: fixture carries it
+      ro.writeTo(out, { checksum: true, overwrite: true }); // checksum bypasses the pristine fast path
+    } finally {
+      ro.close();
+    }
+    const chk = zf.open(out);
+    try {
+      expect(chk.get(1).header.get("OBSERVER")).toBe("Kepler");
+      expect(chk.get(1).header.commentOf("OBSERVER")).toBe("who");
+      expect(dup(chk.get(1).header, "EXTNAME")).toBe(1);
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("#7 attached compressed image: a header edit reconstructs, keeps EXTNAME, and does not duplicate Z* cards", () => {
+    const ramp = new zf.FitsArray(fill(new Int32Array(256), (i) => i), [16, 16]);
+    const src = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU(), new zf.CompImageHDU({ data: ramp, compression: "RICE_1", name: "COMP" })]).writeTo(src);
+    const out = tmp.path();
+    const hl = zf.open(src);
+    hl.get(1).header.set("MYKEY", 7); // read-only edit → dirty → reconstruction
+    hl.writeTo(out, { overwrite: true });
+    hl.close();
+    const chk = zf.open(out);
+    try {
+      const h = chk.get(1).header;
+      expect(h.get("MYKEY")).toBe(7); // the edit survives reconstruction
+      expect(chk.get(1).name).toBe("COMP"); // EXTNAME preserved (no manual block needed)
+      expect(dup(h, "ZCMPTYPE")).toBe(1); // the ZIMAGE-convention cards are not re-emitted
+      const got = chk.get(1).data as zf.FitsArray; // still a decompressable image
+      expect(got.shape).toEqual([16, 16]);
+      expect(asNums(got.data)).toEqual(asNums(ramp.data));
+    } finally {
+      chk.close();
+    }
+  });
+
+  test("#7 detached compressed image: a header keyword survives writeTo", () => {
+    const ramp = new zf.FitsArray(fill(new Int32Array(256), (i) => i), [16, 16]);
+    const hdr = new zf.Header();
+    hdr.set("BUNIT", "adu", "brightness unit");
+    const p = tmp.path();
+    new zf.HDUList([new zf.PrimaryHDU(), new zf.CompImageHDU({ data: ramp, compression: "RICE_1", header: hdr, name: "COMP" })]).writeTo(p);
+    const hdul = zf.open(p);
+    try {
+      const h = hdul.get(1).header;
+      expect(h.get("BUNIT")).toBe("adu");
+      expect(h.commentOf("BUNIT")).toBe("brightness unit");
+      expect(hdul.get(1).name).toBe("COMP");
+      expect(dup(h, "ZCMPTYPE")).toBe(1);
+    } finally {
+      hdul.close();
+    }
+  });
+
+  test("stale CHECKSUM/DATASUM are dropped on checksum:false reconstruction (verify stays clean)", () => {
+    // A checksummed table file; an unrelated header edit then forces the
+    // reconstruction path with checksum:false (the default). The source's
+    // per-HDU CHECKSUM/DATASUM describe the original bytes and must not be
+    // carried forward — a copied one no longer verifies.
+    const src = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      zf.BinTableHDU.fromColumns([new zf.Column("INDEX", "J", { array: Int32Array.from([1, 2, 3]) })], { name: "EVENTS" }),
+    ]).writeTo(src, { checksum: true });
+    expect(zf.verify(src).filter((f) => f.severity === "error")).toEqual([]); // sanity: source is clean
+
+    const out = tmp.path();
+    const hl = zf.open(src);
+    hl.get(1).header.set("OBSERVER", "Rubin"); // edit → dirty → reconstruction
+    hl.writeTo(out, { overwrite: true }); // checksum:false (default)
+    hl.close();
+
+    const chk = zf.open(out);
+    try {
+      expect(chk.get(1).header.keys()).not.toContain("CHECKSUM"); // stale card not copied
+      expect(chk.get(1).header.keys()).not.toContain("DATASUM");
+      expect(chk.get(1).header.get("OBSERVER")).toBe("Rubin"); // the edit still survives
+    } finally {
+      chk.close();
+    }
+    expect(zf.verify(out).filter((f) => f.severity === "error")).toEqual([]); // no invalid-checksum error
+  });
+});
