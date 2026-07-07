@@ -244,12 +244,25 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   write back changed cell values of ordinary (fixed-width, unscaled) columns. Changing the row
   count, or editing a variable-length-array (`P`/`Q`) or `TSCAL`/`TZERO`-scaled column in place,
   raises `NotImplementedError` — use `writeto()` to a new file (which reconstructs) for those.
+- **Python & TypeScript: HDUList structural edits (insert/delete/reorder) persist on `flush()`/`close()`**
+  (2026-07-07, BUGHUNT-2026-07-06 items 4+8 — previously they were silently dropped). The reconcile
+  appends first and deletes the displaced originals after, so a mid-append failure rolls the file
+  back byte-identically and a (raw-I/O) delete-phase failure can only leave duplicate — never
+  missing — HDUs. Shifted HDUs of the same file travel as **exact byte copies** (`zf_copy_hdu`):
+  user keywords, VLA heaps, compression bytes, and checksums survive verbatim. Documented
+  boundaries, each fail-loud: the **primary HDU must remain first** (`insert(0, …)`, `del h[0]`,
+  `reverse()` raise `NotImplementedError` — use `writeto()`); the **same HDU object may not occupy
+  two positions** (`ValueError` — insert a copy instead); an HDU adopted from *another* HDUList is
+  re-serialized through the reconstruct path, which does not yet preserve a table's user keywords
+  (pre-existing `_emit` limitation, tracked in `BUGHUNT-2026-07-06.md`). One undetected aliasing
+  edge (same as astropy): a single `Header` object shared between two different HDUs — the
+  last-flushed HDU wins the header's live-persist hook; give each HDU its own `Header`.
 - **Python: `append` and structural table edits go through the file, not a scratch copy.** Appending
-  an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`; there is no
-  transactional rollback of a partial in-place structural edit if the device write fails midway
-  (the same is true at the Zig layer — see the append/copy rollback that *is* implemented, versus
-  the header-rewrite path which validates-before-mutating but does not un-shift relocated bytes on a
-  mid-write I/O error).
+  an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`. The HDU-level
+  reconcile above rolls back its append phase on failure; there is still no transactional rollback of
+  a partial in-place structural *table* edit if the device write fails midway (the same is true at
+  the Zig layer — see the append/copy rollback that *is* implemented, versus the header-rewrite path
+  which validates-before-mutating but does not un-shift relocated bytes on a mid-write I/O error).
 - **Header `update()`/`modify()` do not support HIERARCH long-keyword cards.** Reading a HIERARCH
   card by its hierarchical name is correct (`get`/`has`/`comment`/`getValue`/`getHierarch`), but the
   *write* helpers build a fixed-format 8-char card (`Card.buildValue`) and cannot construct a

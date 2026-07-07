@@ -742,6 +742,10 @@ pub const Fits = struct {
     pub fn copyHdu(self: *Fits, src_n: usize) FitsError!*Hdu {
         if (self.mode == .read_only or !self.dev.isWritable()) return error.NotWritable;
         try self.ensureScannedAll();
+        // Same trailing-special-records guard as appendHdu: the copy is written at `scan_off`,
+        // and a device extending past it means §3.5 special records live there — the copy would
+        // silently clobber them. Refuse before any device mutation.
+        if (try self.dev.getSize() > self.scan_off) return error.WrongHduType;
         if (src_n == 0 or src_n > self.hdus.items.len) return error.WrongHduType;
         // The duplicate is appended as an extension (it follows the existing primary), so it must
         // carry XTENSION — copying the primary (which carries SIMPLE) can never parse as a valid
@@ -1385,6 +1389,25 @@ test "appendHdu refuses a file with trailing special records" {
     try testing.expectEqual(@as(usize, 1), try f2.hduCount()); // special records not counted
     // Appending would clobber the special-records region, so it is refused with a typed error.
     try testing.expectError(error.WrongHduType, f2.appendImageHdu(.{ .bitpix = 8, .axes = &.{4} }));
+    try testing.expectEqual(eof + block.BLOCK, try f2.dev.getSize()); // region left untouched
+}
+
+test "copyHdu refuses a file with trailing special records" {
+    var b = try newHandle(testing.allocator);
+    defer b.deinit(testing.allocator);
+    const f = &b.f;
+    _ = try f.appendImageHdu(.{ .bitpix = 8, .axes = &.{} });
+    _ = try f.appendImageHdu(.{ .bitpix = 16, .axes = &.{ 4, 3 } });
+    try f.flush();
+    const eof = try f.dev.getSize();
+    try writeSpecialRecords(f.dev, eof);
+
+    var f2 = try Fits.open(testing.allocator, b.mem.device(), .read_write, .{});
+    defer f2.deinit();
+    try testing.expectEqual(@as(usize, 2), try f2.hduCount()); // special records not counted
+    // The copy would land on the special-records region (dest = scan_off), so it is refused with
+    // the same typed error appendHdu uses, before any device mutation.
+    try testing.expectError(error.WrongHduType, f2.copyHdu(2));
     try testing.expectEqual(eof + block.BLOCK, try f2.dev.getSize()); // region left untouched
 }
 

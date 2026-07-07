@@ -534,6 +534,11 @@ export class ImageHDU extends BaseHDU {
   // ── writing ──
   /** @internal */
   _writeTo(handle: bigint, _primary: boolean): void {
+    // Materialize the header BEFORE creating the destination HDU: a lazy header
+    // read _select()s the source HDU, and when an attached HDU is serialized to
+    // its OWN handle that would snap the current HDU back to the source
+    // mid-write, landing the user keys in the source's header instead.
+    void this.header;
     const data = this.data; // lazily materialize attached pixels so a copied HDU keeps its data
     if (data === null) {
       ll.check(ll.lib.zf_create_img(handle, 8, 0, null));

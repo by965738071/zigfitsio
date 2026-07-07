@@ -837,3 +837,305 @@ describe("user header keywords survive reconstruction (table + compressed image)
     expect(zf.verify(out).filter((f) => f.severity === "error")).toEqual([]); // no invalid-checksum error
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2026-07-07: BUGHUNT-2026-07-06 item 4 (TS sibling) — flush()/close() must
+// persist structural HDUList mutations (insert/delete/reorder), not just pure
+// appends. Shifted attached HDUs travel as exact byte copies (zf_copy_hdu) so
+// keywords/VLA heaps/compression bytes survive verbatim. Mirrors the Python
+// structural-flush section of test_bugfixes.py.
+// ════════════════════════════════════════════════════════════════════════════
+describe("structural flush reconcile (insert/delete/reorder persist)", () => {
+  const threeHduFile = (): string => {
+    const p = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU({ data: fill(new Int16Array(4), (i) => i) }),
+      new zf.ImageHDU({ data: fill(new Int16Array(6), (i) => i), name: "A" }),
+      new zf.ImageHDU({ data: fill(new Int32Array(8), (i) => i), name: "B" }),
+    ]).writeTo(p);
+    return p;
+  };
+  const names = (hl: zf.HDUList): string[] => [...hl].map((h) => h.name);
+  const withOpen = <T>(p: string, fn: (hl: zf.HDUList) => T): T => {
+    const hl = zf.open(p);
+    try {
+      return fn(hl);
+    } finally {
+      hl.close();
+    }
+  };
+
+  test("insert persists on close", () => {
+    const p = threeHduFile();
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: fill(new Float32Array(3), (i) => i), name: "NEW" }));
+    hl.close();
+    withOpen(p, (chk) => {
+      expect(names(chk)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+      expect(asNums((chk.get("NEW").data as zf.FitsArray).data)).toEqual([0, 1, 2]);
+      expect(asNums((chk.get("A").data as zf.FitsArray).data)).toEqual([0, 1, 2, 3, 4, 5]);
+      expect(asNums((chk.get("B").data as zf.FitsArray).data)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    });
+  });
+
+  test("delete persists on close", () => {
+    const p = threeHduFile();
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 1);
+    hl.close();
+    withOpen(p, (chk) => {
+      expect(names(chk)).toEqual(["PRIMARY", "B"]);
+      expect(asNums((chk.get("B").data as zf.FitsArray).data)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    });
+  });
+
+  test("deleting the last HDU only truncates (head bytes untouched)", () => {
+    const p = threeHduFile();
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.hdus.pop();
+    hl.close();
+    const after = readFileSync(p);
+    expect(after.length).toBeLessThan(before.length);
+    expect(before.subarray(0, after.length).equals(after)).toBe(true);
+    withOpen(p, (chk) => expect(names(chk)).toEqual(["PRIMARY", "A"]));
+  });
+
+  test("reorder persists on close", () => {
+    const p = threeHduFile();
+    const hl = zf.open(p, "update");
+    [hl.hdus[1], hl.hdus[2]] = [hl.hdus[2], hl.hdus[1]];
+    hl.close();
+    withOpen(p, (chk) => {
+      expect(names(chk)).toEqual(["PRIMARY", "B", "A"]);
+      expect(asNums((chk.get(1).data as zf.FitsArray).data)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    });
+  });
+
+  test("shifted table keeps user keywords, TSCAL, and VLA heap (byte-copy route)", () => {
+    // The reconstruct route would drop the keywords and raise on the scaled
+    // column — this proves the exact-byte-copy route is taken for shifted HDUs.
+    const p = tmp.path();
+    const cols = [
+      new zf.Column("A", "1J", { array: Int32Array.from([1, 2, 3]) }),
+      new zf.Column("V", "1PJ", { array: [Int32Array.from([1]), Int32Array.from([2, 3]), new Int32Array(0)] }),
+    ];
+    new zf.HDUList([new zf.PrimaryHDU(), zf.BinTableHDU.fromColumns(cols, { name: "T" })]).writeTo(p);
+    let hl = zf.open(p, "update");
+    hl.get(1).header.set("OBSNOTE", "keepme");
+    hl.get(1).header.set("TSCAL1", 2.5); // makes the column unreconstructable via _writeTo
+    hl.close();
+    hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: new Int16Array(2), name: "NEW" }));
+    hl.close();
+    withOpen(p, (chk) => {
+      expect(names(chk)).toEqual(["PRIMARY", "NEW", "T"]);
+      expect(chk.get(2).header.get("OBSNOTE")).toBe("keepme");
+      expect(Number(chk.get(2).header.get("TSCAL1"))).toBe(2.5);
+      const v = (chk.get(2).data as zf.TableData).get("V") as ArrayLike<unknown>[];
+      expect(asNums(v[1] as Int32Array)).toEqual([2, 3]);
+    });
+  });
+
+  test("shifted quantized CompImage bytes survive exactly (no requantization)", () => {
+    const p = tmp.path();
+    const data = new zf.FitsArray(fill(new Float32Array(64), (i) => i * 1.37 + 0.1), [8, 8]);
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      new zf.CompImageHDU({ data, compression: "RICE_1", quantize: "SUBTRACTIVE_DITHER_1" }),
+    ]).writeTo(p);
+    const before = readFileSync(p);
+    const compBlock = before.subarray(2880); // empty primary is exactly one block
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: new Int16Array(2), name: "NEW" }));
+    hl.close();
+    const after = readFileSync(p);
+    expect(after.subarray(after.length - compBlock.length).equals(compBlock)).toBe(true);
+    withOpen(p, (chk) => {
+      expect(chk.length).toBe(3); // ...and the insert really landed
+      expect(chk.get(1).name).toBe("NEW");
+      expect((chk.get(2).data as zf.FitsArray).shape).toEqual([8, 8]); // shifted comp still decodes
+    });
+  });
+
+  test("header + in-place data edits on a shifted HDU both persist", () => {
+    const p = threeHduFile();
+    const hl = zf.open(p, "update");
+    hl.get("A").header.set("NEWKEY", 5);
+    ((hl.get("A").data as zf.FitsArray).data as Int16Array)[0] = 42;
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: new Int16Array(2), name: "NEW" }));
+    hl.close();
+    withOpen(p, (chk) => {
+      expect(names(chk)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+      expect(chk.get("A").header.get("NEWKEY")).toBe(5);
+      expect((chk.get("A").data as zf.FitsArray).data[0]).toBe(42);
+    });
+  });
+
+  test("foreign HDU (attached to another open file) persists on flush", () => {
+    const p1 = threeHduFile();
+    const p2 = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      new zf.ImageHDU({ data: fill(new Int32Array(5), (i) => i), name: "DONOR" }),
+    ]).writeTo(p2);
+    const other = zf.open(p2);
+    const hl = zf.open(p1, "update");
+    try {
+      hl.append(other.get(1));
+      hl.close();
+    } finally {
+      other.close();
+    }
+    withOpen(p1, (chk) => {
+      expect(chk.get(3).name).toBe("DONOR");
+      expect(asNums((chk.get(3).data as zf.FitsArray).data)).toEqual([0, 1, 2, 3, 4]);
+    });
+  });
+
+  test("mid-append failure restores the file; corrected retry flushes cleanly", () => {
+    // Complex VLA columns are unwritable — the failure fires AFTER zf_create_tbl,
+    // so the count-driven rollback must remove the partially-built HDU.
+    const p = threeHduFile();
+    const before = readFileSync(p);
+    const bad = zf.BinTableHDU.fromColumns(
+      [new zf.Column("C", "1PC", { array: [Float32Array.from([1, 2])] })],
+      { name: "BAD" },
+    );
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, bad);
+    expect(() => hl.flush()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true); // partial tail rolled back
+    hl.hdus[1] = new zf.ImageHDU({ data: fill(new Int16Array(3), (i) => i), name: "GOOD" });
+    hl.close();
+    withOpen(p, (chk) => expect(names(chk)).toEqual(["PRIMARY", "GOOD", "A", "B"]));
+  });
+
+  const primaryMutations: [string, (hl: zf.HDUList) => void][] = [
+    ["insert at 0", (hl) => hl.hdus.splice(0, 0, new zf.PrimaryHDU({ data: new Int16Array(2) }))],
+    ["delete primary", (hl) => hl.hdus.splice(0, 1)],
+    ["reverse", (hl) => void hl.hdus.reverse()],
+  ];
+  for (const [label, mutate] of primaryMutations) {
+    test(`primary-slot change fails loud, file intact: ${label}`, () => {
+      const p = threeHduFile();
+      const before = readFileSync(p);
+      const hl = zf.open(p, "update");
+      mutate(hl);
+      expect(() => hl.close()).toThrow(zf.NotSupportedError);
+      expect(readFileSync(p).equals(before)).toBe(true);
+    });
+  }
+
+  test("aliased HDU object (same object at two positions) fails loud", () => {
+    const p = threeHduFile();
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.append(hl.get(1));
+    expect(() => hl.close()).toThrow(zf.FitsTypeError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+  });
+
+  test("compressed HDU with replaced data + structural change raises BEFORE restructuring", () => {
+    const p = tmp.path();
+    const img = new zf.FitsArray(fill(new Int16Array(16), (i) => i), [4, 4]);
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      new zf.CompImageHDU({ data: img, compression: "RICE_1" }),
+      new zf.ImageHDU({ data: new Int16Array(2), name: "A" }),
+    ]).writeTo(p);
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    const doubled = (hl.get(1).data as zf.FitsArray).clone();
+    (doubled.data as Int16Array).forEach((v, i) => ((doubled.data as Int16Array)[i] = v * 2));
+    (hl.get(1) as zf.CompImageHDU).data = doubled;
+    hl.hdus.splice(2, 1);
+    expect(() => hl.close()).toThrow(zf.NotSupportedError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+  });
+
+  test("double flush is idempotent (second takes the no-op fast path)", () => {
+    // The wasm handle's device is in RAM (the disk file is only written back on
+    // close), so idempotence is asserted on the handle's own bytes.
+    const p = threeHduFile();
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: fill(new Float32Array(3), (i) => i), name: "NEW" }));
+    hl.flush();
+    const first = Buffer.from(hl._sourceBytes());
+    const parsed = zf.fromBytes(first);
+    try {
+      expect(names(parsed)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    } finally {
+      parsed.close();
+    }
+    hl.flush();
+    expect(Buffer.from(hl._sourceBytes()).equals(first)).toBe(true);
+    hl.close();
+    expect(readFileSync(p).equals(first)).toBe(true); // close() wrote exactly those bytes back
+  });
+
+  test("fromBytes update-mode reconcile makes the handle pristine again", () => {
+    const p = threeHduFile();
+    const hl = zf.fromBytes(readFileSync(p), "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: fill(new Int16Array(3), (i) => i), name: "NEW" }));
+    hl.flush();
+    expect(hl._isPristineAttached()).toBe(true); // handle bytes now match the list
+    const out = hl.toBytes(); // ...so this is the verbatim byte-copy path
+    hl.close();
+    const parsed = zf.fromBytes(out);
+    try {
+      expect(names(parsed)).toEqual(["PRIMARY", "NEW", "A", "B"]);
+    } finally {
+      parsed.close();
+    }
+  });
+
+  test("foreign checksummed HDU drops stale CHECKSUM on flush (reconstruct route)", () => {
+    // Review follow-up (PR #29): a foreign HDU serialized through the reconstruct
+    // path must not carry its source file's CHECKSUM/DATASUM — those describe the
+    // ORIGINAL bytes and would no longer verify. (Byte-copied shifted HDUs keep
+    // theirs, which stay valid.)
+    const p1 = threeHduFile();
+    const p2 = tmp.path();
+    new zf.HDUList([
+      new zf.PrimaryHDU(),
+      new zf.ImageHDU({ data: fill(new Int32Array(5), (i) => i), name: "D" }),
+    ]).writeTo(p2, { checksum: true });
+    const other = zf.open(p2);
+    const hl = zf.open(p1, "update");
+    try {
+      expect(other.get(1).header.get("CHECKSUM")).toBeDefined(); // donor really is checksummed
+      hl.append(other.get(1));
+      hl.close();
+    } finally {
+      other.close();
+    }
+    withOpen(p1, (chk) => {
+      expect(chk.get(3).header.get("CHECKSUM")).toBeUndefined(); // stale card dropped, not copied
+      expect(chk.get(3).header.get("DATASUM")).toBeUndefined();
+    });
+    expect(zf.verify(p1).filter((f) => f.severity === "error")).toEqual([]);
+  });
+
+  test("non-HDU at the primary slot raises FitsTypeError, not the primary-first error", () => {
+    const p = threeHduFile();
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.hdus[0] = "not an hdu" as unknown as zf.PrimaryHDU;
+    expect(() => hl.close()).toThrow(zf.FitsTypeError);
+    expect(readFileSync(p).equals(before)).toBe(true);
+  });
+
+  test("writeTo of an unflushed structural list leaves the source intact", () => {
+    const p = threeHduFile();
+    const out = tmp.path();
+    const before = readFileSync(p);
+    const hl = zf.open(p, "update");
+    hl.hdus.splice(1, 0, new zf.ImageHDU({ data: fill(new Int16Array(3), (i) => i), name: "NEW" }));
+    hl.writeTo(out, { overwrite: true });
+    expect(readFileSync(p).equals(before)).toBe(true); // source untouched so far
+    hl.close(); // now the structural change lands
+    withOpen(out, (chk) => expect(names(chk)).toEqual(["PRIMARY", "NEW", "A", "B"]));
+    withOpen(p, (chk) => expect(names(chk)).toEqual(["PRIMARY", "NEW", "A", "B"]));
+  });
+});

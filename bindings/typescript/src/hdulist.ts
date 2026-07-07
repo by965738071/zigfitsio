@@ -7,7 +7,7 @@ import { existsSync, renameSync, rmSync, writeFile } from "./fsbridge.js";
 import { FitsIOError, FitsTypeError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import { BaseHDU, CompImageHDU, ImageHDU, PrimaryHDU } from "./hdu.js";
-import { AsciiTableHDU, BinTableHDU, TableHDU } from "./table.js";
+import { AsciiTableHDU, BinTableHDU, TableHDU, colFp } from "./table.js";
 import type { ColumnShape } from "./table.js";
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import { NotSupportedError } from "./errors.js";
@@ -158,22 +158,10 @@ export class HDUList implements Iterable<AnyHDU> {
   flush(): void {
     if (this._handle === null) return;
     if (this._mode !== ll.READONLY) {
-      // 1) Serialize any newly-appended (detached) HDUs to the open file, in
-      //    order — so an open+append+close (or +flush) actually writes them.
-      for (let i = this._scannedCount; i < this.hdus.length; i++) {
-        const hdu = this.hdus[i];
-        if (hdu._hdulist === null) {
-          hdu._writeTo(this._handle, i === 0);
-          hdu._hdulist = this;
-          hdu._index = i + 1;
-          if (hdu instanceof ImageHDU && hdu._data !== null) {
-            // Baseline so the next flush (and pristine check) treats the
-            // just-appended pixels as unchanged rather than re-writing them.
-            hdu._dataFingerprint = fnv1a64(viewBytes(hdu._data.data));
-          }
-        }
-      }
-      if (this.hdus.length > this._scannedCount) this._scannedCount = this.hdus.length;
+      // 1) Reconcile the file's HDU layout with the in-memory list — appends,
+      //    inserts, deletions, and reorders — so an open+edit+close persists
+      //    structure, not just writeTo().
+      this._reconcile();
       // 2) Write back in-place edits to attached image/table data.
       for (const hdu of this.hdus) {
         if (hdu._hdulist !== this) continue;
@@ -193,6 +181,144 @@ export class HDUList implements Iterable<AnyHDU> {
     ll.check(ll.lib.zf_flush(this._handle));
   }
 
+  /** @internal Whether list position `i` still holds the HDU attached to this file's slot `i + 1`. */
+  private _attachedAt(hdu: AnyHDU, i: number): boolean {
+    return hdu instanceof BaseHDU && hdu._hdulist === this && hdu._index === i + 1;
+  }
+
+  private _hduCount(): number {
+    const count = ll.newLongArray(1);
+    ll.check(ll.lib.zf_hdu_count(this._handle as bigint, count));
+    return ll.readLongAt(count, 0);
+  }
+
+  /**
+   * @internal Make the open file's HDU layout match the in-memory list
+   * (update/append mode): persist appends, inserts, deletions, and reorders.
+   * A shifted-but-attached HDU is byte-copied (zf_copy_hdu) so its user
+   * keywords, VLA heap, compression bytes, and checksums survive exactly; a
+   * detached or foreign HDU is serialized via _writeTo. The order is
+   * load-bearing: copies are APPENDED first (while the source indices are
+   * still valid for lazy reads), the displaced originals are deleted after,
+   * and bookkeeping is rebound last.
+   */
+  private _reconcile(): void {
+    const handle = this._handle as bigint;
+    // Longest leading run of HDUs still in their scanned slots; everything after is rebuilt.
+    let prefix = 0;
+    for (const [i, hdu] of this.hdus.entries()) {
+      if (!this._attachedAt(hdu, i)) break;
+      prefix += 1;
+    }
+    if (prefix === this.hdus.length && prefix === this._scannedCount) {
+      return; // layout already matches the file
+    }
+    // ── pre-flight guards: every rejection fires BEFORE any file mutation. The type check
+    // runs first (over the whole list) so a stray object at position 0 reports what it is,
+    // not a misleading "primary must remain first". ──
+    for (const hdu of this.hdus) {
+      if (!(hdu instanceof BaseHDU)) {
+        throw new FitsTypeError(410, `HDUList contains a non-HDU object: ${String(hdu)}`);
+      }
+    }
+    if (prefix === 0) {
+      throw new NotSupportedError(
+        410,
+        "the primary HDU of an open file must remain first; use writeTo() to a new file",
+      );
+    }
+    if (new Set(this.hdus).size !== this.hdus.length) {
+      throw new FitsTypeError(
+        410,
+        "the same HDU object appears at more than one position in the HDUList; " +
+          "flush cannot bind one object to two slots — insert a copy instead",
+      );
+    }
+    for (const hdu of this.hdus) {
+      if (hdu instanceof CompImageHDU && hdu._hdulist === this && hdu._dataChanged()) {
+        throw new NotSupportedError(
+          410,
+          "in-place update of a compressed image is not supported; use writeTo() to a new file",
+        );
+      }
+    }
+    const diskCount = this._hduCount(); // authoritative on-disk count (drives cleanup + deletes)
+    // ── append phase: the originals are still at their scanned indices, so lazy
+    // header/data reads (and _emitColumns' source-table access) stay valid ──
+    const serialized = new Set<number>();
+    try {
+      for (let i = prefix; i < this.hdus.length; i++) {
+        const hdu = this.hdus[i];
+        if (hdu._hdulist === this && hdu._index !== null && hdu._index >= 2) {
+          // Exact byte copy of the HDU's on-disk form. In update mode header
+          // edits were already persisted to the source slot, so the copy
+          // carries them; pending in-place DATA edits are intentionally not
+          // carried — step 2 of flush writes them back at the new index
+          // (fingerprints are left untouched below).
+          ll.check(ll.lib.zf_copy_hdu(handle, hdu._index));
+        } else {
+          // Detached, attached to another HDUList, or the primary duplicated
+          // into the tail (zf_copy_hdu refuses source 1: the copy must parse
+          // as an extension).
+          hdu._writeTo(handle, false);
+          serialized.add(i);
+        }
+      }
+    } catch (e) {
+      // Roll back the partial tail so the file is left byte-identical.
+      // Count-driven so a fully-created HDU whose column/data write failed
+      // halfway is removed too. A cleanup failure is swallowed: the original
+      // error matters more, and the file then merely carries extra trailing
+      // HDUs (valid FITS, duplicates — never missing data). JS catch is
+      // necessarily catch-all; the Python port swallows only Exception.
+      try {
+        while (this._hduCount() > diskCount) {
+          ll.check(ll.lib.zf_delete_hdu(handle, diskCount + 1));
+        }
+      } catch {
+        /* keep the original error */
+      }
+      throw e;
+    }
+    // ── delete phase: drop the displaced originals; the appended tail shifts
+    // into place. (Never hold a zf_table_open handle across this loop:
+    // zf_delete_hdu frees the *Hdu a table handle wraps.) A failure here
+    // leaves duplicates, never missing HDUs.
+    for (let k = 0; k < diskCount - prefix; k++) {
+      ll.check(ll.lib.zf_delete_hdu(handle, prefix + 1));
+    }
+    // ── rebind bookkeeping to the new layout ──
+    for (let i = prefix; i < this.hdus.length; i++) {
+      const hdu = this.hdus[i];
+      hdu._hdulist = this;
+      hdu._index = i + 1;
+      if (serialized.has(i)) {
+        // _writeTo serialized the CURRENT in-memory data: baseline it so step 2
+        // doesn't re-write it (or, for a foreign table with a pending
+        // VLA/scaled-column edit, spuriously raise). Byte-copied HDUs keep
+        // their old baseline on purpose — the copy carried the ORIGINAL bytes,
+        // so a pending in-place edit must still be detected and written back
+        // at the new index.
+        if (hdu instanceof ImageHDU && hdu._data !== null) {
+          hdu._dataFingerprint = fnv1a64(viewBytes(hdu._data.data));
+        } else if (hdu instanceof TableHDU && hdu._data !== null) {
+          const rec = hdu._data;
+          hdu._colFingerprints = new Map(rec.names.map((n) => [n, colFp(rec.column(n))]));
+        }
+      }
+      if (hdu._header !== null && hdu._header._persist === null) {
+        // A header materialized while detached (or under a read-only list) has
+        // no persist hook; future edits must reach THIS file's handle like any
+        // attached header's do.
+        const bound = hdu;
+        hdu._header._persist = (key, value, comment) => bound._writeKey(key, value, comment);
+        hdu._header._delete = (key) => bound._deleteKey(key);
+        hdu._header._dirtyCb = () => bound._markDirty();
+      }
+    }
+    this._scannedCount = this.hdus.length;
+  }
+
   /**
    * @internal True when this list is exactly what was scanned from an open
    * file — every HDU still attached in its original slot, nothing
@@ -203,7 +329,7 @@ export class HDUList implements Iterable<AnyHDU> {
       return false;
     }
     if (this.hdus.some((hdu) => hdu._dataChanged())) return false; // in-place edits don't set _dirty
-    return this.hdus.every((h, i) => h._hdulist === this && h._index === i + 1);
+    return this.hdus.every((h, i) => this._attachedAt(h, i));
   }
 
   /** @internal */

@@ -610,3 +610,326 @@ def test_writeto_added_vla_column_fails_loud(tmp_fits):
     with pytest.raises(ll.FitsError):
         h.writeto(out, overwrite=True)
     h.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+# 2026-07-07: BUGHUNT-2026-07-06 item 4 — flush()/close() must persist structural HDUList
+# mutations (insert/delete/reorder), not just pure appends. Shifted attached HDUs travel as
+# exact byte copies (zf_copy_hdu) so keywords/VLA heaps/compression bytes survive verbatim.
+# ════════════════════════════════════════════════════════════════════════════════════════════
+def _file_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _three_hdu_file(tmp_fits, name="s.fits"):
+    p = tmp_fits(name)
+    zf.HDUList([
+        zf.PrimaryHDU(data=np.arange(4, dtype="i2")),
+        zf.ImageHDU(data=np.arange(6, dtype="i2"), name="A"),
+        zf.ImageHDU(data=np.arange(8, dtype="i4"), name="B"),
+    ]).writeto(p, overwrite=True)
+    return p
+
+
+def test_insert_hdu_persists_on_close(tmp_fits):
+    p = _three_hdu_file(tmp_fits)
+    with zf.open(p, mode="update") as h:
+        h.insert(1, zf.ImageHDU(data=np.arange(3, dtype="f4"), name="NEW"))
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+        np.testing.assert_array_equal(chk[1].data, [0.0, 1.0, 2.0])
+        np.testing.assert_array_equal(chk["A"].data, np.arange(6, dtype="i2"))
+        np.testing.assert_array_equal(chk["B"].data, np.arange(8, dtype="i4"))
+
+
+def test_delete_hdu_persists_on_close(tmp_fits):
+    p = _three_hdu_file(tmp_fits)
+    with zf.open(p, mode="update") as h:
+        del h[1]
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "B"]
+        np.testing.assert_array_equal(chk["B"].data, np.arange(8, dtype="i4"))
+
+
+def test_delete_last_hdu_truncates_only(tmp_fits):
+    # Pure truncation: zero copies, one delete — the untouched head of the file stays byte-identical.
+    p = _three_hdu_file(tmp_fits)
+    before = _file_bytes(p)
+    with zf.open(p, mode="update") as h:
+        del h[-1]
+    after = _file_bytes(p)
+    assert len(after) < len(before) and after == before[: len(after)]
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "A"]
+
+
+def test_reorder_extensions_persists(tmp_fits):
+    p = _three_hdu_file(tmp_fits)
+    with zf.open(p, mode="update") as h:
+        h[1], h[2] = h[2], h[1]
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "B", "A"]
+        np.testing.assert_array_equal(chk[1].data, np.arange(8, dtype="i4"))
+        np.testing.assert_array_equal(chk[2].data, np.arange(6, dtype="i2"))
+
+
+def test_shifted_table_keeps_keywords_scaling_and_vla(tmp_fits):
+    # A shifted-but-unedited table must travel as an exact byte copy: its user keywords, TSCAL
+    # scaling, and VLA heap all survive. (The reconstruct path would drop the keywords and raise
+    # on the scaled column — this test proves the copy route is taken.)
+    p = tmp_fits("tk.fits")
+    cols = [
+        zf.Column("A", "1J", array=np.array([1, 2, 3], dtype="i4")),
+        zf.Column("V", "1PJ", array=np.array([np.array([1], dtype="i4"),
+                                              np.array([2, 3], dtype="i4"),
+                                              np.array([], dtype="i4")], dtype=object)),
+    ]
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols, name="T")]).writeto(p, overwrite=True)
+    with zf.open(p, mode="update") as h:
+        h[1].header["OBSNOTE"] = "keepme"
+        h[1].header["TSCAL1"] = 2.0  # makes the column unreconstructable via _write_to
+    with zf.open(p, mode="update") as h:
+        h.insert(1, zf.ImageHDU(data=np.zeros(2, dtype="i2"), name="NEW"))
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "T"]
+        assert chk[2].header["OBSNOTE"] == "keepme"
+        assert float(chk[2].header["TSCAL1"]) == 2.0
+        got = chk[2].data["V"]
+        assert np.array_equal(got[0], [1]) and np.array_equal(got[1], [2, 3]) and got[2].size == 0
+
+
+def test_shifted_compressed_image_bytes_survive_exactly(tmp_fits):
+    # A quantized float CompImageHDU shifted by an insert must be byte-copied, NOT recompressed
+    # (recompression would re-quantize/re-dither to different bytes).
+    p = tmp_fits("ck.fits")
+    rng_data = (np.arange(64, dtype="f4").reshape(8, 8) * 1.37 + 0.1)
+    zf.HDUList([
+        zf.PrimaryHDU(),
+        zf.CompImageHDU(data=rng_data, compression="RICE_1", quantize="SUBTRACTIVE_DITHER_1"),
+    ]).writeto(p, overwrite=True)
+    orig = _file_bytes(p)
+    comp_block = orig[2880:]  # empty primary is exactly one block; the rest is the compressed HDU
+    with zf.open(p, mode="update") as h:
+        h.insert(1, zf.ImageHDU(data=np.zeros(2, dtype="i2"), name="NEW"))
+    after = _file_bytes(p)
+    assert after[-len(comp_block):] == comp_block  # exact bytes, no requantization
+    with zf.open(p) as chk:
+        assert len(chk) == 3 and chk[1].name == "NEW"  # ...and the insert really landed
+
+
+def test_edits_on_shifted_hdu_persist(tmp_fits):
+    # Header edits persist live at the old slot (carried by the byte copy); a pending in-place
+    # data edit must be written back at the NEW index by the flush write-back pass.
+    p = _three_hdu_file(tmp_fits)
+    with zf.open(p, mode="update") as h:
+        h["A"].header["NEWKEY"] = 5
+        h["A"].data[0] = 42
+        h.insert(1, zf.ImageHDU(data=np.zeros(2, dtype="i2"), name="NEW"))
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+        assert chk["A"].header["NEWKEY"] == 5
+        assert int(chk["A"].data[0]) == 42
+
+
+def test_checksummed_hdu_survives_shift(tmp_fits):
+    # CHECKSUM/DATASUM are position-independent; an exact byte copy keeps them valid.
+    p = tmp_fits("sum.fits")
+    zf.HDUList([
+        zf.PrimaryHDU(data=np.arange(4, dtype="i2")),
+        zf.ImageHDU(data=np.arange(6, dtype="i2"), name="A"),
+    ]).writeto(p, overwrite=True, checksum=True)
+    with zf.open(p, mode="update") as h:
+        h.insert(1, zf.ImageHDU(data=np.zeros(2, dtype="i2"), name="NEW"))
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A"]
+        assert chk["A"].header.get("CHECKSUM") is not None
+    assert not [f for f in zf.verify(p) if "sum" in str(f).lower()]  # DATASUM/CHECKSUM still valid
+
+
+def test_foreign_hdu_append_persists(tmp_fits):
+    # An HDU attached to ANOTHER open file must be serialized on flush (today: silently skipped).
+    p1, p2 = _three_hdu_file(tmp_fits, "f1.fits"), tmp_fits("f2.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.ImageHDU(data=np.arange(5, dtype="i4"), name="DONOR")]).writeto(p2, overwrite=True)
+    with zf.open(p2) as other:
+        with zf.open(p1, mode="update") as h:
+            h.append(other[1])
+    with zf.open(p1) as chk:
+        assert chk[3].name == "DONOR"
+        np.testing.assert_array_equal(chk[3].data, np.arange(5, dtype="i4"))
+
+
+def test_foreign_table_with_edit_flushes_current_data(tmp_fits):
+    # A foreign table's CURRENT data is serialized; its fingerprints are rebaselined so the
+    # write-back pass neither re-writes nor spuriously raises.
+    p1, p2 = _three_hdu_file(tmp_fits, "g1.fits"), tmp_fits("g2.fits")
+    col = zf.Column("X", "1J", array=np.array([1, 2, 3], dtype="i4"))
+    zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col], name="T")]).writeto(p2, overwrite=True)
+    with zf.open(p2) as other:
+        other[1].data["X"][:] = [7, 8, 9]  # in-place edit while attached to the read-only donor
+        with zf.open(p1, mode="update") as h:
+            h.append(other[1])
+    with zf.open(p1) as chk:
+        np.testing.assert_array_equal(chk[3].data["X"], [7, 8, 9])
+
+
+def test_foreign_hdu_from_closed_list_fails_and_restores(tmp_fits):
+    p1, p2 = _three_hdu_file(tmp_fits, "h1.fits"), tmp_fits("h2.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.ImageHDU(data=np.arange(5, dtype="i4"), name="D")]).writeto(p2, overwrite=True)
+    other = zf.open(p2)
+    donor = other[1]
+    other.close()
+    before = _file_bytes(p1)
+    h = zf.open(p1, mode="update")
+    h.append(donor)
+    with pytest.raises(zf.FitsError):
+        h.flush()
+    del h[-1]  # restore the layout so close() flushes cleanly
+    h.close()
+    assert _file_bytes(p1) == before
+
+
+def test_mid_append_failure_restores_file(tmp_fits):
+    # A failure AFTER the destination HDU was created (complex VLA columns are unwritable) must
+    # roll the partial tail back; a corrected list must then flush cleanly on the same handle.
+    p = _three_hdu_file(tmp_fits, "mid.fits")
+    before = _file_bytes(p)
+    bad = zf.BinTableHDU.from_columns(
+        [zf.Column("C", "1PC", array=np.array([np.array([1 + 2j])], dtype=object))], name="BAD")
+    h = zf.open(p, mode="update")
+    h.insert(1, bad)
+    with pytest.raises(NotImplementedError):
+        h.flush()
+    assert _file_bytes(p) == before  # partial tail rolled back
+    h[1] = zf.ImageHDU(data=np.arange(3, dtype="i2"), name="GOOD")  # corrected retry
+    h.close()
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "GOOD", "A", "B"]
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda h: h.insert(0, zf.PrimaryHDU(data=np.zeros(2, dtype="i2"))),
+    lambda h: h.__delitem__(0),
+    lambda h: h.reverse(),
+])
+def test_primary_slot_change_fails_loud(tmp_fits, mutate):
+    p = _three_hdu_file(tmp_fits, "prim.fits")
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    mutate(h)
+    with pytest.raises(NotImplementedError):
+        h.close()
+    assert _file_bytes(p) == before  # nothing was mutated
+
+
+def test_aliased_hdu_object_fails_loud(tmp_fits):
+    # One object cannot be bound to two file slots; fail loud instead of silently dropping one.
+    p = _three_hdu_file(tmp_fits, "alias.fits")
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h.append(h[1])
+    with pytest.raises(ValueError):
+        h.close()
+    assert _file_bytes(p) == before
+
+
+def test_compressed_replaced_data_raises_before_restructure(tmp_fits):
+    # A CompImageHDU with replaced data + a structural change: the pre-flight guard must fire
+    # BEFORE the file is restructured, leaving it byte-identical.
+    p = tmp_fits("cpre.fits")
+    img = np.arange(16, dtype="i2").reshape(4, 4)
+    zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(data=img, compression="RICE_1"),
+                zf.ImageHDU(data=np.zeros(2, dtype="i2"), name="A")]).writeto(p, overwrite=True)
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[1].data = img * 2
+    del h[2]
+    with pytest.raises(NotImplementedError):
+        h.close()
+    assert _file_bytes(p) == before
+
+
+def test_double_flush_is_idempotent(tmp_fits):
+    p = _three_hdu_file(tmp_fits, "dbl.fits")
+    with zf.open(p, mode="update") as h:
+        h.insert(1, zf.ImageHDU(data=np.arange(3, dtype="f4"), name="NEW"))
+        h.flush()
+        first = _file_bytes(p)
+        assert [hdu.name for hdu in zf.from_bytes(first)] == ["PRIMARY", "NEW", "A", "B"]
+        h.flush()  # second flush must take the no-op fast path
+        assert _file_bytes(p) == first
+    assert _file_bytes(p) == first  # close() flush is a no-op too
+
+
+def test_from_bytes_update_mode_reconciles(tmp_fits):
+    p = _three_hdu_file(tmp_fits, "mem.fits")
+    h = zf.from_bytes(_file_bytes(p), mode="update")
+    h.insert(1, zf.ImageHDU(data=np.arange(3, dtype="i2"), name="NEW"))
+    h.flush()
+    assert h._is_pristine_attached()  # the handle's own bytes now match the list
+    out = h.to_bytes()  # ...so this is the verbatim byte-copy path
+    h.close()
+    with zf.from_bytes(out) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+
+
+def test_writeto_of_unflushed_structural_list_leaves_source_intact(tmp_fits):
+    # writeto() reconstructs from the in-memory list without flushing; the source file must not
+    # be restructured until flush/close.
+    p, out = _three_hdu_file(tmp_fits, "wsrc.fits"), tmp_fits("wout.fits")
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h.insert(1, zf.ImageHDU(data=np.arange(3, dtype="i2"), name="NEW"))
+    h.writeto(out, overwrite=True)
+    assert _file_bytes(p) == before  # source untouched so far
+    h.close()  # now the structural change lands
+    with zf.open(out) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+    with zf.open(p) as chk:
+        assert [hdu.name for hdu in chk] == ["PRIMARY", "NEW", "A", "B"]
+
+
+def test_foreign_checksummed_hdu_drops_stale_checksum_on_flush(tmp_fits):
+    # Review follow-up (PR #29): a foreign HDU serialized through the reconstruct path must not
+    # carry its source file's CHECKSUM/DATASUM — those describe the ORIGINAL bytes and would no
+    # longer verify. (Byte-copied shifted HDUs keep theirs, which stay valid.)
+    p1, p2 = _three_hdu_file(tmp_fits, "ck1.fits"), tmp_fits("ck2.fits")
+    zf.HDUList([zf.PrimaryHDU(), zf.ImageHDU(data=np.arange(5, dtype="i4"), name="D")]).writeto(
+        p2, overwrite=True, checksum=True)
+    with zf.open(p2) as other:
+        assert other[1].header.get("CHECKSUM") is not None  # donor really is checksummed
+        with zf.open(p1, mode="update") as h:
+            h.append(other[1])
+    with zf.open(p1) as chk:
+        assert chk[3].header.get("CHECKSUM") is None  # stale card dropped, not copied
+        assert chk[3].header.get("DATASUM") is None
+    assert not [f for f in zf.verify(p1) if "sum" in str(f).lower()]
+
+
+def test_reconstruction_drops_stale_checksum_cards(tmp_fits):
+    # Same rule on the writeto reconstruct path: stale CHECKSUM/DATASUM are stripped (astropy
+    # semantics); writeto(checksum=True) regenerates fresh valid ones instead.
+    src, out, out2 = tmp_fits("cs.fits"), tmp_fits("cs_out.fits"), tmp_fits("cs_out2.fits")
+    zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="i2"))]).writeto(src, overwrite=True, checksum=True)
+    hdul = zf.open(src)
+    hdul[0].data = hdul[0].data * 3  # dirty -> writeto reconstructs
+    hdul.writeto(out, overwrite=True)
+    hdul.writeto(out2, overwrite=True, checksum=True)
+    hdul.close()
+    with zf.open(out) as chk:
+        assert chk[0].header.get("CHECKSUM") is None  # stripped, not stale
+    with zf.open(out2) as chk:
+        assert chk[0].header.get("CHECKSUM") is not None  # regenerated on request
+    assert not [f for f in zf.verify(out2) if "sum" in str(f).lower()]
+
+
+def test_non_hdu_at_primary_slot_raises_typeerror(tmp_fits):
+    # Review follow-up (PR #29): garbage at position 0 must report what it is (TypeError), not
+    # the misleading "primary must remain first" NotImplementedError.
+    p = _three_hdu_file(tmp_fits, "junk.fits")
+    before = _file_bytes(p)
+    h = zf.open(p, mode="update")
+    h[0] = "not an hdu"
+    with pytest.raises(TypeError):
+        h.close()
+    assert _file_bytes(p) == before
