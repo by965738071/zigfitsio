@@ -112,7 +112,14 @@ def test_zigfitsio_reads_astropy_hierarch_long_string(tmp_fits):
     hdr = afits.Header()
     hdr["HIERARCH ESO LONG STR"] = (value, "provenance")
     p = tmp_fits()
-    afits.PrimaryHDU(header=hdr).writeto(p, overwrite=True)
+    try:
+        afits.PrimaryHDU(header=hdr).writeto(p, overwrite=True)
+    except ValueError:
+        # astropy <7.1 cannot *write* HIERARCH values via the CONTINUE long-string
+        # convention (it raises "keyword ... with its value is too long"). Without
+        # such a file there is nothing to cross-check, so skip. Reading HIERARCH+
+        # CONTINUE (this test's actual subject) is supported by those versions.
+        pytest.skip("astropy <7.1 cannot write HIERARCH long strings via CONTINUE")
     assert afits.getheader(p)["ESO LONG STR"] == value  # astropy reads its own file
     with zf.open(p) as hdul:
         assert hdul[0].header["ESO LONG STR"] == value
