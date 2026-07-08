@@ -219,7 +219,7 @@ def _fits_value_literal(value) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        return repr(value)
+        return repr(value).replace("e", "E")  # FITS exponents are uppercase (§4.2.4)
     return "'" + str(value).replace("'", "''") + "'"
 
 
@@ -229,12 +229,73 @@ def _commentary_card(kw: str, value) -> bytes:
     return (kw.upper().ljust(8) + text)[:80].ljust(80).encode("ascii", "replace")
 
 
-def _hierarch_card(kw: str, value, comment) -> bytes:
-    """A best-effort 80-byte HIERARCH card: ``HIERARCH tokens = value [/ comment]``."""
-    body = "HIERARCH " + kw.strip() + " = " + _fits_value_literal(value)
-    if comment:
-        body += " / " + comment
-    return body[:80].ljust(80).encode("ascii", "replace")
+def _pair_safe_take(esc: str, want: int) -> int:
+    """Largest cut ≤ ``want`` that does not split a ``''`` escape pair.
+
+    ``esc`` always starts on a pair boundary (callers only advance by pair-safe takes), so a
+    left-to-right walk decides pair membership unambiguously; a cut that would land between the
+    two quotes of a pair backs off one column.
+    """
+    j = 0
+    while j < want:
+        if esc[j] == "'":
+            if j + 1 == want:
+                return want - 1
+            j += 2
+        else:
+            j += 1
+    return want
+
+
+def _hierarch_cards(kw: str, value, comment) -> "list[bytes]":
+    """The 80-byte card run for a HIERARCH keyword: one card when it fits, else HIERARCH+CONTINUE.
+
+    Long string values are continued across CONTINUE cards in astropy's layout: the base fragment
+    fills to column 80 with the ``&`` sentinel inside the quotes, continuations carry the value
+    from column 11, and the comment rides the last fragment or a dedicated
+    ``CONTINUE  '' / comment`` card. The escaped text is chunked so a ``''`` escape pair is never
+    split across cards. A non-string value never continues (the convention applies to strings
+    only, FITS 4.0 §4.2.1.2): its comment may be truncated, but a value that cannot fit raises
+    ValueError instead of being silently cut (the old single-card builder truncated at 80 bytes).
+    """
+    tokens = kw.strip()
+    if tokens[:9].upper() == "HIERARCH ":  # never double the prefix
+        tokens = tokens[9:].lstrip()
+    prefix = "HIERARCH " + tokens + " = "
+    lit = _fits_value_literal(value)
+    body = prefix + lit + ((" / " + comment) if comment else "")
+    if len(body) <= 80:  # fast path: bytes identical to the single-card form
+        return [body.ljust(80).encode("ascii", "replace")]
+    is_string = not isinstance(value, (bool, int, float)) and value is not None
+    if not is_string:
+        if len(prefix + lit) <= 80:  # keep the value exact; only the comment is cut
+            return [body[:80].ljust(80).encode("ascii", "replace")]
+        raise ValueError(f"HIERARCH card for {tokens!r} does not fit in 80 columns")
+    esc = str(value).replace("'", "''")
+    if not esc:  # empty string value: only the comment overflows — truncate it
+        return [(prefix + "'' / " + comment)[:80].ljust(80).encode("ascii", "replace")]
+    ccost = (3 + len(comment)) if comment else 0
+    cards: "list[str]" = []
+    pos, first, comment_done = 0, True, not comment
+    while pos < len(esc):
+        head = prefix if first else "CONTINUE  "
+        cap = 80 - len(head) - 2  # columns between the quotes (incl. a possible '&')
+        remaining = len(esc) - pos
+        terminal = remaining <= cap - ccost
+        take = remaining if terminal else _pair_safe_take(esc[pos:], min(cap - 1, remaining))
+        if take <= 0:
+            raise ValueError(f"HIERARCH keyword {tokens!r} leaves no room for a value")
+        frag = esc[pos : pos + take]
+        pos += take
+        first = False
+        if terminal:
+            cards.append(head + "'" + frag + "'" + ((" / " + comment) if comment else ""))
+            comment_done = True
+            break
+        cards.append(head + "'" + frag + "&'")
+    if not comment_done:  # astropy's dedicated comment card
+        cards.append(("CONTINUE  '' / " + comment)[:80])
+    return [t.ljust(80).encode("ascii", "replace") for t in cards]
 
 
 def _ptr(arr: np.ndarray) -> _VOID:
@@ -368,6 +429,22 @@ class _HDU:
         if up in _STRUCTURAL or up.startswith("NAXIS"):
             raise ll.FitsHeaderError(207, f"cannot set structural keyword {key!r} on an open header")
         value = _coerce_kw_value(value)
+        key_s = key.strip()
+        if " " in key_s or len(key_s) > 8:
+            # HIERARCH-convention keyword: the fixed-format ABI cannot express it (>8 chars fails
+            # Name.parse; an embedded space would stamp a spec-invalid keyword). Build the cards
+            # FIRST so a bad value cannot delete the old card and then fail; the Zig-side delete
+            # also removes an old CONTINUE run, so replacement never orphans continuations.
+            cards = _hierarch_cards(key_s, value, comment)
+            h = self._select()
+            kb = _enc(key_s)
+            try:
+                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))  # matches HIERARCH names in Zig
+            except ll.KeywordNotFound:
+                pass
+            for card in cards:
+                ll.check(ll.lib.zf_write_record(h, card))  # sequential insert-before-END keeps order
+            return
         h = self._select()
         kb = _enc(key)
         cb = _enc(comment) if comment else None
@@ -560,10 +637,11 @@ class ImageHDU(_HDU):
             if up in ("COMMENT", "HISTORY", ""):
                 ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, value)))
                 continue
+            value = _coerce_kw_value(value)  # before the HIERARCH branch: numpy scalars normalize too
             if " " in kw or len(kw) > 8:
-                ll.check(ll.lib.zf_write_record(handle, _hierarch_card(kw, value, comment)))
+                for card in _hierarch_cards(kw, value, comment):
+                    ll.check(ll.lib.zf_write_record(handle, card))
                 continue
-            value = _coerce_kw_value(value)
             kb = _enc(kw)
             cb = _enc(comment) if comment else None
             cl = len(cb) if cb else 0

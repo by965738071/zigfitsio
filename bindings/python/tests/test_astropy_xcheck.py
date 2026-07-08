@@ -86,6 +86,39 @@ def test_zigfitsio_reads_astropy_long_string(tmp_fits, value):
         assert hdul[0].header.comment_of("LSTR") == "provenance"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        ("the quick brown fox " * 10).strip(),  # plain multi-card
+        ("abc'def&" * 12) + "END",              # quotes and ampersands straddling boundaries
+    ],
+)
+def test_astropy_reads_zigfitsio_hierarch_long_string(tmp_fits, value):
+    """astropy must read our HIERARCH+CONTINUE output exactly (value, comment, verify clean)."""
+    p = tmp_fits()
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO LONG STR"] = (value, "provenance")
+    zf.HDUList([hdu]).writeto(p, overwrite=True)
+    hdr = afits.getheader(p)
+    assert hdr["ESO LONG STR"] == value
+    assert hdr.comments["ESO LONG STR"] == "provenance"
+    with afits.open(p) as h:
+        h.verify("exception")
+
+
+def test_zigfitsio_reads_astropy_hierarch_long_string(tmp_fits):
+    """We must read astropy's HIERARCH+CONTINUE output (incl. its split '' escape pairs)."""
+    value = ("it's a 'long' tale & so on " * 8).strip()
+    hdr = afits.Header()
+    hdr["HIERARCH ESO LONG STR"] = (value, "provenance")
+    p = tmp_fits()
+    afits.PrimaryHDU(header=hdr).writeto(p, overwrite=True)
+    assert afits.getheader(p)["ESO LONG STR"] == value  # astropy reads its own file
+    with zf.open(p) as hdul:
+        assert hdul[0].header["ESO LONG STR"] == value
+        assert hdul[0].header.comment_of("ESO LONG STR") == "provenance"
+
+
 def test_wcs_matches_astropy(tmp_fits):
     WCS = pytest.importorskip("astropy.wcs").WCS
     data = np.zeros((64, 64), dtype="f4")

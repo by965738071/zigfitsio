@@ -331,7 +331,17 @@ pub const Header = struct {
     pub fn update(self: *Header, alloc: Allocator, name: []const u8, v: value.KeywordValue, comment_text: ?[]const u8) (HeaderError || Allocator.Error)!void {
         if (self.findFirst(name)) |i| {
             const keep = comment_text orelse value.parseComment(self.cards.items[i].valueField());
+            // Replacing a continued long-string base with a single card must also drop its
+            // CONTINUE run (same rule as `delete`): the new value does not continue, so a
+            // leftover run would be orphaned garbage commentary.
+            const old = &self.cards.items[i];
+            var continues = old.kind == .value and continuation.endsWithSentinel(old.valueField()) and
+                i + 1 < self.cards.items.len and self.cards.items[i + 1].kind == .continuation;
             self.cards.items[i] = try Card.buildValue(name, v, keep);
+            while (continues and i + 1 < self.cards.items.len and self.cards.items[i + 1].kind == .continuation) {
+                const c = self.cards.orderedRemove(i + 1);
+                continues = continuation.endsWithSentinel(c.valueField());
+            }
         } else {
             const card = try Card.buildValue(name, v, comment_text);
             // Prefer filling a reserved blank card in place (FR-HDR-12) over inserting, so the
@@ -365,10 +375,30 @@ pub const Header = struct {
         try self.cards.insert(alloc, index, card);
     }
 
-    /// Delete the first card named `name`. `error.KeywordNotFound` if absent.
+    /// Delete the first card named `name`. `error.KeywordNotFound` if absent. When the deleted
+    /// card holds a string value ending with the `&` continuation sentinel, its CONTINUE run is
+    /// removed with it (FR-HDR-8): leaving the run behind would orphan the CONTINUE cards as
+    /// garbage commentary that can splice onto a neighboring long string.
+    /// `zf_write_key_longstr`'s replace-if-present relies on this to not leak the old run.
     pub fn delete(self: *Header, name: []const u8) ValueError!void {
         const i = self.findFirst(name) orelse return error.KeywordNotFound;
+        const card = &self.cards.items[i];
+        // A HIERARCH card keeps its value after the `=`, not at fixed columns 11–80 (same
+        // routing as valueBytesOf); commentary/blank cards have no value and never continue.
+        const field: ?[]const u8 = if (hierarch.isHierarch(card))
+            hierarch.valueField(card)
+        else if (card.kind == .value)
+            card.valueField()
+        else
+            null;
+        var continues = if (field) |vf| continuation.endsWithSentinel(vf) else false;
         _ = self.cards.orderedRemove(i);
+        // The run extends while each removed fragment carries the sentinel AND another CONTINUE
+        // follows — the same rule `assemble` uses (a trailing `&` on the last card is literal).
+        while (continues and i < self.cards.items.len and self.cards.items[i].kind == .continuation) {
+            const c = self.cards.orderedRemove(i);
+            continues = continuation.endsWithSentinel(c.valueField());
+        }
     }
 
     /// Rename keyword `old` to `new`, preserving its value/comment and position. The new name
@@ -632,6 +662,76 @@ test "getLongString reassembles a multi-card CONTINUE value parsed from real car
     const obj = try h.getLongString(testing.allocator, "OBJECT");
     defer testing.allocator.free(obj);
     try testing.expectEqualStrings("M31", obj);
+}
+
+fn raw80(s: []const u8) [80]u8 {
+    var b: [80]u8 = [_]u8{' '} ** 80;
+    @memcpy(b[0..s.len], s);
+    return b;
+}
+
+test "delete removes the full CONTINUE run of a long string (BUGHUNT 34)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendValue(testing.allocator, "BEFORE", .{ .int = 1 }, null);
+    try h.appendLongString(testing.allocator, "LONGSTR", "x" ** 150, "c");
+    try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
+    try h.ensureEnd(testing.allocator);
+    try testing.expect(h.count() >= 6); // BEFORE + base + ≥2 CONTINUE + AFTER + END
+
+    try h.delete("LONGSTR");
+    // The base card AND every CONTINUE card are gone; neighbors and END are intact.
+    for (h.cards.items) |c| try testing.expect(c.kind != .continuation);
+    try testing.expectEqual(@as(i64, 1), try h.getValue(i64, "BEFORE"));
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "AFTER"));
+    try testing.expect(!h.has("LONGSTR"));
+    try testing.expect(h.at(h.count() - 1).kind == .end);
+}
+
+test "delete of a HIERARCH long-string base removes its CONTINUE run" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendRaw(testing.allocator, &raw80("HIERARCH ESO LONG STR = 'aaaa&'"));
+    try h.appendRaw(testing.allocator, &raw80("CONTINUE  'bbbb&'"));
+    try h.appendRaw(testing.allocator, &raw80("CONTINUE  'cccc'"));
+    try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
+    try h.ensureEnd(testing.allocator);
+
+    try h.delete("ESO LONG STR"); // HIERARCH name resolved via matchName
+    for (h.cards.items) |c| try testing.expect(c.kind != .continuation);
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "AFTER"));
+    try testing.expectEqual(@as(usize, 2), h.count()); // AFTER + END
+}
+
+test "update of a long-string base to a short value removes its CONTINUE run (BUGHUNT 24)" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    try h.appendLongString(testing.allocator, "LSTR", "z" ** 150, null);
+    try h.appendValue(testing.allocator, "AFTER", .{ .int = 2 }, null);
+    try h.ensureEnd(testing.allocator);
+
+    try h.update(testing.allocator, "LSTR", .{ .string = "tiny" }, null);
+    for (h.cards.items) |c| try testing.expect(c.kind != .continuation);
+    const got = try h.getLongString(testing.allocator, "LSTR");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("tiny", got);
+    try testing.expectEqual(@as(i64, 2), try h.getValue(i64, "AFTER"));
+}
+
+test "delete keeps a literal trailing '&' value and an unrelated CONTINUE run intact" {
+    var h = Header.initEmpty();
+    defer h.deinit(testing.allocator);
+    // A '&'-terminated value with NO following CONTINUE keeps the '&' literal — deleting it
+    // must not consume the next keyword's unrelated CONTINUE run.
+    try h.appendRaw(testing.allocator, &raw80("AMPLIT  = 'M31 &'"));
+    try h.appendRaw(testing.allocator, &raw80("WEATHER = 'cloudy skies over&'"));
+    try h.appendRaw(testing.allocator, &raw80("CONTINUE  'night'"));
+    try h.ensureEnd(testing.allocator);
+
+    try h.delete("AMPLIT");
+    const got = try h.getLongString(testing.allocator, "WEATHER");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("cloudy skies overnight", got);
 }
 
 test "HIERARCH lookup through the Header by both spellings (FR-HDR-9)" {

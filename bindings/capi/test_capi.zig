@@ -395,6 +395,75 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     capi.zf_free(out_ptr, out_len);
 }
 
+fn putRecord(hh: *Handle, text: []const u8) !void {
+    var card: [80]u8 = [_]u8{' '} ** 80;
+    @memcpy(card[0..text.len], text);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_record(hh, &card));
+}
+
+fn countContinueCards(hh: *Handle) !usize {
+    var n: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n));
+    var found: usize = 0;
+    var i: c_long = 0;
+    while (i < n) : (i += 1) {
+        var got: [80]u8 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_card(hh, i, &got));
+        if (std.mem.eql(u8, got[0..8], "CONTINUE")) found += 1;
+    }
+    return found;
+}
+
+test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT 24)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const name = "LONGSTR";
+    const longval = "x" ** 150; // base + 2 CONTINUE cards
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
+    try testing.expect(try countContinueCards(hh) >= 2);
+    var n_before: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_before));
+
+    // Replacing with a short value must remove the whole old run, not just the base card.
+    const short = "short";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, short, short.len, null, 0));
+    try testing.expectEqual(@as(usize, 0), try countContinueCards(hh));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_before - 2, n_after); // 3 cards → 1
+
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, name, name.len, &out_ptr, &out_len));
+    defer capi.zf_free(out_ptr, out_len);
+    try testing.expectEqualStrings(short, out_ptr.?[0..out_len]);
+}
+
+test "zf_delete_key removes a HIERARCH+CONTINUE run inserted via zf_write_record" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    var n_base: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_base));
+
+    try putRecord(hh, "HIERARCH ESO LONG STR = 'aaaa&'");
+    try putRecord(hh, "CONTINUE  'bbbb&'");
+    try putRecord(hh, "CONTINUE  'cccc'");
+
+    const q = "ESO LONG STR"; // HIERARCH names resolve through matchName
+    try testing.expectEqual(@as(c_int, 0), capi.zf_delete_key(hh, q, q.len));
+    try testing.expectEqual(@as(usize, 0), try countContinueCards(hh));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_base, n_after); // header back to its baseline
+}
+
 test "header scalar reads: lng, log, str, and key_comment" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

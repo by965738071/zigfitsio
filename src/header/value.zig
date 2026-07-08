@@ -21,7 +21,7 @@ const ValueError = @import("../errors.zig").ValueError;
 const FIXED_WIDTH: usize = 20;
 /// Fixed-format minimum string length: a string value is padded with blanks to at least 8
 /// characters between the quotes (FITS 4.0 §4.2.1).
-const MIN_STRING_CHARS: usize = 8;
+pub const MIN_STRING_CHARS: usize = 8;
 
 /// A parsed FITS keyword value, carrying the standard value types plus the *undefined* tag.
 ///
@@ -319,6 +319,28 @@ fn padLeft(w: *std.Io.Writer, s: []const u8, width: usize) std.Io.Writer.Error!v
     var i: usize = s.len;
     while (i < width) : (i += 1) try w.writeByte(' ');
     try w.writeAll(s);
+}
+
+/// Rendered length of `s` once each `'` is escaped to `''` (quotes/padding not included).
+pub fn escapedLen(s: []const u8) usize {
+    var n: usize = s.len;
+    for (s) |c| {
+        if (c == '\'') n += 1;
+    }
+    return n;
+}
+
+/// Write `s` into `out` with each `'` doubled; `out.len` must be `escapedLen(s)`.
+pub fn escapeQuotes(s: []const u8, out: []u8) void {
+    var i: usize = 0;
+    for (s) |c| {
+        out[i] = c;
+        i += 1;
+        if (c == '\'') {
+            out[i] = '\'';
+            i += 1;
+        }
+    }
 }
 
 // Write a single-quoted string with `'`→`''` escaping, padded to the 8-character minimum.

@@ -268,6 +268,157 @@ def test_hierarch_keyword_accessible():
     assert "ESO DET GAIN" in hh.keys()
 
 
+# ── #11/#26 HIERARCH long-string WRITE (multi-card) ───────────────────────────────────────────
+def _header_cards(blob: bytes) -> "list[bytes]":
+    """The 80-byte cards of the first header block run, up to and excluding END."""
+    cards = []
+    for i in range(0, len(blob), 80):
+        card = blob[i : i + 80]
+        if card[:8].rstrip() == b"END":
+            break
+        cards.append(card)
+    return cards
+
+
+def test_hierarch_long_string_write_roundtrip():
+    """A long HIERARCH string survives writeto/to_bytes exactly (was: silent truncation at 80)."""
+    value = ("the quick brown fox " * 12).strip()  # 239 chars
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO LONG STR"] = (value, "my provenance comment")
+    blob = zf.HDUList([hdu]).to_bytes()
+
+    # Raw layout: HIERARCH base fragment ends with the '&' sentinel, CONTINUE cards follow.
+    cards = _header_cards(blob)
+    base = [c for c in cards if c.startswith(b"HIERARCH ESO LONG STR = '")]
+    assert len(base) == 1 and base[0].rstrip().endswith(b"&'")
+    conts = [c for c in cards if c[:8] == b"CONTINUE"]
+    assert len(conts) >= 2
+
+    hh = zf.from_bytes(blob)[0].header
+    assert hh["ESO LONG STR"] == value
+    assert hh.comment_of("ESO LONG STR") == "my provenance comment"
+
+
+@pytest.mark.parametrize("offset", range(40, 70))
+def test_hierarch_long_string_quote_boundary_sweep(offset):
+    """Slide a quote across the base-card boundary; every escaped split must round-trip."""
+    value = "x" * offset + "'" + "y" * (120 - offset)
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO Q W"] = value
+    hh = zf.from_bytes(zf.HDUList([hdu]).to_bytes())[0].header
+    assert hh["ESO Q W"] == value
+
+
+def test_hierarch_prefix_not_doubled():
+    """A key spelled with an explicit HIERARCH prefix must not emit HIERARCH twice (item 26)."""
+    hdu = zf.PrimaryHDU()
+    hdu.header["HIERARCH ESO DET ID"] = 42
+    blob = zf.HDUList([hdu]).to_bytes()
+    card = next(c for c in _header_cards(blob) if b"ESO DET ID" in c)
+    assert card.count(b"HIERARCH") == 1
+    assert zf.from_bytes(blob)[0].header["ESO DET ID"] == 42
+
+
+def test_hierarch_float_uppercase_exponent():
+    """HIERARCH float literals use the FITS uppercase exponent, not repr()'s lowercase (item 26)."""
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO DET EXPTIME"] = 1.5e-07
+    blob = zf.HDUList([hdu]).to_bytes()
+    card = next(c for c in _header_cards(blob) if b"ESO DET EXPTIME" in c)
+    assert b"E-07" in card and b"e-07" not in card
+    assert zf.from_bytes(blob)[0].header["ESO DET EXPTIME"] == pytest.approx(1.5e-07)
+
+
+def test_hierarch_comment_dedicated_card():
+    """A comment that cannot ride the last data fragment gets astropy's CONTINUE '' card."""
+    from zigfitsio.core import _hierarch_cards
+
+    # base takes 53 chars, the next CONTINUE 67; the final 60 exceed the comment-reserving
+    # terminal window (49) so they fill their own card and the comment spills to a '' card.
+    value = "A" * 180
+    cards = _hierarch_cards("ESO LONG STR", value, "trailing comment")
+    assert cards[-1].startswith(b"CONTINUE  '' / trailing comment")
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO LONG STR"] = (value, "trailing comment")
+    hh = zf.from_bytes(zf.HDUList([hdu]).to_bytes())[0].header
+    assert hh["ESO LONG STR"] == value
+    assert hh.comment_of("ESO LONG STR") == "trailing comment"
+
+
+def test_hierarch_nonstring_overflow():
+    """Non-string HIERARCH cards never CONTINUE: the comment is cut, a value never is (item 11)."""
+    from zigfitsio.core import _hierarch_cards
+
+    # Comment overflow: the integer value survives intact, the comment is truncated at col 80.
+    kw = "ESO DET " + "LONG NAME " * 4
+    [card] = _hierarch_cards(kw.strip(), 123456, "c" * 60)
+    assert b"= 123456 / " in card
+    # Value overflow (absurd keyword): loud error instead of silent truncation.
+    with pytest.raises(ValueError):
+        _hierarch_cards("ESO " + "X" * 76, 1, None)
+
+
+def test_hierarch_numpy_scalar_value():
+    """numpy scalars normalize before HIERARCH serialization (no 'np.float64(...)' literals)."""
+    hdu = zf.PrimaryHDU()
+    hdu.header["ESO DET GAIN2"] = np.float64(2.5)
+    hdu.header["ESO DET NX"] = np.int32(1024)
+    hh = zf.from_bytes(zf.HDUList([hdu]).to_bytes())[0].header
+    assert hh["ESO DET GAIN2"] == pytest.approx(2.5)
+    assert hh["ESO DET NX"] == 1024
+
+
+def _file_continue_count(path) -> int:
+    with open(path, "rb") as fh:
+        return sum(1 for c in _header_cards(fh.read()) if c[:8] == b"CONTINUE")
+
+
+def test_hierarch_update_mode_write_and_replace(tmp_fits):
+    """Update-mode HIERARCH set + replace: no Name.parse error, no orphaned CONTINUE run."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((4, 4), dtype="f4"))
+    long_value = ("it's long " * 20).strip()
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["ESO LONG KEY"] = (long_value, "note")  # was: BadKeywordName from Zig
+    with zf.open(p) as hdul:
+        assert hdul[0].header["ESO LONG KEY"] == long_value
+        assert hdul[0].header.comment_of("ESO LONG KEY") == "note"
+    assert _file_continue_count(p) >= 2
+
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["ESO LONG KEY"] = "short"  # replacement must remove the old run
+    with zf.open(p) as hdul:
+        assert hdul[0].header["ESO LONG KEY"] == "short"
+    assert _file_continue_count(p) == 0
+
+
+def test_update_mode_standard_longstr_replace_no_orphans(tmp_fits):
+    """Replacing a standard-key long string in update mode leaves no orphan CONTINUE (item 24)."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((4, 4), dtype="f4"))
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["LSTR"] = "z" * 150
+    assert _file_continue_count(p) >= 2
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["LSTR"] = "tiny"
+    with zf.open(p) as hdul:
+        assert hdul[0].header["LSTR"] == "tiny"
+    assert _file_continue_count(p) == 0
+
+
+def test_update_mode_longstr_delete_removes_run(tmp_fits):
+    """Deleting a long-string key in update mode removes its whole CONTINUE run (item 34)."""
+    p = tmp_fits()
+    zf.writeto(p, np.zeros((4, 4), dtype="f4"))
+    with zf.open(p, mode="update") as hdul:
+        hdul[0].header["LSTR"] = "z" * 150
+    with zf.open(p, mode="update") as hdul:
+        del hdul[0].header["LSTR"]
+    with zf.open(p) as hdul:
+        assert "LSTR" not in hdul[0].header.keys()
+    assert _file_continue_count(p) == 0
+
+
 # ── #11 ragged; #21 empty; #26 non-ASCII ─────────────────────────────────────────────────────
 def test_ragged_from_columns_raises():
     with pytest.raises(ValueError):

@@ -7,10 +7,45 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **TypeScript**: `writeTo`/`toBytes` reconstruction of **table** and **compressed-image**
+  HDUs no longer silently drops every user header keyword and `COMMENT`/`HISTORY` card —
+  both paths now mirror the image path's `_applyUserKeys`, with a per-caller skip predicate
+  so freshly written structural cards (column descriptors, ZIMAGE-convention cards) are not
+  duplicated or double-applied. (#27)
+- **Python**: table write paths address columns **by name, not position** — reassigning
+  `hdu.data` with a recarray whose columns are reordered, renamed, retyped, added, or
+  dropped no longer writes values into the wrong file column (update-mode flush) or
+  silently truncates data through a stale positional `TFORM` (`writeto`); incompatible
+  column-set changes on an attached table fail loud instead of corrupting. (#28)
+- **Python & TypeScript**: `HDUList` structural edits — `insert()`, deletion, reorders, and
+  appends of an HDU attached to another file — now persist on `flush()`/`close()` in update
+  mode instead of being silently dropped. Shifted attached HDUs travel as exact byte copies
+  (`zf_copy_hdu`) so user keywords, VLA heaps, compression bytes, and checksums survive
+  verbatim; guards (primary must stay first, no aliased HDU objects) fire before any file
+  mutation, and a mid-flush failure rolls back byte-identically. (#29)
 - **Python**: reading an astropy-written CONTINUE long string containing a single quote no
   longer silently truncates the value — continuation is folded on the raw escaped text and
   `''` unescaped exactly once, matching astropy's read path; `HIERARCH` long strings
   continued across `CONTINUE` cards fold too (both standard `KEY = ` and `HIERARCH` bases).
+  (#30)
+- **Core**: `continuation.split` (and therefore `zf_write_key_longstr`) escapes embedded
+  single quotes in multi-card CONTINUE runs and never cuts a `''` escape pair across a card
+  boundary; the single-card threshold counts the rendered width (escapes + the 8-char
+  fixed-format minimum), so quote-heavy boundary strings and short strings with long
+  comments no longer fail with a spurious `CardOverflow`. (#31)
+- **Core**: `Header.delete` and `Header.update` of a continued long-string base card
+  (standard or `HIERARCH`) now remove its `CONTINUE` run instead of orphaning it — replacing
+  or deleting a long string through `zf_delete_key`/`zf_write_key_str`/`zf_write_key_longstr`
+  no longer leaves stale continuation cards in the header. (#31)
+- **Python & TypeScript**: `HIERARCH` keywords with long string values are written as
+  multi-card `HIERARCH`+`CONTINUE` runs in astropy's layout instead of being silently
+  truncated at 80 bytes; an unfittable value now raises instead of being cut. Setting a
+  spaced/>8-char keyword on an attached writable file (update mode) works via the same
+  builder (previously a `BadKeywordName` error). Riders: an explicit `HIERARCH ` prefix is
+  no longer doubled and `HIERARCH` float literals use the FITS uppercase exponent. (#31)
+- **TypeScript**: the header parser folds CONTINUE long strings on the raw escaped text
+  (port of the Python fix), so astropy quote-splits and `HIERARCH` long strings read
+  correctly. (#31)
 
 ## [0.1.2] - 2026-07-05
 

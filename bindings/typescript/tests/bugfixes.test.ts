@@ -302,6 +302,154 @@ describe("long strings and HIERARCH", () => {
   });
 });
 
+describe("HIERARCH long-string write (multi-card)", () => {
+  const headerCards = (blob: Uint8Array): string[] => {
+    const text = new TextDecoder("ascii").decode(blob);
+    const cards: string[] = [];
+    for (let i = 0; i + 80 <= text.length; i += 80) {
+      const card = text.slice(i, i + 80);
+      if (card.slice(0, 8).trimEnd() === "END") break;
+      cards.push(card);
+    }
+    return cards;
+  };
+  const continueCount = (blob: Uint8Array): number =>
+    headerCards(blob).filter((c) => c.slice(0, 8) === "CONTINUE").length;
+
+  test("long HIERARCH string round-trips through toBytes (was: silent truncation at 80)", () => {
+    const value = "the quick brown fox ".repeat(12).trim(); // 239 chars
+    const hdu = new zf.PrimaryHDU();
+    hdu.header.set("ESO LONG STR", value, "my provenance comment");
+    const blob = new zf.HDUList([hdu]).toBytes();
+
+    // Raw layout: HIERARCH base fragment ends with the '&' sentinel, CONTINUE cards follow.
+    const base = headerCards(blob).filter((c) => c.startsWith("HIERARCH ESO LONG STR = '"));
+    expect(base).toHaveLength(1);
+    expect(base[0].trimEnd().endsWith("&'")).toBe(true);
+    expect(continueCount(blob)).toBeGreaterThanOrEqual(2);
+
+    const hl = zf.fromBytes(blob);
+    try {
+      expect(hl.get(0).header.get("ESO LONG STR")).toBe(value);
+      expect(hl.get(0).header.commentOf("ESO LONG STR")).toBe("my provenance comment");
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("quotes straddling the CONTINUE boundary round-trip (escaped-pair-safe split)", () => {
+    for (const offset of [45, 51, 52, 53, 60]) {
+      const value = "x".repeat(offset) + "'" + "y".repeat(120 - offset);
+      const hdu = new zf.PrimaryHDU();
+      hdu.header.set("ESO Q W", value);
+      const hl = zf.fromBytes(new zf.HDUList([hdu]).toBytes());
+      try {
+        expect(hl.get(0).header.get("ESO Q W")).toBe(value);
+      } finally {
+        hl.close();
+      }
+    }
+  });
+
+  test("explicit HIERARCH prefix is not doubled; float exponent is uppercase (item 26)", () => {
+    const hdu = new zf.PrimaryHDU();
+    hdu.header.set("HIERARCH ESO DET ID", 42);
+    hdu.header.set("ESO DET EXPTIME", 1.5e-7);
+    const blob = new zf.HDUList([hdu]).toBytes();
+    const cards = headerCards(blob);
+    const idCard = cards.find((c) => c.includes("ESO DET ID"))!;
+    expect(idCard.split("HIERARCH").length - 1).toBe(1);
+    const expCard = cards.find((c) => c.includes("ESO DET EXPTIME"))!;
+    expect(expCard).toContain("E-7");
+    expect(expCard).not.toContain("e-7");
+    const hl = zf.fromBytes(blob);
+    try {
+      expect(hl.get(0).header.get("ESO DET ID")).toBe(42);
+      expect(hl.get(0).header.get("ESO DET EXPTIME")).toBeCloseTo(1.5e-7);
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("comment that cannot ride the last fragment gets a dedicated CONTINUE '' card", () => {
+    // base takes 53 chars, the next CONTINUE 67; the final 60 exceed the comment-reserving
+    // terminal window so they fill their own card and the comment spills to a '' card.
+    const value = "A".repeat(180);
+    const hdu = new zf.PrimaryHDU();
+    hdu.header.set("ESO LONG STR", value, "trailing comment");
+    const blob = new zf.HDUList([hdu]).toBytes();
+    const cards = headerCards(blob);
+    expect(cards.some((c) => c.startsWith("CONTINUE  '' / trailing comment"))).toBe(true);
+    const hl = zf.fromBytes(blob);
+    try {
+      expect(hl.get(0).header.get("ESO LONG STR")).toBe(value);
+      expect(hl.get(0).header.commentOf("ESO LONG STR")).toBe("trailing comment");
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("update-mode HIERARCH set + replace leaves no orphaned CONTINUE run", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(16), [4, 4]));
+    const longValue = "it's long ".repeat(20).trim();
+
+    let hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("ESO LONG KEY", longValue, "note"); // was: BadKeywordName from Zig
+    } finally {
+      hl.close();
+    }
+    expect(continueCount(readFileSync(p))).toBeGreaterThanOrEqual(2);
+    hl = zf.open(p);
+    try {
+      expect(hl.get(0).header.get("ESO LONG KEY")).toBe(longValue);
+      expect(hl.get(0).header.commentOf("ESO LONG KEY")).toBe("note");
+    } finally {
+      hl.close();
+    }
+
+    hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("ESO LONG KEY", "short"); // replacement must remove the old run
+    } finally {
+      hl.close();
+    }
+    expect(continueCount(readFileSync(p))).toBe(0);
+    hl = zf.open(p);
+    try {
+      expect(hl.get(0).header.get("ESO LONG KEY")).toBe("short");
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("update-mode standard-key long-string replace leaves no orphans (item 24, via wasm)", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(16), [4, 4]));
+    let hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("LSTR", "z".repeat(150));
+    } finally {
+      hl.close();
+    }
+    expect(continueCount(readFileSync(p))).toBeGreaterThanOrEqual(2);
+    hl = zf.open(p, "update");
+    try {
+      hl.get(0).header.set("LSTR", "tiny");
+    } finally {
+      hl.close();
+    }
+    expect(continueCount(readFileSync(p))).toBe(0);
+    hl = zf.open(p);
+    try {
+      expect(hl.get(0).header.get("LSTR")).toBe("tiny");
+    } finally {
+      hl.close();
+    }
+  });
+});
+
 describe("construction guards", () => {
   test("ragged fromColumns raises", () => {
     expect(() =>

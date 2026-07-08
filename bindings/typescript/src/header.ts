@@ -94,6 +94,57 @@ function cardText(raw: Uint8Array | string): string {
   return typeof raw === "string" ? raw : asciiDecoder.decode(raw);
 }
 
+/**
+ * Locate a quoted string in a value field WITHOUT unescaping `''` pairs (port of the Python
+ * `_extract_raw_string`).
+ *
+ * Returns the substring between the opening and true closing quote with escapes left intact.
+ * The closing quote is the first `'` that is not part of a `''` pair and is followed only by
+ * spaces then end-of-field or a `/` comment; a lone `'` followed by anything else is content
+ * (astropy splits `''` escape pairs across CONTINUE cards, leaving a lone `'&` at a card
+ * boundary). `raw` is null when the field does not hold a string value.
+ */
+function extractRawString(field: string): { raw: string | null; comment: string; isString: boolean } {
+  const s = field;
+  let i = 0;
+  while (i < s.length && s[i] === " ") i++;
+  if (i >= s.length || s[i] !== "'") return { raw: null, comment: "", isString: false };
+  i++;
+  const start = i;
+  while (i < s.length) {
+    if (s[i] === "'") {
+      if (i + 1 < s.length && s[i + 1] === "'") {
+        i += 2; // escaped quote → content
+        continue;
+      }
+      const stripped = s.slice(i + 1).replace(/^ +/, "");
+      if (stripped === "" || stripped[0] === "/") {
+        const comment = stripped[0] === "/" ? stripped.slice(1).trim() : "";
+        return { raw: s.slice(start, i), comment, isString: true };
+      }
+      i++; // lone quote, not a terminator → content
+    } else {
+      i++;
+    }
+  }
+  return { raw: s.slice(start), comment: "", isString: true }; // unterminated (defensive)
+}
+
+/**
+ * Raw value field (escapes intact) for a card, or null when it has no value field (port of the
+ * Python `_value_field`). Mirrors `parseCard`'s value-field selection: a standard `KEY = `
+ * card's value starts at column 10; a HIERARCH card's value starts after the first `=`.
+ */
+function rawValueField(text: string): string | null {
+  if (text.slice(8, 10) === "= ") return text.slice(10);
+  if (text.slice(0, 8).trimEnd() === "HIERARCH") {
+    const rest = text.slice(8);
+    const eq = rest.indexOf("=");
+    if (eq >= 0) return rest.slice(eq + 1);
+  }
+  return null;
+}
+
 /** Parse one 80-byte card; return null for END. */
 export function parseCard(raw: Uint8Array | string): CardRec | null {
   const text = cardText(raw);
@@ -124,10 +175,17 @@ export function parseCard(raw: Uint8Array | string): CardRec | null {
 
 /**
  * Parse a sequence of physical 80-byte cards, folding CONTINUE long-string
- * continuations. A string value whose text ends in `&` is continued by the
- * following CONTINUE cards; the fragments are concatenated (each `&`
- * sentinel dropped) and the comment taken from the last fragment. A lone
+ * continuations (port of the fixed Python `parse_cards`).
+ *
+ * Continuation is folded on the RAW escaped text before unescaping: astropy
+ * splits the escaped representation and can cut a `''` escape pair across a
+ * card boundary, so unescaping each card independently would misread the
+ * split `'` as a closing quote and truncate. The raw fragments (each `&`
+ * continuation sentinel dropped) are concatenated and `''`→`'` unescaped
+ * exactly once, with the comment taken from the last fragment. A lone
  * `&`-terminated value with no following CONTINUE keeps the `&` literally.
+ * Both standard `KEY = ` cards and HIERARCH long strings are folded (their
+ * value field is located by `rawValueField`).
  */
 export function parseCards(raws: readonly (Uint8Array | string)[]): CardRec[] {
   const cards: CardRec[] = [];
@@ -135,27 +193,31 @@ export function parseCards(raws: readonly (Uint8Array | string)[]): CardRec[] {
   const n = raws.length;
   const isContinue = (raw: Uint8Array | string): boolean => cardText(raw).slice(0, 8).trimEnd() === "CONTINUE";
   while (i < n) {
+    const base = i;
     const c = parseCard(raws[i]);
     i++;
     if (c === null) continue; // END
-    if (!c.commentary && typeof c.value === "string" && c.value.endsWith("&") && i < n && isContinue(raws[i])) {
-      const parts = [c.value.slice(0, -1)];
-      let comment = c.comment;
-      while (i < n && isContinue(raws[i])) {
-        const text = cardText(raws[i]);
-        const [fragRaw, contComment] = parseValueComment(text.slice(8));
-        i++;
-        if (contComment) comment = contComment;
-        const frag = typeof fragRaw === "string" ? fragRaw : "";
-        if (frag.endsWith("&")) {
-          parts.push(frag.slice(0, -1));
-        } else {
-          parts.push(frag);
-          break;
+    const field = !c.commentary && typeof c.value === "string" ? rawValueField(cardText(raws[base])) : null;
+    if (field !== null) {
+      const { raw, comment: baseComment, isString } = extractRawString(field);
+      if (isString && raw !== null && raw.endsWith("&") && i < n && isContinue(raws[i])) {
+        const parts = [raw.slice(0, -1)];
+        let comment = baseComment;
+        while (i < n && isContinue(raws[i])) {
+          const cont = extractRawString(cardText(raws[i]).slice(8));
+          i++;
+          if (cont.comment) comment = cont.comment;
+          const frag = cont.raw ?? "";
+          if (frag.endsWith("&")) {
+            parts.push(frag.slice(0, -1));
+          } else {
+            parts.push(frag);
+            break;
+          }
         }
+        c.value = parts.join("").replace(/''/g, "'").replace(/ +$/, "");
+        c.comment = comment;
       }
-      c.value = parts.join("");
-      c.comment = comment;
     }
     cards.push(c);
   }

@@ -3,7 +3,7 @@
  * An HDU is either *attached* (from an open file: `_hdulist` + `_index`) or
  * *detached* (built in JS with `_data`/`_header` for writing).
  */
-import { FitsHeaderError, FitsIOError, FitsOverflowError, FitsTypeError, NotSupportedError } from "./errors.js";
+import { FitsHeaderError, FitsIOError, FitsOverflowError, FitsTypeError, KeywordNotFound, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { FitsArray, asFitsArray } from "./fitsarray.js";
@@ -82,15 +82,81 @@ function commentaryCard(kw: string, value: HeaderValue): Uint8Array {
 function fitsValueLiteral(value: HeaderValue): string {
   if (typeof value === "boolean") return value ? "T" : "F";
   if (value === null || value === undefined) return "";
-  if (typeof value === "number" || typeof value === "bigint") return String(value);
+  if (typeof value === "number") return String(value).replace("e", "E"); // FITS exponents are uppercase
+  if (typeof value === "bigint") return String(value);
   return "'" + String(value).replace(/'/g, "''") + "'";
 }
 
-/** A best-effort 80-byte HIERARCH card: `HIERARCH tokens = value [/ comment]`. */
-function hierarchCard(kw: string, value: HeaderValue, comment: string): Uint8Array {
-  let body = "HIERARCH " + kw.trim() + " = " + fitsValueLiteral(value);
-  if (comment) body += " / " + comment;
-  return asciiBytes(body.slice(0, 80).padEnd(80));
+/**
+ * Largest cut ≤ `want` that does not split a `''` escape pair. `esc` always
+ * starts on a pair boundary (callers only advance by pair-safe takes), so a
+ * left-to-right walk decides pair membership unambiguously.
+ */
+function pairSafeTake(esc: string, want: number): number {
+  let j = 0;
+  while (j < want) {
+    if (esc[j] === "'") {
+      if (j + 1 === want) return want - 1;
+      j += 2;
+    } else {
+      j++;
+    }
+  }
+  return want;
+}
+
+/**
+ * The 80-byte card run for a HIERARCH keyword: one card when it fits, else
+ * HIERARCH+CONTINUE (port of the Python `_hierarch_cards`; astropy's layout).
+ *
+ * Long string values continue across CONTINUE cards: the base fragment fills
+ * to column 80 with the `&` sentinel inside the quotes, and the comment rides
+ * the last fragment or a dedicated `CONTINUE  '' / comment` card. The escaped
+ * text is chunked so a `''` escape pair is never split across cards. A
+ * non-string value never continues (the convention applies to strings only):
+ * its comment may be truncated, but a value that cannot fit throws instead of
+ * being silently cut (the old single-card builder truncated at 80 bytes).
+ */
+function hierarchCards(kw: string, value: HeaderValue, comment: string): Uint8Array[] {
+  let tokens = kw.trim();
+  if (/^hierarch /i.test(tokens)) tokens = tokens.slice(9).replace(/^ +/, ""); // never double the prefix
+  const prefix = "HIERARCH " + tokens + " = ";
+  const lit = fitsValueLiteral(value);
+  const body = prefix + lit + (comment ? " / " + comment : "");
+  if (body.length <= 80) return [asciiBytes(body.padEnd(80))]; // fast path: identical to the single-card form
+  if (typeof value !== "string") {
+    if ((prefix + lit).length <= 80) return [asciiBytes(body.slice(0, 80).padEnd(80))]; // only the comment is cut
+    throw new FitsHeaderError(207, `HIERARCH card for '${tokens}' does not fit in 80 columns`);
+  }
+  const esc = value.replace(/'/g, "''");
+  if (esc.length === 0) {
+    // Empty string value: only the comment overflows — truncate it.
+    return [asciiBytes((prefix + "'' / " + comment).slice(0, 80).padEnd(80))];
+  }
+  const ccost = comment ? 3 + comment.length : 0;
+  const cards: string[] = [];
+  let pos = 0;
+  let first = true;
+  let commentDone = !comment;
+  while (pos < esc.length) {
+    const head = first ? prefix : "CONTINUE  ";
+    const cap = 80 - head.length - 2; // columns between the quotes (incl. a possible '&')
+    const remaining = esc.length - pos;
+    const terminal = remaining <= cap - ccost;
+    const take = terminal ? remaining : pairSafeTake(esc.slice(pos), Math.min(cap - 1, remaining));
+    if (take <= 0) throw new FitsHeaderError(207, `HIERARCH keyword '${tokens}' leaves no room for a value`);
+    const frag = esc.slice(pos, pos + take);
+    pos += take;
+    first = false;
+    if (terminal) {
+      cards.push(head + "'" + frag + "'" + (comment ? " / " + comment : ""));
+      commentDone = true;
+      break;
+    }
+    cards.push(head + "'" + frag + "&'");
+  }
+  if (!commentDone) cards.push(("CONTINUE  '' / " + comment).slice(0, 80)); // astropy's dedicated comment card
+  return cards.map((t) => asciiBytes(t.padEnd(80)));
 }
 
 /**
@@ -276,6 +342,23 @@ export abstract class BaseHDU {
     if (isStructuralKeyword(key)) {
       throw new FitsHeaderError(207, `cannot set structural keyword '${key}' on an open header`);
     }
+    const keyS = key.trim();
+    if (keyS.includes(" ") || keyS.length > 8) {
+      // HIERARCH-convention keyword: the fixed-format ABI cannot express it (>8 chars fails
+      // Name.parse; an embedded space would stamp a spec-invalid keyword). Build the cards
+      // FIRST so a bad value cannot delete the old card and then fail; the Zig-side delete
+      // also removes an old CONTINUE run, so replacement never orphans continuations.
+      const cards = hierarchCards(keyS, value, comment ?? "");
+      const h = this._select();
+      const kb = enc(keyS);
+      try {
+        ll.check(ll.lib.zf_delete_key(h, kb, kb.length)); // matches HIERARCH names in Zig
+      } catch (e) {
+        if (!(e instanceof KeywordNotFound)) throw e;
+      }
+      for (const card of cards) ll.check(ll.lib.zf_write_record(h, card)); // insert-before-END keeps order
+      return;
+    }
     writeKeyValue(this._select(), key, value, comment);
   }
 
@@ -325,7 +408,9 @@ export abstract class BaseHDU {
         continue;
       }
       if (kw.includes(" ") || kw.length > 8) {
-        ll.check(ll.lib.zf_write_record(handle, hierarchCard(kw, value, comment)));
+        for (const card of hierarchCards(kw, value, comment)) {
+          ll.check(ll.lib.zf_write_record(handle, card));
+        }
         continue;
       }
       if (value === null || value === undefined) continue;

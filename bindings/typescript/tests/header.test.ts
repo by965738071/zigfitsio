@@ -84,6 +84,50 @@ describe("parseCards CONTINUE folding", () => {
     const cards = parseCards([pad80("KEY     = 'ends with &'"), pad80("END")]);
     expect(cards[0].value).toBe("ends with &");
   });
+
+  test("a '' escape pair split across the CONTINUE boundary folds on raw text (astropy split)", () => {
+    // astropy splits the ESCAPED representation and can cut a '' pair in half at a card
+    // boundary; unescaping each card independently misreads the split ' as a closing quote.
+    const value = "abc'def&".repeat(12) + "END"; // 99 chars, quotes and ampersands throughout
+    const escaped = value.replace(/'/g, "''");
+    const cut = 67; // cuts the 8th block's '' pair after its first '
+    expect(escaped[cut - 1]).toBe("'");
+    expect(escaped[cut]).toBe("'");
+    const cards = parseCards([
+      pad80("LSTR    = '" + escaped.slice(0, cut) + "&'"),
+      pad80("CONTINUE  '" + escaped.slice(cut) + "'"),
+      pad80("END"),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].value).toBe(value);
+  });
+
+  test("HIERARCH long string folds across CONTINUE (no leaked CONTINUE card)", () => {
+    const cards = parseCards([
+      pad80("HIERARCH ESO LONG STR = 'part one is here &'"),
+      pad80("CONTINUE  'part two here.'"),
+      pad80("END"),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].keyword).toBe("ESO LONG STR");
+    expect(cards[0].value).toBe("part one is here part two here.");
+  });
+
+  test("HIERARCH '' pair split across the CONTINUE boundary folds exactly", () => {
+    const value = "abc'def&".repeat(12) + "END";
+    const escaped = value.replace(/'/g, "''");
+    const cut = 49; // 6th block's '' pair; keeps the base card ≤ 80 with the HIERARCH prefix
+    expect(escaped[cut - 1]).toBe("'");
+    expect(escaped[cut]).toBe("'");
+    const cards = parseCards([
+      pad80("HIERARCH ESO LSTR = '" + escaped.slice(0, cut) + "&'"),
+      pad80("CONTINUE  '" + escaped.slice(cut) + "'"),
+      pad80("END"),
+    ]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].keyword).toBe("ESO LSTR");
+    expect(cards[0].value).toBe(value);
+  });
 });
 
 describe("Header", () => {
