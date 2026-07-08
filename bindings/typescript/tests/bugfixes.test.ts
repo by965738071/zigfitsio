@@ -1287,3 +1287,108 @@ describe("structural flush reconcile (insert/delete/reorder persist)", () => {
     withOpen(p, (chk) => expect(names(chk)).toEqual(["PRIMARY", "NEW", "A", "B"]));
   });
 });
+
+// BUGHUNT-2026-07-06 HIGH #6: repeated header COMMENT/HISTORY sets overwrote in
+// place (in memory) and persisted a malformed valued `COMMENT = 'text'` card,
+// silently dropping provenance. Commentary must accumulate, wrap >72 chars, and
+// support a mutable view — mirroring the Python fix.
+describe("commentary cards accumulate and persist (BUGHUNT #6)", () => {
+  const img = (): zf.FitsArray => new zf.FitsArray(fill(new Int16Array(4), () => 1), [2, 2]);
+  const read = <T>(p: string, fn: (hl: zf.HDUList) => T): T => {
+    const hl = zf.open(p);
+    try {
+      return fn(hl);
+    } finally {
+      hl.close();
+    }
+  };
+  const update = (p: string, fn: (hl: zf.HDUList) => void): void => {
+    const hl = zf.open(p, "update");
+    try {
+      fn(hl);
+    } finally {
+      hl.close();
+    }
+  };
+
+  test("detached: repeated COMMENT/HISTORY accumulate through writeTo", () => {
+    const hdu = new zf.PrimaryHDU({ data: img() });
+    hdu.header.set("COMMENT", "first note");
+    hdu.header.set("COMMENT", "second note");
+    hdu.header.addHistory("step 1");
+    hdu.header.addHistory("step 2");
+    expect(hdu.header.comments).toEqual(["first note", "second note"]);
+    expect(hdu.header.history).toEqual(["step 1", "step 2"]);
+    expect(hdu.header.keys().includes("COMMENT")).toBe(false);
+    const p = tmp.path();
+    new zf.HDUList([hdu]).writeTo(p);
+    read(p, (hl) => {
+      expect(hl.get(0).header.comments).toEqual(["first note", "second note"]);
+      expect(hl.get(0).header.history).toEqual(["step 1", "step 2"]);
+    });
+  });
+
+  test("update mode: eager commentary writes accumulate; no malformed valued card", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(9), [3, 3]));
+    update(p, (hl) => {
+      hl.get(0).header.set("COMMENT", "a");
+      hl.get(0).header.set("COMMENT", "b");
+      hl.get(0).header.addHistory("h1");
+    });
+    read(p, (hl) => {
+      expect(hl.get(0).header.comments).toEqual(["a", "b"]);
+      expect(hl.get(0).header.history).toEqual(["h1"]);
+    });
+    expect(readFileSync(p).includes(Buffer.from("COMMENT = '"))).toBe(false);
+  });
+
+  test("long commentary text wraps into ≤72-char cards", () => {
+    const long = "x".repeat(100);
+    const hdu = new zf.PrimaryHDU({ data: img() });
+    hdu.header.set("COMMENT", long);
+    expect(hdu.header.comments).toEqual([long.slice(0, 72), long.slice(72)]);
+    const p = tmp.path();
+    new zf.HDUList([hdu]).writeTo(p);
+    read(p, (hl) => {
+      const chunks = hl.get(0).header.comments;
+      expect(chunks.every((c) => c.length <= 72)).toBe(true);
+      expect(chunks.join("")).toBe(long);
+    });
+  });
+
+  test("mutable view in-place edit, replace-all, and delete-all persist in update mode", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(9), [3, 3]));
+    update(p, (hl) => {
+      const hdr = hl.get(0).header;
+      hdr.addComment("one");
+      hdr.addComment("two");
+      const v = hdr.commentary("COMMENT");
+      expect(v.length).toBe(2);
+      expect(v.toArray()).toEqual(["one", "two"]);
+      v.setAt(0, "ONE");
+    });
+    read(p, (hl) => expect(hl.get(0).header.comments).toEqual(["ONE", "two"]));
+    update(p, (hl) => hl.get(0).header.set("COMMENT", ["x", "y", "z"]));
+    read(p, (hl) => expect(hl.get(0).header.comments).toEqual(["x", "y", "z"]));
+    update(p, (hl) => hl.get(0).header.delete("COMMENT"));
+    read(p, (hl) => expect(hl.get(0).header.comments).toEqual([]));
+  });
+
+  test("blank-keyword ('') commentary append/edit/delete persist in update mode (finding 1)", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(new Float32Array(9), [3, 3]));
+    const blanks = (hdr: zf.Header): zf.HeaderValue[] =>
+      hdr.cards().filter(([kw]) => kw === "").map(([, v]) => v);
+    update(p, (hl) => {
+      hl.get(0).header.set("", "blank one");
+      hl.get(0).header.set("", "blank two");
+    });
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual(["blank one", "blank two"]));
+    update(p, (hl) => hl.get(0).header.commentary("").setAt(0, "EDITED"));
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual(["EDITED", "blank two"]));
+    update(p, (hl) => hl.get(0).header.delete(""));
+    read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual([]));
+  });
+});

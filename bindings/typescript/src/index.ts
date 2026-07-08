@@ -38,7 +38,16 @@ export {
   type StringColumn,
   type VlaColumn,
 } from "./table.js";
-export { Header, parseCard, parseCards, parseValueComment, type CardRec, type HeaderValue } from "./header.js";
+export {
+  Header,
+  parseCard,
+  parseCards,
+  parseValueComment,
+  wrapCommentary,
+  type CardRec,
+  type CommentaryView,
+  type HeaderValue,
+} from "./header.js";
 export { FitsArray, asFitsArray, type ElementOf } from "./fitsarray.js";
 export {
   tableFromArrays,

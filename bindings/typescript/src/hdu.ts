@@ -7,7 +7,7 @@ import { FitsHeaderError, FitsIOError, FitsOverflowError, FitsTypeError, Keyword
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { FitsArray, asFitsArray } from "./fitsarray.js";
-import { Header, parseCards, type HeaderValue } from "./header.js";
+import { Header, parseCards, wrapCommentary, type HeaderValue } from "./header.js";
 import { enc, fnv1a64, viewBytes } from "./util.js";
 import type { HDUList } from "./hdulist.js";
 
@@ -331,6 +331,7 @@ export abstract class BaseHDU {
     if (this._writable()) {
       hdr._persist = (key, value, comment) => this._writeKey(key, value, comment);
       hdr._delete = (key) => this._deleteKey(key);
+      hdr._resync = (keyword, texts) => this._resyncCommentary(keyword, texts);
     }
     // A read-only header edit is not persisted to the handle; flag it so save reconstructs.
     hdr._dirtyCb = () => this._markDirty();
@@ -339,6 +340,13 @@ export abstract class BaseHDU {
 
   /** @internal */
   _writeKey(key: string, value: HeaderValue, comment: string | null): void {
+    const up = key.toUpperCase();
+    if (up === "COMMENT" || up === "HISTORY" || up === "") {
+      // Commentary cards are appended verbatim (insert-before-END) as raw records, never written
+      // as valued keywords. Callers pre-split long text into ≤72-char chunks.
+      ll.check(ll.lib.zf_write_record(this._select(), commentaryCard(up, value)));
+      return;
+    }
     if (isStructuralKeyword(key)) {
       throw new FitsHeaderError(207, `cannot set structural keyword '${key}' on an open header`);
     }
@@ -367,6 +375,29 @@ export abstract class BaseHDU {
     const h = this._select();
     const kb = enc(key);
     ll.check(ll.lib.zf_delete_key(h, kb, kb.length));
+  }
+
+  /**
+   * @internal Rewrite every commentary card of `keyword` in the open handle to `texts`: delete all
+   * by name, then re-append (before END) as raw records. Used for in-place commentary edits,
+   * deletions, and array replace-all, where a single append cannot express the new state. Same
+   * delete-then-write-records idiom as the HIERARCH replacement path in `_writeKey`. For the blank
+   * keyword this also rewrites blank separator cards (they share the empty name), so an in-place
+   * edit/delete of blank commentary reorders every blank card — same as astropy.
+   */
+  _resyncCommentary(keyword: string, texts: HeaderValue[]): void {
+    const h = this._select();
+    const kb = enc(keyword);
+    for (;;) {
+      try {
+        ll.check(ll.lib.zf_delete_key(h, kb, kb.length));
+      } catch (e) {
+        if (e instanceof KeywordNotFound) break;
+        throw e;
+      }
+    }
+    const up = keyword.toUpperCase();
+    for (const t of texts) ll.check(ll.lib.zf_write_record(h, commentaryCard(up, t)));
   }
 
   get name(): string {
@@ -404,7 +435,11 @@ export abstract class BaseHDU {
       // verbatim so COMMENT/HISTORY provenance and HIERARCH keywords survive
       // the reconstruction (non-pristine) path.
       if (up === "COMMENT" || up === "HISTORY" || up === "") {
-        ll.check(ll.lib.zf_write_record(handle, commentaryCard(kw, value)));
+        // Wrap so a >72-char commentary card (e.g. built via Header.fromCards) spans multiple
+        // records instead of truncating; set-time cards are already ≤72.
+        for (const chunk of wrapCommentary(value)) {
+          ll.check(ll.lib.zf_write_record(handle, commentaryCard(kw, chunk)));
+        }
         continue;
       }
       if (kw.includes(" ") || kw.length > 8) {

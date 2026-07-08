@@ -313,6 +313,7 @@ export class HDUList implements Iterable<AnyHDU> {
         const bound = hdu;
         hdu._header._persist = (key, value, comment) => bound._writeKey(key, value, comment);
         hdu._header._delete = (key) => bound._deleteKey(key);
+        hdu._header._resync = (keyword, texts) => bound._resyncCommentary(keyword, texts);
         hdu._header._dirtyCb = () => bound._markDirty();
       }
     }

@@ -13,7 +13,7 @@
  * stays a `number` and the unsigned-convention detection ports 1:1, while
  * larger-than-2^53 odd values stay exact as `bigint`.
  */
-import { KeywordNotFound } from "./errors.js";
+import { FitsTypeError, KeywordNotFound } from "./errors.js";
 
 export type HeaderValue = string | number | bigint | boolean | null;
 
@@ -30,6 +30,36 @@ const card = (keyword: string, value: HeaderValue, comment = "", commentary = fa
   comment,
   commentary,
 });
+
+const COMMENTARY_KEYWORDS = new Set(["COMMENT", "HISTORY", ""]);
+const isCommentaryKey = (key: string): boolean => COMMENTARY_KEYWORDS.has(key.toUpperCase());
+
+/**
+ * Split commentary text into physical-card chunks of ≤72 chars (a COMMENT/HISTORY/blank card holds
+ * free text in columns 9-80). Empty text yields one blank card, matching astropy — which splits
+ * long commentary into multiple cards at assignment time rather than truncating.
+ */
+export function wrapCommentary(value: HeaderValue): string[] {
+  const text = value === null || value === undefined ? "" : String(value);
+  if (text.length === 0) return [""];
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += 72) out.push(text.slice(i, i + 72));
+  return out;
+}
+
+/**
+ * A mutable, list-like view over one keyword's COMMENT/HISTORY/blank cards — the TS analogue of the
+ * object astropy returns from `header['COMMENT']`. `setAt`/`removeAt`/`append` mutate the owning
+ * `Header` and persist to an attached writable file.
+ */
+export interface CommentaryView extends Iterable<HeaderValue> {
+  readonly length: number;
+  at(index: number): HeaderValue | undefined;
+  toArray(): HeaderValue[];
+  setAt(index: number, text: HeaderValue): void;
+  removeAt(index: number): void;
+  append(text: HeaderValue): void;
+}
 
 const INT_TOKEN = /^[+-]?\d+$/;
 
@@ -232,6 +262,11 @@ export class Header implements Iterable<[string, HeaderValue]> {
   /** @internal Persist-first delete hook. */
   _delete: ((key: string) => void) | null = null;
   /**
+   * @internal Rewrite-all hook for commentary edits/deletes/replace-all on an attached writable
+   * handle (delete-all-by-name then re-append). Null on read-only/detached headers.
+   */
+  _resync: ((keyword: string, texts: HeaderValue[]) => void) | null = null;
+  /**
    * @internal Called after an edit that is NOT persisted to an open handle
    * (read-only mode), so the owning HDUList can flag itself dirty and
    * reconstruct rather than copy stale bytes on save.
@@ -255,6 +290,10 @@ export class Header implements Iterable<[string, HeaderValue]> {
   }
 
   has(key: string): boolean {
+    if (isCommentaryKey(key)) {
+      const ku = key.toUpperCase();
+      return this._cards.some((c) => c.commentary && c.keyword.toUpperCase() === ku);
+    }
     return this._find(key) >= 0;
   }
 
@@ -272,17 +311,28 @@ export class Header implements Iterable<[string, HeaderValue]> {
     return this._cards[i].value;
   }
 
-  set(key: string, value: HeaderValue, comment?: string): void {
+  set(key: string, value: HeaderValue | readonly HeaderValue[], comment?: string): void {
+    // Commentary keywords accumulate (append), never overwrite; a passed array replaces all of
+    // them. Handled first — the (key, value, comment) valued path does not apply to commentary.
+    if (isCommentaryKey(key)) {
+      this._setCommentary(key.toUpperCase(), value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      // An array is a commentary replace-all; for a valued keyword it would stamp a malformed card.
+      throw new FitsTypeError(410, `array values are only valid for commentary keywords, not '${key}'`);
+    }
+    const v = value as HeaderValue;
     const i = this._find(key);
     const resolvedComment = comment !== undefined ? comment : i >= 0 ? this._cards[i].comment : "";
     // Persist FIRST: a rejected edit (a structural keyword, or a read-only
     // device) must not leave a bogus card in the in-memory header.
-    if (this._persist !== null) this._persist(key, value, resolvedComment);
+    if (this._persist !== null) this._persist(key, v, resolvedComment);
     if (i >= 0) {
-      this._cards[i].value = value;
+      this._cards[i].value = v;
       if (comment !== undefined) this._cards[i].comment = comment;
     } else {
-      this._cards.push(card(key.toUpperCase(), value, comment ?? ""));
+      this._cards.push(card(key.toUpperCase(), v, comment ?? ""));
     }
     if (this._persist === null && this._dirtyCb !== null) {
       this._dirtyCb(); // read-only edit → not in the handle's bytes; reconstruct on save
@@ -290,11 +340,134 @@ export class Header implements Iterable<[string, HeaderValue]> {
   }
 
   delete(key: string): void {
+    // Deleting a commentary keyword removes ALL of its cards (astropy semantics).
+    if (isCommentaryKey(key)) {
+      const ku = key.toUpperCase();
+      const idxs = this._commentaryIndices(ku);
+      if (idxs.length === 0) throw new KeywordNotFound(202, `keyword ${key} not found in header`);
+      for (let j = idxs.length - 1; j >= 0; j--) this._cards.splice(idxs[j], 1);
+      this._resyncKeyword(ku); // empty texts → delete-all in the handle (or mark dirty)
+      return;
+    }
     const i = this._find(key);
     if (i < 0) throw new KeywordNotFound(202, `keyword ${key} not found in header`);
     if (this._delete !== null) this._delete(key); // persist first; on failure the in-memory card is retained
     this._cards.splice(i, 1);
     if (this._delete === null && this._dirtyCb !== null) this._dirtyCb();
+  }
+
+  /** Append a COMMENT card (astropy-compatible). Long text spans multiple cards. */
+  addComment(value: HeaderValue): void {
+    this._setCommentary("COMMENT", value);
+  }
+
+  /** Append a HISTORY card (astropy-compatible). Long text spans multiple cards. */
+  addHistory(value: HeaderValue): void {
+    this._setCommentary("HISTORY", value);
+  }
+
+  /**
+   * A mutable, list-like view over the COMMENT/HISTORY/blank cards of `keyword` (astropy's
+   * `header['COMMENT']`). Absent keyword → an empty view. Mutations persist to an attached file.
+   *
+   * `append` is O(1); a single `setAt`/`removeAt` rewrites all k cards of the keyword to persist,
+   * so replacing many at once via `set(keyword, [...])` is cheaper than a loop of per-index edits.
+   */
+  commentary(keyword: string): CommentaryView {
+    const kw = keyword.toUpperCase();
+    const self = this; // read self._cards fresh each call (a replace-all mutates it in place)
+    const indices = (): number[] => self._commentaryIndices(kw);
+    const resolve = (index: number, len: number): number => {
+      const p = index < 0 ? index + len : index;
+      if (p < 0 || p >= len) throw new RangeError(`commentary index ${index} out of range`);
+      return p;
+    };
+    return {
+      get length(): number {
+        return indices().length;
+      },
+      at(index: number): HeaderValue | undefined {
+        const idx = indices();
+        const p = index < 0 ? index + idx.length : index;
+        return p >= 0 && p < idx.length ? self._cards[idx[p]].value : undefined;
+      },
+      toArray(): HeaderValue[] {
+        return indices().map((i) => self._cards[i].value);
+      },
+      setAt(index: number, text: HeaderValue): void {
+        const idx = indices();
+        const pos = idx[resolve(index, idx.length)];
+        const chunks = wrapCommentary(text);
+        self._cards[pos].value = chunks[0];
+        for (let off = 1; off < chunks.length; off++) {
+          // over-long text spills into new cards after this one
+          self._cards.splice(pos + off, 0, card(kw, chunks[off], "", true));
+        }
+        self._resyncKeyword(kw);
+      },
+      removeAt(index: number): void {
+        const idx = indices();
+        self._cards.splice(idx[resolve(index, idx.length)], 1);
+        self._resyncKeyword(kw);
+      },
+      append(text: HeaderValue): void {
+        self._setCommentary(kw, text);
+      },
+      [Symbol.iterator](): Iterator<HeaderValue> {
+        return indices()
+          .map((i) => self._cards[i].value)
+          [Symbol.iterator]();
+      },
+    };
+  }
+
+  /** @internal Ordered indices of the commentary cards for `keyword` (already uppercased). */
+  private _commentaryIndices(keyword: string): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < this._cards.length; i++) {
+      const c = this._cards[i];
+      if (c.commentary && c.keyword.toUpperCase() === keyword) out.push(i);
+    }
+    return out;
+  }
+
+  /**
+   * @internal Append (scalar) or replace-all (array) commentary cards for `keyword`. Each logical
+   * entry is split into ≤72-char physical cards. Appending persists eagerly one card at a time
+   * (O(1) per card); replace-all rewrites every card of the keyword through `_resync`.
+   */
+  private _setCommentary(keyword: string, value: HeaderValue | readonly HeaderValue[]): void {
+    if (Array.isArray(value)) {
+      // Drop existing cards of this keyword in place (don't rebind _cards; a live view holds it).
+      for (let i = this._cards.length - 1; i >= 0; i--) {
+        const c = this._cards[i];
+        if (c.commentary && c.keyword.toUpperCase() === keyword) this._cards.splice(i, 1);
+      }
+      for (const item of value as readonly HeaderValue[]) {
+        for (const chunk of wrapCommentary(item)) this._cards.push(card(keyword, chunk, "", true));
+      }
+      this._resyncKeyword(keyword);
+      return;
+    }
+    for (const chunk of wrapCommentary(value as HeaderValue)) {
+      // Persist FIRST so a rejected write leaves no bogus in-memory card (mirrors valued keys).
+      if (this._persist !== null) this._persist(keyword, chunk, null);
+      this._cards.push(card(keyword, chunk, "", true));
+    }
+    if (this._persist === null && this._dirtyCb !== null) this._dirtyCb();
+  }
+
+  /**
+   * @internal Push the current in-memory commentary cards of `keyword` to an attached writable
+   * handle (rewrite-all), or flag the list dirty so a read-only edit reconstructs on save.
+   */
+  private _resyncKeyword(keyword: string): void {
+    if (this._resync !== null) {
+      const texts = this._cards.filter((c) => c.commentary && c.keyword.toUpperCase() === keyword).map((c) => c.value);
+      this._resync(keyword, texts);
+    } else if (this._dirtyCb !== null) {
+      this._dirtyCb();
+    }
   }
 
   /**

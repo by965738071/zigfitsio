@@ -17,7 +17,7 @@ import numpy as np
 
 from . import _dtypes as dt
 from . import lowlevel as ll
-from .header import Header, parse_cards
+from .header import Header, _wrap_commentary, parse_cards
 
 _VOID = c.c_void_p
 
@@ -420,12 +420,18 @@ class _HDU:
         if self._writable():
             hdr._persist = self._write_key
             hdr._delete = self._delete_key
+            hdr._resync = self._resync_commentary
         # A read-only header edit is not persisted to the handle; flag it so save reconstructs.
         hdr._dirty_cb = self._mark_dirty
         return hdr
 
     def _write_key(self, key: str, value: Any, comment: str | None):
         up = key.upper()
+        if up in ("COMMENT", "HISTORY", ""):
+            # Commentary cards are appended verbatim (insert-before-END) as raw records, never
+            # written as valued keywords. Callers pre-split long text into ≤72-char chunks.
+            ll.check(ll.lib.zf_write_record(self._select(), _commentary_card(up, value)))
+            return
         if up in _STRUCTURAL or up.startswith("NAXIS"):
             raise ll.FitsHeaderError(207, f"cannot set structural keyword {key!r} on an open header")
         value = _coerce_kw_value(value)
@@ -466,6 +472,25 @@ class _HDU:
         h = self._select()
         kb = _enc(key)
         ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
+
+    def _resync_commentary(self, keyword: str, texts):
+        """Rewrite every commentary card of ``keyword`` in the open handle to ``texts``: delete all
+        by name, then re-append (before END) as raw records. Used for in-place commentary edits,
+        deletions, and list replace-all, where a single append cannot express the new state. Same
+        delete-then-write-records idiom as the HIERARCH replacement path in ``_write_key``. Rewritten
+        cards migrate to the header end (spec-legal); exact placement holds via reconstruction. For
+        the blank keyword this also rewrites blank *separator* cards (they share the empty name), so
+        an in-place edit/delete of blank commentary reorders every blank card — same as astropy."""
+        h = self._select()
+        kb = _enc(keyword)
+        while True:
+            try:
+                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
+            except ll.KeywordNotFound:
+                break
+        up = keyword.upper()
+        for t in texts:
+            ll.check(ll.lib.zf_write_record(h, _commentary_card(up, t)))
 
     @property
     def name(self) -> str:
@@ -635,7 +660,10 @@ class ImageHDU(_HDU):
             # keywords; reconstruct their 80-byte card and write it verbatim so COMMENT/HISTORY
             # provenance and HIERARCH keywords survive the reconstruction (non-pristine) path.
             if up in ("COMMENT", "HISTORY", ""):
-                ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, value)))
+                # Wrap so a >72-char commentary card (e.g. built via Header._from_cards) spans
+                # multiple records instead of truncating; set-time cards are already ≤72.
+                for chunk in _wrap_commentary(value):
+                    ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, chunk)))
                 continue
             value = _coerce_kw_value(value)  # before the HIERARCH branch: numpy scalars normalize too
             if " " in kw or len(kw) > 8:
@@ -1324,6 +1352,7 @@ class HDUList(list):
                 # hook; future edits must reach THIS file's handle like any attached header's do.
                 hdu._header._persist = hdu._write_key
                 hdu._header._delete = hdu._delete_key
+                hdu._header._resync = hdu._resync_commentary
                 hdu._header._dirty_cb = hdu._mark_dirty
         self._scanned_count = len(self)
 

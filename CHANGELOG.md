@@ -46,6 +46,16 @@ All notable changes to `zigfitsio` are documented here. The format follows
 - **TypeScript**: the header parser folds CONTINUE long strings on the raw escaped text
   (port of the Python fix), so astropy quote-splits and `HIERARCH` long strings read
   correctly. (#31)
+- **Python & TypeScript**: repeated `COMMENT`/`HISTORY` (and blank-keyword) header
+  assignments now **accumulate** instead of overwriting — `header['COMMENT'] = a;
+  header['COMMENT'] = b` keeps both cards, so `HISTORY` provenance chains and multi-line
+  `COMMENT` annotations are no longer silently lost. Commentary is written as proper
+  commentary records (never a malformed `COMMENT = 'text'` valued card, including in
+  update mode) and text longer than 72 columns wraps across multiple cards instead of
+  truncating. Adds astropy-compatible surface: `header['COMMENT']` returns a mutable
+  list-like view (TS: `header.commentary('COMMENT')`), `add_comment`/`add_history`
+  (`addComment`/`addHistory`), assigning a list replaces all cards of the keyword, and
+  `del header['COMMENT']` removes them all. (#32)
 
 ## [0.1.2] - 2026-07-05
 

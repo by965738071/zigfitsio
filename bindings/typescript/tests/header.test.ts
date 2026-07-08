@@ -1,7 +1,7 @@
 /** Pure card-parser and Header unit tests (no native library needed). */
 import { describe, expect, test } from "./_harness/index.js";
 import { Header, parseCard, parseCards, parseValueComment } from "../src/header.js";
-import { KeywordNotFound } from "../src/errors.js";
+import { FitsTypeError, KeywordNotFound } from "../src/errors.js";
 
 const pad80 = (s: string): string => s.padEnd(80);
 
@@ -195,5 +195,79 @@ describe("Header", () => {
     expect(() => h.set("BAD", 2)).toThrow("rejected");
     expect(h.has("BAD")).toBe(false);
     expect(h.get("SAFE")).toBe(1);
+  });
+});
+
+describe("commentary cards (BUGHUNT #6)", () => {
+  test("set accumulates COMMENT/HISTORY instead of overwriting", () => {
+    const h = new Header();
+    h.set("COMMENT", "first");
+    h.set("COMMENT", "second");
+    h.set("HISTORY", "step1");
+    expect(h.comments).toEqual(["first", "second"]);
+    expect(h.history).toEqual(["step1"]);
+    expect(h.keys().includes("COMMENT")).toBe(false); // commentary is not a keyword record
+    expect(h.length).toBe(0);
+    expect(h.has("COMMENT")).toBe(true);
+  });
+
+  test("addComment/addHistory append", () => {
+    const h = new Header();
+    h.addComment("a");
+    h.addHistory("b");
+    expect(h.comments).toEqual(["a"]);
+    expect(h.history).toEqual(["b"]);
+  });
+
+  test("long commentary text wraps into ≤72-char cards", () => {
+    const h = new Header();
+    const long = "x".repeat(100);
+    h.set("COMMENT", long);
+    expect(h.comments).toEqual([long.slice(0, 72), long.slice(72)]);
+    expect(h.comments.every((c) => c.length <= 72)).toBe(true);
+  });
+
+  test("commentary() view: index, setAt, removeAt, append", () => {
+    const h = new Header();
+    h.addComment("one");
+    h.addComment("two");
+    const v = h.commentary("COMMENT");
+    expect(v.length).toBe(2);
+    expect(v.at(0)).toBe("one");
+    expect(v.at(-1)).toBe("two");
+    expect(v.toArray()).toEqual(["one", "two"]);
+    expect([...v]).toEqual(["one", "two"]);
+    v.setAt(0, "ONE");
+    expect(h.comments).toEqual(["ONE", "two"]);
+    v.removeAt(0);
+    expect(h.comments).toEqual(["two"]);
+    v.append("three");
+    expect(h.comments).toEqual(["two", "three"]);
+  });
+
+  test("array assignment replaces all; delete removes all", () => {
+    const h = new Header();
+    h.addComment("old");
+    h.set("COMMENT", ["p", "q", "r"]);
+    expect(h.comments).toEqual(["p", "q", "r"]);
+    h.delete("COMMENT");
+    expect(h.comments).toEqual([]);
+    expect(h.has("COMMENT")).toBe(false);
+  });
+
+  test("commentary set routes raw text to the persist hook, not a valued-key write", () => {
+    const h = new Header();
+    const calls: Array<[string, unknown]> = [];
+    h._persist = (key, value) => {
+      calls.push([key, value]);
+    };
+    h.set("COMMENT", "hello");
+    expect(calls).toEqual([["COMMENT", "hello"]]); // scalar chunk flows through as commentary text
+  });
+
+  test("array value on a valued keyword throws instead of stamping a malformed card", () => {
+    const h = new Header();
+    expect(() => h.set("BITPIX", [1, 2] as unknown as number)).toThrow(FitsTypeError);
+    expect(h.has("BITPIX")).toBe(false);
   });
 });

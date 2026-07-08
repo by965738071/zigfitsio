@@ -119,6 +119,28 @@ def test_zigfitsio_reads_astropy_hierarch_long_string(tmp_fits):
         assert hdul[0].header.comment_of("ESO LONG STR") == "provenance"
 
 
+def test_astropy_reads_accumulated_commentary(tmp_fits):
+    """astropy must read back every accumulated COMMENT/HISTORY card, wrapping long text (BUGHUNT #6)."""
+    # A space-free token: FITS commentary right-strips trailing spaces per card (standard, done by
+    # astropy and our reader alike), so a boundary space would not survive — use unbroken text.
+    long_note = "abcdefghij0123456789" * 6  # 120 chars → two ≤72-char cards
+    p = tmp_fits()
+    hdu = zf.PrimaryHDU(data=np.ones((3, 3), dtype="i2"))
+    hdu.header["COMMENT"] = "note one"
+    hdu.header["COMMENT"] = "note two"
+    hdu.header.add_history("did a thing")
+    hdu.header.add_history("did another thing")
+    hdu.header["COMMENT"] = long_note  # spans multiple 72-char cards
+    zf.HDUList([hdu]).writeto(p, overwrite=True)
+    hdr = afits.getheader(p)
+    assert list(hdr["COMMENT"])[:2] == ["note one", "note two"]
+    assert list(hdr["HISTORY"]) == ["did a thing", "did another thing"]
+    # The long comment is split into ≤72-char cards; astropy joins them back to the original.
+    assert "".join(list(hdr["COMMENT"])[2:]) == long_note
+    with afits.open(p) as h:
+        h.verify("exception")
+
+
 def test_wcs_matches_astropy(tmp_fits):
     WCS = pytest.importorskip("astropy.wcs").WCS
     data = np.zeros((64, 64), dtype="f4")
