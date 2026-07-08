@@ -6,6 +6,8 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-07
+
 ### Fixed
 - **TypeScript**: `writeTo`/`toBytes` reconstruction of **table** and **compressed-image**
   HDUs no longer silently drops every user header keyword and `COMMENT`/`HISTORY` card —
