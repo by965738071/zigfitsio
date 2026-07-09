@@ -113,6 +113,20 @@
       "expected": "HDU 1 BITPIX--32 32x32 image; the exact f32 pixels zigfitsio must produce from the paired .fz"
     },
     {
+      "path": "compress/tile_rice_ddith.fits",
+      "sha256": "7acf337b2b69b8a8c443e6cc317c799e78172c20af40c69839ab688a66e81c45",
+      "generator": "CFITSIO gen_sources.c fits_img_compress (RICE_1, SUBTRACTIVE_DITHER_1, quantize level 4, fits_set_dither_seed(1)) over a 32x32 BITPIX--64 LCG noise+gradient field offset to ~1000 (f32 grid spacing 2^-14 ≫ the dither term, so any f32 funnel in the dequantization is observable), default 32x1 row-strip tiles",
+      "consumer": "CMP-4 quantized-double / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/RICE_1 ZBITPIX=-64 ZQUANTIZ=SUBTRACTIVE_DITHER_1 ZDITHER0=1; TiledImage.readAll(f64) reproduces tile_rice_ddith_expected.fits (funpack's full-double dequantized decode) bit-exactly (hunt 2026-07-06 item 41)"
+    },
+    {
+      "path": "compress/tile_rice_ddith_expected.fits",
+      "sha256": "2abb6e690be60ca65f0a1374d5c38509cf0b1666f0067f466eb69f95b400bd20",
+      "generator": "funpack -C over tile_rice_ddith.fits (the authoritative CFITSIO full-double dequantized decode)",
+      "consumer": "CMP-4 quantized-double (expected pixels)",
+      "expected": "HDU 1 BITPIX--64 32x32 image; the exact f64 pixels zigfitsio must produce from the paired .fz (pins the double-precision dequantization path, hunt 2026-07-06 item 41)"
+    },
+    {
       "path": "compress/tile_plio.fits",
       "sha256": "076c41db5eeb9448fe5dc42b179fc1057ca6b8476fabbd8f5e96fbae04fb4776",
       "generator": "fpack -C -p (PLIO_1) over a CFITSIO 16x16 BITPIX-16 positive identity ramp",

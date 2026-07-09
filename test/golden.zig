@@ -264,6 +264,53 @@ test "golden: CMP-4 quantized-float RICE_1 dithered tile decodes exactly like fu
     try expectQuantizedTile(testing.allocator, "compress/tile_rice_fdith.fits", "compress/tile_rice_fdith_expected.fits", "SUBTRACTIVE_DITHER_1");
 }
 
+// The f64 variant of `expectQuantizedTile`: the quantized-DOUBLE (ZBITPIX = -64) decode must
+// reproduce funpack's full-double dequantization to the exact f64 bit pattern. Pins the
+// double-precision read path permanently (hunt 2026-07-06 item 41: an f32 funnel in
+// `dither.unquantize` corrupted every pixel of every quantized double file; the fix also
+// matches CFITSIO/astropy's FMA-contracted `* ZSCALE + ZZERO` via `@mulAdd`).
+fn expectQuantizedTileF64(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8, quantiz: []const u8) !void {
+    const npix = noise_n;
+    var expected: [npix]f64 = undefined;
+    {
+        const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{expected_rel});
+        defer alloc.free(path);
+        var f = try fits.openFile(alloc, path, .read_only, .{});
+        defer f.deinit();
+        const hdu = try f.select(1);
+        try testing.expectEqual(@as(i64, -64), try hdu.header.getValue(i64, "BITPIX"));
+        try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+        var v = try fits.ImageView.of(&f, hdu);
+        try v.readAll(f64, &expected, .{ .scaling = .{ .mode = .raw } });
+    }
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    const zq = try hdu.header.getString(alloc, "ZQUANTIZ");
+    defer alloc.free(zq);
+    try testing.expectEqualStrings(quantiz, std.mem.trim(u8, zq, " "));
+    try testing.expectEqual(@as(i64, -64), try hdu.header.getValue(i64, "ZBITPIX"));
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, npix), ti.elementCount());
+    var out: [npix]f64 = undefined;
+    try ti.readAll(f64, &out);
+    for (expected, out, 0..) |e, g, i| {
+        testing.expectEqual(@as(u64, @bitCast(e)), @as(u64, @bitCast(g))) catch |err| {
+            std.debug.print("pixel {d}: expected {e}, got {e}\n", .{ i, e, g });
+            return err;
+        };
+    }
+}
+
+test "golden: CMP-4 quantized-double RICE_1 dithered tile decodes exactly like funpack at full f64 width (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTileF64(testing.allocator, "compress/tile_rice_ddith.fits", "compress/tile_rice_ddith_expected.fits", "SUBTRACTIVE_DITHER_1");
+}
+
 // CMP-5: a genuine CFITSIO `fpack -p` PLIO tile decodes to the exact ramp. This golden caught a
 // real interop bug — zigfitsio's PLIO codec omitted the 7-word IRAF/CFITSIO line-list header, so
 // it could neither read CFITSIO tiles nor write CFITSIO-readable ones. Fixed in

@@ -83,6 +83,39 @@ def main(root):
             state,
         )
 
+    # Quantized-DOUBLE tile (RICE dithered, ZBITPIX=-64): full f64-width dequantization.
+    # Tolerance is 1 ULP, NOT bit-exact: the final `* ZSCALE + ZZERO` is an FP-contraction
+    # point on which CFITSIO's own builds disagree at f64 width (FMA-contracted arm64 vs
+    # non-contracted baseline x86-64 — see interop/c/gen_sources.c; the f32 tiles above hide
+    # the wobble in their final f32 rounding). The expected file is authored by an
+    # FMA-contracted funpack; an Astropy wheel built without FMA lands 1 ULP away on a small
+    # fraction of pixels. zigfitsio's own decode is pinned bit-exactly in test/golden.zig
+    # (its fused @mulAdd is byte-deterministic on every target).
+    fz = os.path.join(root, "compress", "tile_rice_ddith.fits")
+    exp = os.path.join(root, "compress", "tile_rice_ddith_expected.fits")
+    with fits.open(fz) as hdul:
+        data = hdul[1].data
+    with fits.open(exp) as hdul:
+        want = hdul[0].data
+    got64 = np.ascontiguousarray(data, dtype="<f8")
+    want64 = np.ascontiguousarray(want, dtype="<f8")
+    _check(
+        data.dtype.kind == "f"
+        and data.dtype.itemsize == 8
+        and want.dtype.kind == "f"
+        and want.dtype.itemsize == 8
+        and bool(np.all(np.abs(got64 - want64) <= np.spacing(np.abs(want64)))),
+        "tile_rice_ddith == funpack expected (f64, <= 1 ULP)",
+        state,
+    )
+    # Non-vacuous at double width: the pixels must carry precision beyond the f32 grid
+    # (an f32 funnel anywhere in a decoder would zero this count — bug-hunt 2026-07-06 #41).
+    _check(
+        bool(np.count_nonzero(want64 != want64.astype(np.float32).astype(np.float64)) > 0),
+        "tile_rice_ddith expected pixels exceed f32 precision (non-vacuous)",
+        state,
+    )
+
     with fits.open(os.path.join(root, "images", "img_i16.fits")) as hdul:
         d = hdul[0].data.astype(np.int64).ravel()
         _check(np.array_equal(d, np.arange(32) - 8), "img_i16 value[i]=i-8", state)

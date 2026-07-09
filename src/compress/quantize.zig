@@ -547,7 +547,7 @@ test "quantizeTile: SUBTRACTIVE_DITHER_1 round-trips within delta via the matchi
     // Decode with the file-format reconstruction (same draws): |err| <= delta/2.
     var cur = dither.Dither.init(table, .subtractive_1, 42, 3);
     for (data, idata) |v, s| {
-        const rec = cur.unquantizeNext(s, p.bscale, p.bzero, std.math.nan(f32));
+        const rec = cur.unquantizeNext(s, p.bscale, p.bzero, std.math.nan(f64));
         try testing.expect(@abs(rec - v) <= 0.25 + 1e-6);
     }
 }
@@ -581,9 +581,9 @@ test "quantizeTile: SUBTRACTIVE_DITHER_2 preserves exact zeros via ZERO_VALUE" {
     try testing.expectEqual(dither.zero_value, idata[17]);
     var cur = dither.Dither.init(table, .subtractive_2, 1, 0);
     for (data, idata) |v, s| {
-        const rec = cur.unquantizeNext(s, r.quantized.bscale, r.quantized.bzero, std.math.nan(f32));
+        const rec = cur.unquantizeNext(s, r.quantized.bscale, r.quantized.bzero, std.math.nan(f64));
         if (v == 0.0) {
-            try testing.expectEqual(@as(f32, 0.0), rec);
+            try testing.expectEqual(@as(f64, 0.0), rec);
         } else {
             try testing.expect(@abs(rec - v) <= 0.0625 + 1e-6);
         }

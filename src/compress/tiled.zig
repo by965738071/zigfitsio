@@ -560,7 +560,7 @@ pub const TiledImage = struct {
         // A dithered file missing ZDITHER0 defaults to seed 1 (CFITSIO's default), matching the
         // write path (`CompressSpec.zdither0 = 1`) and how funpack reads such a file.
         const zd = self.zdither0 orelse 1;
-        const nan = std.math.nan(f32);
+        const nan = std.math.nan(f64);
 
         var row: u64 = 0;
         while (row < self.ntiles_total) : (row += 1) {
@@ -605,7 +605,7 @@ pub const TiledImage = struct {
                     // with the encoder) and maps the reserved `null_value` to NaN; a declared
                     // `ZBLANK` overrides that sentinel so its pixels also read back as NaN.
                     const fval = cur.unquantizeNext(s, zs, zz, nan);
-                    const sub: f32 = if (blank) |bl| (if (@as(i64, s) == bl) nan else fval) else fval;
+                    const sub: f64 = if (blank) |bl| (if (@as(i64, s) == bl) nan else fval) else fval;
                     out[@intCast(full)] = try convert.cast(T, sub, .bulk);
                 }
             } else {
@@ -3247,6 +3247,46 @@ test "writeCompressed quantized-float: noise-based default level, f64 pixels, lo
     // Noise-based q=4 ⇒ step ≈ sigma/4 where sigma ≈ the (u−0.5)·8 noise MAD; generous sanity
     // bound (the exact step is pinned separately by the quantizer's reference vectors).
     for (src, out) |s, o| try testing.expect(@abs(o - s) <= 1.5);
+}
+
+test "writeCompressed quantized f64: dequantization keeps full double precision (no f32 funnel)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Values ~1000 make the f32 grid spacing (2^-14 ≈ 6.1e-5) far coarser than the dither
+    // term's contribution, so an f32 funnel anywhere in the dequantization is observable.
+    var src: [32 * 32]f64 = undefined;
+    fillNoiseField(f64, &src, 32, 1000.0);
+    const hdu = try writeCompressed(f64, &fx.f, .{
+        .bitpix = -64,
+        .axes = &.{ 32, 32 },
+        .codec = .rice_1,
+        .quantize = .subtractive_dither_1,
+        .zdither0 = 1,
+        .quantize_level = -0.25, // absolute step ⇒ deterministic |err| ≤ 0.125 bound
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(Quantize.subtractive_dither_1, ti.quantize);
+    var out: [32 * 32]f64 = undefined;
+    try ti.readAll(f64, &out);
+    // Canary: the dequantized `(stored − r + 0.5)·ZSCALE + ZZERO` values carry the f32 dither
+    // draw's low bits, so virtually none of them sit on the f32 grid. If the read path is ever
+    // funneled through f32 again, every pixel becomes f32-representable and this fails.
+    var beyond_f32: usize = 0;
+    var lossy: usize = 0;
+    for (src, out) |s, o| {
+        try testing.expect(@abs(o - s) <= 0.125 + 1e-9);
+        if (o != @as(f64, @as(f32, @floatCast(o)))) beyond_f32 += 1;
+        if (o != s) lossy += 1;
+    }
+    try testing.expect(beyond_f32 > 0);
+    // Guard the canary itself: the source values are not f32-representable either, so a silent
+    // lossless fallback (raw f64s stored verbatim, `out == src`) would pass the check above
+    // without the dequantization ever running. Quantization is lossy — some pixel must differ.
+    try testing.expect(lossy > 0);
 }
 
 test "writeCompressed quantized-float: NaN emits ZBLANK, ±Inf tile falls back lossless (HCOMPRESS)" {

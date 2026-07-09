@@ -7,6 +7,14 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Core**: quantized (lossy) `BITPIX = -64` tile-compressed images are dequantized in
+  **full double precision** — `dither.unquantize`/`unquantizeNext` returned `f32`, silently
+  truncating every pixel of every quantized double file to a 24-bit mantissa (~6e-5 absolute
+  error at pixel values ~1000; 0/4096 pixels matched funpack/astropy). The reconstruction
+  now runs and returns `f64`, and uses a fused `@mulAdd` for the final `× ZSCALE + ZZERO`
+  step, matching CFITSIO's and astropy's FMA-contracted builds bit-for-bit on every target.
+  A funpack-authored quantized-double golden (`compress/tile_rice_ddith*`) pins the path
+  permanently; `ZBITPIX = -32` decodes are byte-identical to before.
 - **TypeScript**: `writeTo`/`toBytes` reconstruction of an attached table addresses columns
   **by name, not position** — reassigning `hdu.data` with a `TableData` whose columns are
   reordered, renamed, retyped, added, or dropped no longer silently truncates values through

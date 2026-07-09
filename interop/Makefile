@@ -31,7 +31,8 @@ golden: $(GEN)
 	      $(CMP)/tile_hcompress_lossy16.fits $(CMP)/tile_hcompress_lossy16_expected.fits \
 	      $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_smooth_expected.fits \
 	      $(CMP)/tile_hcompress_fq0.fits $(CMP)/tile_hcompress_fq0_expected.fits \
-	      $(CMP)/tile_hcompress_fdith_expected.fits $(CMP)/tile_rice_fdith_expected.fits
+	      $(CMP)/tile_hcompress_fdith_expected.fits $(CMP)/tile_rice_fdith_expected.fits \
+	      $(CMP)/tile_rice_ddith_expected.fits
 	fpack -C -r      -O $(CMP)/tile_rice.fits      $(CMP)/src_rice.fits
 	fpack -C -g1     -O $(CMP)/tile_gzip.fits      $(CMP)/src_gzip.fits
 	fpack -C -h -s 0 -O $(CMP)/tile_hcompress.fits $(CMP)/src_hcompress.fits
@@ -52,6 +53,10 @@ golden: $(GEN)
 	funpack -C -O $(CMP)/tile_hcompress_fq0_expected.fits   $(CMP)/tile_hcompress_fq0.fits
 	funpack -C -O $(CMP)/tile_hcompress_fdith_expected.fits $(CMP)/tile_hcompress_fdith.fits
 	funpack -C -O $(CMP)/tile_rice_fdith_expected.fits      $(CMP)/tile_rice_fdith.fits
+	# 2d. Quantized-DOUBLE tile (BITPIX=-64): dithered, authored by the C generator (pinned
+	#     ZDITHER0), decoded by funpack at full f64 width. Pins the double-precision
+	#     dequantization path (hunt 2026-07-06 item 41: an f32 funnel corrupted every pixel).
+	funpack -C -O $(CMP)/tile_rice_ddith_expected.fits      $(CMP)/tile_rice_ddith.fits
 	# 3. The intermediate uncompressed sources are not committed — only the .fz tiles are.
 	rm -f $(CMP)/src_*.fits
 	# 4. Determinism normalizer (defensive: strips any DATE / timestamped comment a tool injects).

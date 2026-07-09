@@ -158,10 +158,12 @@ static void gen_hcomp_lossy(const char *root, const char *rel, int smooth) {
  * zero computes fl(s*zscale) == -zzero exactly and the final `s*zscale + zzero` becomes a
  * catastrophic cancellation whose result depends on FP contraction: an FMA-contracted CFITSIO
  * build (e.g. Homebrew arm64 clang, -ffp-contract=on) yields a 2^-53-order residual where a
- * non-contracted build (baseline x86-64, and zigfitsio/astropy) yields exactly 0.0 — observed
- * empirically with this very corpus. CFITSIO is therefore not bit-stable across its own builds
- * for near-zero reconstructions; all-positive data keeps every golden off that knife edge so
- * every reference build decodes to identical bits. */
+ * non-contracted build (baseline x86-64) yields exactly 0.0 — observed empirically with this
+ * very corpus. CFITSIO is therefore not bit-stable across its own builds for near-zero
+ * reconstructions; all-positive data keeps every golden off that knife edge so every reference
+ * build decodes to identical bits. (zigfitsio's dequantization deliberately uses a fused
+ * @mulAdd — src/compress/dither.zig unquantize — matching the FMA-contracted builds bit-for-bit
+ * on every target; astropy's vendored-CFITSIO wheels follow their compile target.) */
 
 #define NOISE_W 32
 #define NOISE_H 32
@@ -212,6 +214,54 @@ static void gen_quantized_f32(const char *root, const char *rel, int comptype) {
     fits_img_compress(in, out, &status);                   check(status, "quantized compress");
     fits_close_file(out, &status);                         check(status, "quantized close out");
     fits_close_file(in, &status);                          check(status, "quantized close in");
+}
+
+/* ── 32x32 f64 noise+gradient source for the QUANTIZED-double tile golden ─────────────────
+ * The same LCG field as gen_noise_f32 but offset +1000.0 and stored as double. At |value|
+ * ≈ 1000 the f32 grid spacing (2^-14 ≈ 6.1e-5) towers over the dither term's low bits, so a
+ * decoder that funnels the dequantization through f32 corrupts every pixel — the exact bug
+ * (hunt 2026-07-06 item 41) whose fix the paired expected file pins at full f64 width. Every
+ * FP step below is EXACT in double (1000 + gradient + m·2^-21 spans 31 bits < 53), so the
+ * committed bytes stay deterministic across platforms; all-positive for the same
+ * cancellation-avoidance reason as the f32 field above. */
+static void gen_noise_f64(const char *root, const char *rel) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { NOISE_W, NOISE_H };
+    double data[NOISE_N];
+    unsigned int state = 12345u; /* fixed LCG seed — part of the determinism contract */
+    for (int i = 0; i < NOISE_N; i++) {
+        state = state * 1664525u + 1013904223u;
+        double u = (double)(state >> 8) / 16777216.0; /* exact: 24-bit / 2^24 */
+        int r = i / NOISE_W, c = i % NOISE_W;
+        data[i] = 1000.0 + (double)(r + c) * 0.5 + (u - 0.5) * 8.0;
+    }
+    fits_create_file(&f, path, &status);          check(status, "noise_f64 create");
+    fits_create_img(f, DOUBLE_IMG, 2, naxes, &status); check(status, "noise_f64 img");
+    fits_write_img(f, TDOUBLE, 1, NOISE_N, data, &status); check(status, "noise_f64 write");
+    fits_close_file(f, &status);                  check(status, "noise_f64 close");
+}
+
+/* compress/tile_rice_ddith.fits — the f64 noise source quantized with SUBTRACTIVE_DITHER_1
+ * (q = 4) under RICE_1, ZDITHER0 pinned to 1 (same clock-derived-seed reasoning as
+ * gen_quantized_f32). The funpack-authored expected decode stays BITPIX=-64. */
+static void gen_quantized_f64(const char *root, const char *rel, int comptype) {
+    char srcpath[1024], path[1024];
+    snprintf(srcpath, sizeof srcpath, "%s/%s", root, "compress/src_f64.fits");
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *in, *out;
+    fits_open_file(&in, srcpath, READONLY, &status);       check(status, "quantized64 open src");
+    fits_create_file(&out, path, &status);                 check(status, "quantized64 create");
+    fits_set_compression_type(out, comptype, &status);     check(status, "quantized64 ctype");
+    fits_set_quantize_method(out, SUBTRACTIVE_DITHER_1, &status); check(status, "quantized64 method");
+    fits_set_quantize_level(out, 4.0f, &status);           check(status, "quantized64 level");
+    fits_set_dither_seed(out, 1, &status);                 check(status, "quantized64 seed");
+    fits_img_compress(in, out, &status);                   check(status, "quantized64 compress");
+    fits_close_file(out, &status);                         check(status, "quantized64 close out");
+    fits_close_file(in, &status);                          check(status, "quantized64 close in");
 }
 
 /* ── Plain inbound images (X-INTEROP inbound) ─────────────────────────────────────────────*/
@@ -470,6 +520,11 @@ int main(int argc, char **argv) {
     gen_noise_f32(root, "compress/src_f32.fits");
     gen_quantized_f32(root, "compress/tile_hcompress_fdith.fits", HCOMPRESS_1);
     gen_quantized_f32(root, "compress/tile_rice_fdith.fits", RICE_1);
+
+    /* quantized-double tile: authored here for the same pinned-ZDITHER0 reason; funpack
+     * authors its expected decode in the Makefile. */
+    gen_noise_f64(root, "compress/src_f64.fits");
+    gen_quantized_f64(root, "compress/tile_rice_ddith.fits", RICE_1);
 
     /* plain inbound */
     gen_img_i16(root);
