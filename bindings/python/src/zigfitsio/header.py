@@ -7,9 +7,16 @@ file, are persisted immediately through an injected ``_persist`` callback.
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Any, Callable, Iterator, Optional
 
 _COMMENTARY = ("COMMENT", "HISTORY", "")
+
+# FITS 4.0 §4.2.4 real grammar (with the FORTRAN D exponent). Bare ``float()`` also accepts
+# ``nan``/``inf``/``infinity`` and ``1_000.5``, none of which are valid FITS reals — such tokens
+# must fall through as strings, matching the TypeScript parser and the strict Zig-core reader.
+_FITS_REAL = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[EDed][+-]?\d+)?\Z")
 
 
 class _Card:
@@ -66,10 +73,11 @@ def _parse_value_comment(field: str):
         return int(token), comment
     except ValueError:
         pass
-    try:
-        return float(token.replace("D", "E").replace("d", "e")), comment
-    except ValueError:
-        return token, comment
+    if _FITS_REAL.match(token):
+        f = float(token.replace("D", "E").replace("d", "e"))
+        if math.isfinite(f):  # a finite FITS real cannot overflow to ±inf (e.g. '1E999')
+            return f, comment
+    return token, comment
 
 
 def _extract_raw_string(field: str):

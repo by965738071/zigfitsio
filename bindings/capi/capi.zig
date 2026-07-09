@@ -711,7 +711,9 @@ pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usiz
     return 0;
 }
 
-/// Insert a raw 80-byte card before END.
+/// Insert a raw 80-byte card before END. Like CFITSIO's `ffprec`, the value field is NOT
+/// validated (only printable-ASCII and the keyword name are) — callers building raw cards
+/// must guard their own values (e.g. the bindings reject non-finite reals before this call).
 pub export fn zf_write_record(h_opt: ?*Handle, card80: [*]const u8) c_int {
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);

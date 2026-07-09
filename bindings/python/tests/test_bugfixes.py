@@ -1481,3 +1481,64 @@ def test_detached_bintable_data_writes_rows():
     arec = np.zeros(2, dtype=[("A", "i4")])
     with pytest.raises(NotImplementedError):
         zf.HDUList([zf.PrimaryHDU(), zf.AsciiTableHDU(data=arec)]).to_bytes()
+
+
+# ── #25/#27 non-finite float header values must be rejected on write ──────────────────────────
+def test_nonfinite_float_keyword_raises_create_mode():
+    # NaN/Inf would format as bare 'nan'/'inf' tokens — cards no reader (including this
+    # library's own parser) accepts. The write must fail fast instead.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        h = zf.Header()
+        h["KNAN"] = bad
+        with pytest.raises(zf.FitsError):
+            zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="f4"), header=h)]).to_bytes()
+
+
+def test_nonfinite_float_keyword_raises_update_mode(tmp_fits):
+    p = tmp_fits("nf.fits")
+    zf.writeto(p, np.arange(4, dtype="f4"), overwrite=True)
+    with zf.open(p, mode="update") as hdul:
+        with pytest.raises(zf.FitsError):
+            hdul[0].header["KINF"] = float("inf")
+    with zf.open(p) as hdul:  # the failed write left the file readable and unchanged
+        assert "KINF" not in hdul[0].header
+
+
+def test_nonfinite_numpy_float_keyword_raises():
+    h = zf.Header()
+    h["KNAN32"] = np.float32("nan")
+    with pytest.raises(zf.FitsError):
+        zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="f4"), header=h)]).to_bytes()
+
+
+def test_nonfinite_hierarch_float_raises():
+    # The HIERARCH path builds raw 80-byte cards client-side (zf_write_record), bypassing the
+    # Zig-core builder — the Python-level guard must cover it too.
+    h = zf.Header()
+    h["ESO DET BAD GAIN"] = float("-inf")
+    with pytest.raises(zf.FitsError):
+        zf.HDUList([zf.PrimaryHDU(data=np.arange(4, dtype="f4"), header=h)]).to_bytes()
+
+
+def test_bare_nan_token_reads_as_string_not_float():
+    # A hostile file carrying an invalid bare 'nan'/'inf' value token: bare float() used to turn
+    # it into float('nan'). It must fall through as a string (matching the TypeScript parser),
+    # while the typed C-ABI read keeps rejecting it with status 207.
+    cards = [
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "BADF    =                  nan / not a FITS real",
+        "BADI    =                  inf",
+        "GOODF   =                 1.5E2",
+        "END",
+    ]
+    raw = "".join(s.ljust(80) for s in cards).ljust(2880).encode("ascii")
+    with zf.from_bytes(raw) as hdul:
+        hh = hdul[0].header
+        assert hh["BADF"] == "nan" and isinstance(hh["BADF"], str)
+        assert hh["BADI"] == "inf" and isinstance(hh["BADI"], str)
+        assert hh["GOODF"] == pytest.approx(150.0)  # legit reals still parse
+        out = c.c_double()
+        kb = b"BADF"
+        assert ll.lib.zf_read_key_dbl(hdul[0]._select(), kb, len(kb), c.byref(out)) == 207

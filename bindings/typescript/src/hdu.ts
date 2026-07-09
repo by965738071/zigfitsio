@@ -90,7 +90,14 @@ function commentaryCard(kw: string, value: HeaderValue): Uint8Array {
 function fitsValueLiteral(value: HeaderValue): string {
   if (typeof value === "boolean") return value ? "T" : "F";
   if (value === null || value === undefined) return "";
-  if (typeof value === "number") return String(value).replace("e", "E"); // FITS exponents are uppercase
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      // FITS has no NaN/Inf spelling; `String(NaN)` would stamp a literal "NaN" token no
+      // reader accepts. This raw-card path bypasses the Zig-core guard, so reject here.
+      throw new FitsHeaderError(207, `non-finite float keyword value ${value}: FITS headers cannot represent NaN/Inf`);
+    }
+    return String(value).replace("e", "E"); // FITS exponents are uppercase
+  }
   if (typeof value === "bigint") return String(value);
   return "'" + String(value).replace(/'/g, "''") + "'";
 }
@@ -189,6 +196,11 @@ export function writeKeyValue(handle: bigint, key: string, value: HeaderValue, c
     return;
   }
   if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      // NaN/±Infinity fail Number.isInteger and would flow to zf_write_key_dbl, producing a
+      // card no reader parses (the FITS real grammar has no NaN/Inf spelling). Fail fast.
+      throw new FitsHeaderError(207, `non-finite float keyword value ${value} for ${key}: FITS headers cannot represent NaN/Inf`);
+    }
     // Any exact-integer double in i64 range writes as an integer card, so a
     // parsed integer keyword (numbers up to 2^63 parse exactly) round-trips
     // as the same card type. Beyond the range (or non-integer) → double card.

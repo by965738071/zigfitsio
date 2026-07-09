@@ -27,6 +27,17 @@ All notable changes to `zigfitsio` are documented here. The format follows
   synthesized from the structured dtype / column data — instead of the data being dropped
   by the builder-columns early-return. Detached ASCII tables fail loud toward
   `from_columns`/`fromColumns` (their formats cannot be synthesized).
+- **Core / Python / TypeScript**: non-finite float keyword values (`NaN`/`±Inf`) are
+  **rejected on every header write path** with `error.BadValueSyntax` (CFITSIO status 207)
+  instead of being formatted as bare `nan`/`inf` tokens — cards the FITS real grammar
+  cannot express and no reader (including this library's own parser, astropy, and CFITSIO)
+  accepts. The guard lives at the card-construction boundary (`Card.buildValue` and the
+  HIERARCH free-format builder; `formatReal` stays infallible) and is mirrored in both
+  bindings at coerce time, which also covers their client-side raw-card HIERARCH paths
+  that bypass the core builder. The pure-Python header parser no longer turns a hostile
+  bare `nan`/`inf`/`1E999` token into a float either: it now applies the same strict
+  FITS-real grammar as the TypeScript parser and falls back to the string value, while
+  typed C-ABI reads keep failing with 207. (BUGHUNT-2026-07-06 items 25+27)
 - **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
   `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
   boundary — are now readable: out-of-range decoded values **clamp to the type range**

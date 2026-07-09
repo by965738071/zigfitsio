@@ -417,6 +417,37 @@ test "spaced keyword names are rejected with status 207 on the write path (BUGHU
     try testing.expectEqual(@as(c_longlong, 7), v); // untouched by the failed rename
 }
 
+test "non-finite float keyword values are rejected with status 207 on the write path (BUGHUNT 25/27)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // BadValueSyntax maps to CFITSIO 207, mirroring the read path's rejection of nan/inf tokens.
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const name = "KNAN";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, nan, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, inf, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, -inf, null, 0));
+
+    // The failed writes left nothing behind: the keyword is absent...
+    var v: f64 = 0;
+    try testing.expect(capi.zf_read_key_dbl(hh, name, name.len, &v) != 0);
+    // ...and a finite value still writes fine afterwards.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, name, name.len, 1.5, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, name, name.len, &v));
+    try testing.expectEqual(@as(f64, 1.5), v);
+
+    // Updating an existing key with NaN fails and keeps the old value.
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, nan, null, 0));
+    v = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, name, name.len, &v));
+    try testing.expectEqual(@as(f64, 1.5), v);
+}
+
 fn putRecord(hh: *Handle, text: []const u8) !void {
     var card: [80]u8 = [_]u8{' '} ** 80;
     @memcpy(card[0..text.len], text);

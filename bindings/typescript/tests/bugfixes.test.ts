@@ -1982,3 +1982,75 @@ describe("table data validation + detached TableData writes (finding 15)", () =>
     expect(() => new zf.HDUList([new zf.PrimaryHDU(), hdu]).toBytes()).toThrow(zf.NotSupportedError);
   });
 });
+
+describe("non-finite float header values are rejected on write (BUGHUNT 25/27)", () => {
+  test("NaN/Infinity keyword write throws in create mode", () => {
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      const h = new zf.Header();
+      h.set("KNAN", bad);
+      expect(() => new zf.HDUList([new zf.PrimaryHDU({ data: new Float32Array(4), header: h })]).toBytes()).toThrow(
+        zf.FitsError,
+      );
+    }
+  });
+
+  test("Infinity keyword write throws immediately in update mode and leaves the file unchanged", () => {
+    const p = tmp.path();
+    zf.writeTo(p, new zf.FitsArray(Float32Array.from([1, 2, 3, 4]), [4]));
+    let hl = zf.open(p, "update");
+    try {
+      expect(() => hl.get(0).header.set("KINF", Infinity)).toThrow(zf.FitsHeaderError);
+    } finally {
+      hl.close();
+    }
+    hl = zf.open(p);
+    try {
+      expect(hl.get(0).header.get("KINF")).toBeUndefined();
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("HIERARCH float -Infinity throws (raw-card path bypasses the Zig-core guard)", () => {
+    const h = new zf.Header();
+    h.set("ESO DET BAD GAIN", -Infinity);
+    expect(() => new zf.HDUList([new zf.PrimaryHDU({ data: new Float32Array(4), header: h })]).toBytes()).toThrow(
+      zf.FitsHeaderError,
+    );
+  });
+
+  test("finite numbers are unaffected: non-integer, exact-integer double, bigint", () => {
+    const h = new zf.Header();
+    h.set("FVAL", 1.5);
+    h.set("BIGI", 2 ** 40);
+    h.set("BINT", 123n);
+    const hl = zf.fromBytes(new zf.HDUList([new zf.PrimaryHDU({ data: new Float32Array(4), header: h })]).toBytes());
+    const hh = hl.get(0).header;
+    expect(hh.get("FVAL")).toBe(1.5);
+    expect(Number(hh.get("BIGI"))).toBe(2 ** 40);
+    expect(Number(hh.get("BINT"))).toBe(123);
+  });
+
+  test("a bare 'nan' value token parses as a string, not a float (parser regression pin)", () => {
+    // The TS parser was already strict (FITS-real regex + Number.isFinite); pin it as the model
+    // the Python parser now mirrors: an invalid bare token falls through as a string.
+    const cards = [
+      "SIMPLE  =                    T",
+      "BITPIX  =                    8",
+      "NAXIS   =                    0",
+      "BADF    =                  nan / not a FITS real",
+      "BADI    =                  inf",
+      "GOODF   =                 1.5E2",
+      "END",
+    ];
+    const raw = cards
+      .map((s) => s.padEnd(80))
+      .join("")
+      .padEnd(2880);
+    const hl = zf.fromBytes(enc(raw));
+    const hh = hl.get(0).header;
+    expect(hh.get("BADF")).toBe("nan");
+    expect(hh.get("BADI")).toBe("inf");
+    expect(hh.get("GOODF")).toBe(150);
+  });
+});

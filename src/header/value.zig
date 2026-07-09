@@ -143,6 +143,18 @@ pub fn formatValue(w: *std.Io.Writer, v: KeywordValue) std.Io.Writer.Error!void 
     }
 }
 
+/// Reject a value whose real component(s) cannot be represented in a FITS header: the §4.2.4
+/// real grammar has no NaN/Inf spelling, so `formatReal` would emit a bare `nan`/`inf` token
+/// that no reader — including `parseFloatTok` below, which rejects exactly those tokens —
+/// can parse. Card builders call this before formatting (`formatReal` itself stays infallible).
+pub fn requireFinite(v: KeywordValue) HeaderError!void {
+    switch (v) {
+        .float => |f| if (!std.math.isFinite(f)) return error.BadValueSyntax,
+        .complex_float => |c| if (!std.math.isFinite(c[0]) or !std.math.isFinite(c[1])) return error.BadValueSyntax,
+        else => {},
+    }
+}
+
 /// Format a real with the FITS-mandated **uppercase** exponent letter (FITS 4.0 §4.2.4: reals
 /// are written with `E` — or the FORTRAN `D` — never a lowercase `e`). `std.fmt`'s `{e}` emits
 /// a lowercase `e`, so the exponent letter is upper-cased in place within `buf`. Returns the

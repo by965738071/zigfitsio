@@ -10,6 +10,7 @@ Data is exchanged as native-endian NumPy arrays; image arrays use C-order with r
 from __future__ import annotations
 
 import ctypes as c
+import math
 import os
 from typing import Any, Sequence
 
@@ -317,14 +318,19 @@ _INT64_MAX = 2**63 - 1
 
 
 def _coerce_kw_value(value: Any) -> Any:
-    """Normalize a header value for the C ABI: numpy scalars → Python scalars, and reject integers
-    that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints)."""
+    """Normalize a header value for the C ABI: numpy scalars → Python scalars, reject integers
+    that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints), and
+    reject non-finite floats — the FITS real grammar has no NaN/Inf spelling, so they would produce
+    cards no reader (including this library) can parse. This guard also covers the HIERARCH paths,
+    which build raw 80-byte cards client-side and bypass the Zig-core rejection."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, np.integer):
         value = int(value)
     if isinstance(value, np.floating):
-        return float(value)
+        value = float(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ll.FitsHeaderError(207, f"non-finite float keyword value {value!r}: FITS headers cannot represent NaN/Inf")
     if isinstance(value, int):  # bool already handled above
         if not (_INT64_MIN <= value <= _INT64_MAX):
             raise ll.FitsOverflowError(412, f"integer keyword value {value} out of signed-64-bit range")
