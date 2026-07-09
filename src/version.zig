@@ -3,7 +3,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 
 /// The library version (mirrors `build.zig.zon` and `root.version`).
-pub const version_string = "0.1.3";
+pub const version_string = "0.1.4";
 
 /// Return the library version string (FR-UTL-3).
 pub fn version() []const u8 {
@@ -79,7 +79,7 @@ pub fn errorText(err: errors.Error) []const u8 {
 const testing = std.testing;
 
 test "version is non-empty and matches the literal" {
-    try testing.expectEqualStrings("0.1.3", version());
+    try testing.expectEqualStrings("0.1.4", version());
 }
 
 test "errorText is non-empty for every error value" {

@@ -6,6 +6,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.4] - 2026-07-09
+
 ### Fixed
 - **Python & TypeScript**: assigning `None`/`null` to a header keyword now writes a FITS
   *undefined* card (blank value field, byte-identical to astropy's compact form) instead of
