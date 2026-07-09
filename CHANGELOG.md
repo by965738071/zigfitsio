@@ -6,6 +6,17 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **TypeScript**: `writeTo`/`toBytes` reconstruction of an attached table addresses columns
+  **by name, not position** — reassigning `hdu.data` with a `TableData` whose columns are
+  reordered, renamed, retyped, added, or dropped no longer silently truncates values through
+  a stale positional `TFORM`; a column the file lacks synthesizes its format from the column
+  data, and ASCII-table adds/renames fail loud. Indexed per-column metadata follows its
+  column to the new position: `TNULLn`/`TDISPn`/`TDIMn` are re-emitted at the column's new
+  index (dropped for a retyped column, whose stored type they no longer describe) and
+  `TUNITn` — previously lost on every table reconstruction — rides the rebuilt column
+  descriptor. Port of the Python fix shipped in 0.1.3 (#28). (#35)
+
 ## [0.1.3] - 2026-07-07
 
 ### Fixed

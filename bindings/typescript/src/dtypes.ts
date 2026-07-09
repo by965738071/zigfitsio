@@ -177,6 +177,19 @@ export function binElemDtype(letter: string): { dtype: Dtype; isComplex: boolean
   return TFORM_BIN[letter] ?? { dtype: "f8", isComplex: false };
 }
 
+/**
+ * Element dtype -> binary-table TFORM letter (the inverse of TFORM_BIN, for
+ * synthesizing a format from column data). Unsigned integers map to the signed
+ * letter of matching width; the write path re-applies the TZEROn convention
+ * (see unsignedColTzero) so the column still round-trips as unsigned. A
+ * logical/bit column reads back as u1, so its synthesized letter is 'B';
+ * tformInterchangeable keeps the file column's own 'L'/'X' on reconstruction.
+ */
+export const DTYPE_TO_TFORM: Record<Dtype, string> = {
+  u1: "B", i1: "B", i2: "I", u2: "I", i4: "J", u4: "J",
+  i8: "K", u8: "K", f4: "E", f8: "D", c8: "C", c16: "M",
+};
+
 /** ZfType element code -> binary-table TFORM letter (for rebuilding formats on copy). */
 export const ZF_TO_TFORM: Record<number, string> = {
   [ll.ZF_BOOL]: "L",

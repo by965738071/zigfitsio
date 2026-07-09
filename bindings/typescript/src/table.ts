@@ -8,7 +8,7 @@
 import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
-import { BaseHDU, writeConventionOffset, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
+import { BaseHDU, writeConventionOffset, writeKeyValue, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
 import type { ElementOf } from "./fitsarray.js";
 import { decOut, enc, fnv1a64, viewBytes } from "./util.js";
 
@@ -276,6 +276,68 @@ export function asciiTformOf(info: ll.ColInfo): string {
     return `E${w}.${Math.max(w - 7, 1)}`; // leave room for sign, decimal point, and E±dd exponent
   }
   return `I${w}`; // integer column of any width
+}
+
+/**
+ * Synthesize a binary-table TFORM from materialized column data (port of
+ * `core.py _tform_from_dtype`, driven by the ColumnData discriminant instead
+ * of a numpy dtype). Used to format a column that has no matching file column
+ * (a reassigned TableData that added or retyped a column) so its values are
+ * never truncated to a stale TFORM.
+ */
+function tformFromColumnData(cd: ColumnData): string {
+  if (cd.kind === "string") return `${Math.max(cd.repeat, 1)}A`; // repeat is the field width
+  if (cd.kind === "complex") return `${cd.repeat}${cd.dtype === "c8" ? "C" : "M"}`;
+  const letter = dt.DTYPE_TO_TFORM[cd.dtype];
+  if (letter === undefined) throw new FitsTypeError(410, `cannot synthesize a table TFORM for dtype ${cd.dtype}`);
+  if (cd.kind === "vla") return `1P${letter}`; // a VlaColumn carries its element dtype
+  return `${cd.repeat}${letter}`;
+}
+
+/** (repeat, uppercase type letter) for a scalar/vector binary TFORM like '1J' or '8A'. */
+function tformRepeatLetter(fmt: string): [number, string] {
+  const s = fmt.trim().toUpperCase();
+  let i = 0;
+  while (i < s.length && s[i] >= "0" && s[i] <= "9") i++;
+  return [parseInt(s.slice(0, i) || "1", 10), s.slice(i, i + 1)];
+}
+
+/**
+ * True when a file column's stored TFORM `have` still faithfully represents a
+ * column whose data synthesizes to `synth` — same repeat and same element
+ * dtype. Distinct letters that decode to the same element dtype (L/X/B all
+ * read as u1) are interchangeable, so a logical or bit column keeps its own
+ * 'L'/'X' letter instead of being flattened to the generic 'B'. Strings ('A',
+ * whose width lives in the repeat) only match letter-for-letter.
+ */
+function tformInterchangeable(have: string, synth: string): boolean {
+  const [rh, lh] = tformRepeatLetter(have);
+  const [rs, ls] = tformRepeatLetter(synth);
+  if (rh !== rs) return false;
+  if (lh === ls) return true;
+  if (lh === "A" || ls === "A") return false;
+  const dh = dt.binElemDtype(lh);
+  const ds = dt.binElemDtype(ls);
+  return dh.dtype === ds.dtype && dh.isComplex === ds.isComplex;
+}
+
+/**
+ * Choose a binary-table TFORM for a TableData column on write-back/copy (port
+ * of `core.py _binary_tform_for`). Reuse the same-named file column's stored
+ * TFORM when it still describes the data — the only way to reproduce VLA,
+ * unsigned, logical/bit, or exact-width string columns — otherwise synthesize
+ * one from the column data so a new or retyped column is never written under
+ * a stale (truncating) format. `info` is the matching file column (or
+ * undefined when the column has no counterpart).
+ */
+function binaryTformFor(info: ll.ColInfo | undefined, cd: ColumnData): string {
+  if (info !== undefined && (info.isVla || cd.kind === "vla")) {
+    return tformOf(info); // VLA: only the file descriptor can describe it
+  }
+  const synth = tformFromColumnData(cd);
+  if (info === undefined) return synth; // added/renamed column with no file counterpart
+  const have = tformOf(info); // a scaled column throws here (unreconstructable) — preserved as today
+  return tformInterchangeable(have, synth) ? have : synth;
 }
 
 // ── write-side array normalization ──
@@ -672,29 +734,69 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
   /**
    * @internal (columns, nrows) to serialize: the builder columns for a
    * detached HDU, or columns reconstructed from the live table for an
-   * attached one (so a copied table keeps its rows).
+   * attached one (so a copied table keeps its rows). For the attached path,
+   * `srcIndex[i]` is the FILE column index whose stored format the emitted
+   * column `i` still uses (null for an added/renamed/retyped column), so
+   * _writeTo can move that column's indexed metadata cards (TNULLn/TDISPn/
+   * TDIMn) to the column's new position; null srcIndex = detached path,
+   * where indexed cards already refer to the emitted order.
    */
-  _emitColumns(): { cols: Column[]; nrows: number } {
+  _emitColumns(): { cols: Column[]; nrows: number; srcIndex: (number | null)[] | null } {
     if (this._columns.length > 0 || this._hdulist === null) {
-      return { cols: [...this._columns], nrows: this._nrows };
+      return { cols: [...this._columns], nrows: this._nrows, srcIndex: null };
     }
     const data = this.data;
-    if (data === null) return { cols: [], nrows: 0 };
+    if (data === null) return { cols: [], nrows: 0, srcIndex: null };
     const h = this._select();
     return withTable(h, (t) => {
-      const cols: Column[] = [];
-      for (let i = 0; i < data.names.length; i++) {
-        const info = readColInfo(t, i);
-        const fmt = this._tableType === ll.ASCII_TBL ? asciiTformOf(info) : tformOf(info);
-        cols.push(new Column(data.names[i], fmt, { array: data.get(data.names[i]) as ColumnArray }));
+      const ncolsOut = ll.outI32();
+      ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      // Map file columns by NAME so a reassigned TableData keeps each column's
+      // true format even when reordered/filtered; a positional pairing would
+      // hand a column the wrong TFORM and silently truncate it. First card
+      // wins, and the `col${j+1}` fallback matches _readTable's name for a
+      // column lacking TTYPE.
+      const fileInfo = new Map<string, { info: ll.ColInfo; index: number }>();
+      for (let j = 0; j < ncolsOut[0]; j++) {
+        const nm = colName(t, j) || `col${j + 1}`;
+        if (!fileInfo.has(nm)) fileInfo.set(nm, { info: readColInfo(t, j), index: j });
       }
-      return { cols, nrows: data.nrows };
+      const cols: Column[] = [];
+      const srcIndex: (number | null)[] = [];
+      for (const name of data.names) {
+        const entry = fileInfo.get(name);
+        let fmt: string;
+        if (this._tableType === ll.ASCII_TBL) {
+          if (entry === undefined) {
+            throw new NotSupportedError(
+              410,
+              `writeTo() cannot add or rename an ASCII-table column ('${name}') from a reassigned ` +
+                "TableData; rebuild the table with AsciiTableHDU.fromColumns(...)",
+            );
+          }
+          fmt = asciiTformOf(entry.info);
+        } else {
+          fmt = binaryTformFor(entry?.info, data.column(name));
+        }
+        // The unit rides the COLUMN, not its position: thread the source
+        // TUNITn through the builder Column so zf_create_tbl re-emits it at
+        // the column's new index (TUNITn itself is structural-skipped). A
+        // retyped column keeps its unit — the physical quantity is unchanged.
+        const unit = entry !== undefined ? this.header.get(`TUNIT${entry.index + 1}`) : undefined;
+        cols.push(new Column(name, fmt, { array: data.get(name) as ColumnArray, unit: typeof unit === "string" ? unit : undefined }));
+        // Indexed metadata describes the STORED cells, so it only survives
+        // when the emitted format is still the file column's own (a retyped
+        // column's old TNULL sentinel / display / shape no longer apply).
+        const fileFmt = entry === undefined ? null : this._tableType === ll.ASCII_TBL ? asciiTformOf(entry.info) : tformOf(entry.info);
+        srcIndex.push(entry !== undefined && fmt === fileFmt ? entry.index : null);
+      }
+      return { cols, nrows: data.nrows, srcIndex };
     });
   }
 
   /** @internal */
   _writeTo(handle: bigint, _primary: boolean): void {
-    const { cols, nrows } = this._emitColumns();
+    const { cols, nrows, srcIndex } = this._emitColumns();
     const n = cols.length;
     const ttype = cols.map((c) => c.name);
     const tform = cols.map((c) => c.format);
@@ -720,8 +822,25 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     // Re-emit the user header cards (science keywords, COMMENT/HISTORY, HIERARCH)
     // that zf_create_tbl does not carry, skipping the column descriptors it
     // already wrote — mirroring ImageHDU._writeTo so a reconstruction save does
-    // not silently drop table metadata.
-    this._applyUserKeys(handle, isTableStructuralKeyword);
+    // not silently drop table metadata. On the attached reconstruction path
+    // (srcIndex set), indexed per-column cards are skipped from the verbatim
+    // pass too: their index refers to the SOURCE column order, and a by-name
+    // reorder/subset would leave them labeling the wrong column (a TNULLn on a
+    // float column is even spec-invalid). They are re-emitted below at each
+    // column's new position instead.
+    const indexedMeta = /^T(NULL|DISP|DIM)\d+$/;
+    this._applyUserKeys(handle, (up) => isTableStructuralKeyword(up) || (srcIndex !== null && indexedMeta.test(up)));
+    if (srcIndex !== null) {
+      for (let i = 0; i < srcIndex.length; i++) {
+        const j = srcIndex[i];
+        if (j === null) continue; // added/renamed/retyped: the old cards no longer describe it
+        for (const base of ["TNULL", "TDISP", "TDIM"] as const) {
+          const v = this.header.get(`${base}${j + 1}`);
+          if (v === undefined || v === null) continue;
+          writeKeyValue(handle, `${base}${i + 1}`, v, this.header.commentOf(`${base}${j + 1}`) || null);
+        }
+      }
+    }
 
     withTable(handle, (t) => {
       for (let i = 0; i < cols.length; i++) {
