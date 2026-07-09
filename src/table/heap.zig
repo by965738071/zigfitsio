@@ -1203,6 +1203,163 @@ test "THEAP present but unparseable is a structural error (not the default)" {
     try testing.expectError(error.BadTbcol, readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32));
 }
 
+test "structural row edits rewrite an explicit default THEAP (grow: appendRows)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // Explicit THEAP equal to its default (main = 8*2 = 16) is conforming; a row append must
+    // rewrite it to the new default alongside the relocated heap, or every later VLA read
+    // trips the theap < main structural check.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 64, .{ .theap = 16 });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 111, 222, 333 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 1, i32, &[_]i32{ 444, 555 });
+
+    try t.appendRows(1);
+
+    try testing.expectEqual(@as(i64, 24), try t.hdu.header.getValue(i64, "THEAP"));
+    const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r0);
+    const r1 = try readVlaCell(alloc, &t, .{ .index = 0 }, 1, i32);
+    defer alloc.free(r1);
+    try testing.expectEqualSlices(i32, &[_]i32{ 111, 222, 333 }, r0);
+    try testing.expectEqualSlices(i32, &[_]i32{ 444, 555 }, r1);
+
+    // A fresh open sees the rewritten card and the same VLA bytes on the device.
+    var f2 = try Fits.open(alloc, fx.mem.device(), .read_only, .{});
+    defer f2.deinit();
+    const hdu2 = try f2.select(2);
+    try testing.expectEqual(@as(i64, 24), try hdu2.header.getValue(i64, "THEAP"));
+    var t2 = try BinTable.of(&f2, hdu2);
+    defer t2.deinit(alloc);
+    const rr = try readVlaCell(alloc, &t2, .{ .index = 0 }, 0, i32);
+    defer alloc.free(rr);
+    try testing.expectEqualSlices(i32, &[_]i32{ 111, 222, 333 }, rr);
+}
+
+test "structural row edits rewrite an explicit default THEAP (shrink: deleteRows)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // main = 8*3 = 24. After deleting a row the heap slides down to the new default (16); a
+    // stale THEAP=24 would silently read the heap 8 bytes off.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 3, 64, .{ .theap = 24 });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 111, 222, 333 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 1, i32, &[_]i32{ 444, 555 });
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 2, i32, &[_]i32{7});
+
+    try t.deleteRows(0, 1);
+
+    try testing.expectEqual(@as(i64, 16), try t.hdu.header.getValue(i64, "THEAP"));
+    const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r0);
+    const r1 = try readVlaCell(alloc, &t, .{ .index = 0 }, 1, i32);
+    defer alloc.free(r1);
+    try testing.expectEqualSlices(i32, &[_]i32{ 444, 555 }, r0);
+    try testing.expectEqualSlices(i32, &[_]i32{7}, r1);
+}
+
+test "structural column edits rewrite an explicit default THEAP (insert/delete column)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // main = 8*1 = 8.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 1, 64, .{ .theap = 8 });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 9, 8, 7 });
+
+    // Grow: a 1J column widens NAXIS1 to 12.
+    try t.insertColumn(alloc, 0, "1J", "PAD");
+    try testing.expectEqual(@as(i64, 12), try t.hdu.header.getValue(i64, "THEAP"));
+    const r0 = try readVlaCell(alloc, &t, .{ .name = "VLA" }, 0, i32);
+    defer alloc.free(r0);
+    try testing.expectEqualSlices(i32, &[_]i32{ 9, 8, 7 }, r0);
+
+    // Shrink back: NAXIS1 returns to 8.
+    try t.deleteColumn(0);
+    try testing.expectEqual(@as(i64, 8), try t.hdu.header.getValue(i64, "THEAP"));
+    const r1 = try readVlaCell(alloc, &t, .{ .name = "VLA" }, 0, i32);
+    defer alloc.free(r1);
+    try testing.expectEqualSlices(i32, &[_]i32{ 9, 8, 7 }, r1);
+}
+
+test "structural edits do not invent a THEAP card when none exists" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 64, .{});
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 1, 2 });
+
+    try t.appendRows(1);
+
+    try testing.expectError(error.KeywordNotFound, t.hdu.header.getValue(i64, "THEAP"));
+    const r0 = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r0);
+    try testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, r0);
+}
+
+test "structural edits on a genuine THEAP gap are rejected without touching the table" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // Same geometry as the gap-read test: main = 8*2 = 16, THEAP=24 ⇒ gap=8, heap_size=64.
+    // Every heap-relocating edit assumes the default heap position, so a real gap must be a
+    // clean BadTbcol — and the rejected edit must leave the (readable) table fully intact.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 2, 72, .{ .theap = 24 });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+    var mgr = try HeapManager.initForTable(&t);
+    defer mgr.deinit(alloc);
+    try writeVlaCell(alloc, &t, &mgr, .{ .index = 0 }, 0, i32, &[_]i32{ 42, 43 });
+
+    try testing.expectError(error.BadTbcol, t.appendRows(1));
+    try testing.expectError(error.BadTbcol, t.deleteRows(0, 1));
+    try testing.expectError(error.BadTbcol, t.insertColumn(alloc, 0, "1J", "PAD"));
+    try testing.expectError(error.BadTbcol, t.deleteColumn(0));
+
+    try testing.expectEqual(@as(i64, 24), try t.hdu.header.getValue(i64, "THEAP"));
+    try testing.expectEqual(@as(i64, 2), try t.hdu.header.getValue(i64, "NAXIS2"));
+    const r = try readVlaCell(alloc, &t, .{ .index = 0 }, 0, i32);
+    defer alloc.free(r);
+    try testing.expectEqualSlices(i32, &[_]i32{ 42, 43 }, r);
+}
+
+test "structural edits on an unparseable THEAP are rejected like reads are" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, .{});
+    defer fx.deinit(alloc);
+
+    // heapGeometry treats a present-but-unparseable THEAP as BadTbcol; edits must agree
+    // rather than silently relocating a heap whose declared position is unreadable.
+    const hdu = try makeVlaHdu(&fx.f, alloc, "1PJ", 1, 64, .{ .theap_str = "oops" });
+    var t = try BinTable.of(&fx.f, hdu);
+    defer t.deinit(alloc);
+
+    try testing.expectError(error.BadTbcol, t.appendRows(1));
+    try testing.expectError(error.BadTbcol, t.deleteRows(0, 1));
+    try testing.expectError(error.BadTbcol, t.insertColumn(alloc, 0, "1J", "PAD"));
+    try testing.expectError(error.BadTbcol, t.deleteColumn(0));
+}
+
 test "zero-length VLA cell ignores its (undefined) descriptor offset (§7.3.5)" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, .{});
