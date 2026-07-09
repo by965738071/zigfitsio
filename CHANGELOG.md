@@ -16,6 +16,11 @@ All notable changes to `zigfitsio` are documented here. The format follows
   index (dropped for a retyped column, whose stored type they no longer describe) and
   `TUNITn` — previously lost on every table reconstruction — rides the rebuilt column
   descriptor. Port of the Python fix shipped in 0.1.3 (#28). (#35)
+- **Core**: `CAR` (plate carrée) world→pixel no longer returns a pixel aliased by a full
+  360°/CDELT wrap when `LONPOLE` is far from 0° — including the FITS **default** `LONPOLE=180`
+  for any CAR header with a southern reference declination (`CRVAL2 < 0`). The native
+  longitude from the celestial→native rotation is now wrapped into [−180°, 180°), matching
+  WCSLIB's `sphs2x`; zenithal projections are unaffected. (#37)
 
 ## [0.1.3] - 2026-07-07
 
