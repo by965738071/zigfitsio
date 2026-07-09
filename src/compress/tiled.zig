@@ -5,7 +5,8 @@
 //! optional `ZQUANTIZ`/`ZDITHER0` dither method and `ZNAMEn`/`ZVALn` codec parameters); the
 //! pixel payload lives in columns: `COMPRESSED_DATA` (a `1P`/`1Q` byte VLA, one row per tile),
 //! the optional `GZIP_COMPRESSED_DATA`/`UNCOMPRESSED_DATA` fallbacks, and the per-tile linear
-//! `ZSCALE`/`ZZERO` (`ZBLANK` may be either a keyword or a column).
+//! `ZSCALE`/`ZZERO` (`ZBLANK` may be either a keyword or a column, with a plain `BLANK`
+//! keyword accepted as the fallback spelling — fpack copies the source's `BLANK` unrenamed).
 //!
 //! `TiledImage` parses that structure and decodes the covering tiles into a normal, row-major
 //! image buffer (`readAll`). The image space is tiled row-major with the first axis varying
@@ -347,7 +348,13 @@ pub const TiledImage = struct {
         // Keyword fallbacks for ZSCALE/ZZERO/ZBLANK when there is no per-tile column.
         const zscale_kw: ?f64 = if (zscale_col == null) (hdu.header.getValue(f64, "ZSCALE") catch null) else null;
         const zzero_kw: ?f64 = if (zzero_col == null) (hdu.header.getValue(f64, "ZZERO") catch null) else null;
-        const zblank_kw: ?i64 = if (zblank_col == null) (hdu.header.getValue(i64, "ZBLANK") catch null) else null;
+        // ZBLANK falls back to a plain BLANK keyword: fpack copies the source image's BLANK
+        // into the compressed header without renaming it, and CFITSIO's reader
+        // (imcomp_get_compressed_image_par) tries ZBLANK then BLANK. Mirror that order.
+        const zblank_kw: ?i64 = if (zblank_col == null) blk: {
+            const z: ?i64 = hdu.header.getValue(i64, "ZBLANK") catch null;
+            break :blk z orelse (hdu.header.getValue(i64, "BLANK") catch null);
+        } else null;
 
         return .{
             .base = base,

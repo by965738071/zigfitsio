@@ -343,6 +343,27 @@ _STRUCTURAL = {
 }
 
 
+def _blank_defined(header) -> bool:
+    """Whether the HDU declares an integer null sentinel: a ``BLANK`` keyword, or — for a
+    tile-compressed image, whose Python-visible header is the raw BINTABLE one — ``ZBLANK`` as
+    a keyword or a per-tile column. fpack copies the source's ``BLANK`` unrenamed, so the plain
+    spelling also covers most compressed files in the wild."""
+    if header.get("BLANK") is not None:
+        return True
+    if header.get("ZIMAGE"):
+        if header.get("ZBLANK") is not None:
+            return True
+        try:
+            nfields = int(header.get("TFIELDS", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        for i in range(1, nfields + 1):
+            t = header.get(f"TTYPE{i}")
+            if t is not None and str(t).strip().upper() == "ZBLANK":
+                return True
+    return False
+
+
 def _write_bzero(handle, bzero: int) -> None:
     """Write the BZERO keyword for the unsigned-integer convention (as a double when it exceeds the
     signed-64-bit keyword slot — e.g. 2**63 for uint64, which is exact as an IEEE double)."""
@@ -577,7 +598,13 @@ class ImageHDU(_HDU):
         bscale = header.get("BSCALE", 1)
         bzero = header.get("BZERO", 0)
         if bscale in (1, 1.0) and bitpix in _UNSIGNED_BZERO and bzero == _UNSIGNED_BZERO[bitpix]:
+            # astropy parity: the unsigned convention wins — BLANK is ignored on this path
+            # (astropy returns the raw unsigned ints too).
             return _UNSIGNED_DTYPE[bitpix]
+        if bitpix > 0 and _blank_defined(header):
+            # BLANK/ZBLANK forces float physical values (blanked pixels read as NaN),
+            # at astropy's widths: float32 for BITPIX 8/16, float64 for 32/64.
+            return np.dtype("f4") if bitpix in (8, 16) else np.dtype("f8")
         if bscale not in (1, 1.0) or bzero not in (0, 0.0):
             return np.dtype("f4") if bitpix == -32 else np.dtype("f8")
         return dt.bitpix_to_dtype(bitpix)
@@ -592,7 +619,15 @@ class ImageHDU(_HDU):
         n = int(arr.size)
         if n:
             h = self._select()
-            ll.check(ll.lib.zf_read_img(h, dt.zf_code(out_dtype), 1, n, None, None, _ptr(arr)))
+            nulref = None
+            if bitpix > 0 and out_dtype.kind == "f" and _blank_defined(self.header):
+                # Stored values equal to BLANK substitute this sentinel BEFORE scaling
+                # (FR-IMG-8), matching astropy/funpack. The tile-compressed path ignores
+                # nulval and NaN-substitutes on its own for float output, so passing it
+                # unconditionally is harmless there.
+                nul = np.array([np.nan], dtype=out_dtype)
+                nulref = _ptr(nul)
+            ll.check(ll.lib.zf_read_img(h, dt.zf_code(out_dtype), 1, n, nulref, None, _ptr(arr)))
         # Baseline in ALL modes so both update-mode write-back and the writeto/to_bytes pristine
         # gate can detect a later edit — including an in-place mutation (`data[:] = x`) that never
         # goes through the data setter and so never sets `_dirty`.
@@ -643,7 +678,10 @@ class ImageHDU(_HDU):
         bitpix = dt.dtype_to_bitpix(data.dtype)
         axes = list(reversed(data.shape))  # C-order shape -> FITS axes
         ll.check(ll.lib.zf_create_img(handle, bitpix, len(axes), _carr(axes)))
-        self._apply_user_keys(handle)
+        # A float image cannot carry BLANK (its null is NaN; validate/fitsverify flag the card).
+        # Reached when writing back a BLANK-promoted read — astropy strands the stale card with
+        # a warning; drop it instead so our own output verifies clean.
+        self._apply_user_keys(handle, skip=(lambda up: up == "BLANK") if bitpix < 0 else None)
         n = int(data.size)
         if n:
             ll.check(ll.lib.zf_write_img(handle, dt.zf_code(data.dtype), 1, n, None, None, _ptr(data)))
@@ -686,10 +724,12 @@ class ImageHDU(_HDU):
             ll.check(ll.lib.zf_write_img(h, dt.zf_code(native.dtype), 1, n, None, scref, _ptr(native)))
         self._data_fingerprint = fp
 
-    def _apply_user_keys(self, handle):
+    def _apply_user_keys(self, handle, skip=None):
         for kw, value, comment in self.header.cards():
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
+                continue
+            if skip is not None and skip(up):
                 continue
             # A scanned header's CHECKSUM/DATASUM describe the ORIGINAL bytes; copying them onto
             # a reconstructed HDU yields cards that no longer verify. Drop them (as astropy strips

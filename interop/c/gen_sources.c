@@ -312,6 +312,37 @@ static void gen_img_i16(const char *root) {
     fits_close_file(f, &status);                  check(status, "img_i16 close");
 }
 
+/* 8x4 i16, value[i] = i - 8 with BLANK = -32768 stored at indices 3, 17, 31 (integer null
+ * semantics, FR-IMG-8 / X-INTEROP inbound). `scaled` adds BSCALE=2/BZERO=100 so consumers can
+ * pin that null substitution happens on the RAW stored value, BEFORE scaling. The raw shorts
+ * are stored verbatim: fits_set_bscale(1,0) neutralizes the in-memory scaling CFITSIO would
+ * otherwise apply on write (fits_write_img inverse-scales through BSCALE/BZERO). */
+static void gen_img_i16_blank(const char *root, const char *rel, int scaled) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { 8, 4 };
+    const int n = 8 * 4;
+    long blank = -32768;
+    short data[8 * 4];
+    for (int i = 0; i < n; i++) data[i] = (short)(i - 8);
+    data[3] = -32768; data[17] = -32768; data[31] = -32768;
+    fits_create_file(&f, path, &status);          check(status, "i16_blank create");
+    fits_create_img(f, SHORT_IMG, 2, naxes, &status); check(status, "i16_blank img");
+    fits_update_key(f, TLONG, "BLANK", &blank, "undefined-pixel sentinel", &status);
+    check(status, "i16_blank BLANK");
+    if (scaled) {
+        double bscale = 2.0, bzero = 100.0;
+        fits_update_key(f, TDOUBLE, "BSCALE", &bscale, "physical = 2*stored + 100", &status);
+        fits_update_key(f, TDOUBLE, "BZERO", &bzero, NULL, &status);
+        check(status, "i16_blank scaling keys");
+    }
+    fits_set_bscale(f, 1.0, 0.0, &status);        check(status, "i16_blank set_bscale");
+    fits_write_img(f, TSHORT, 1, n, data, &status); check(status, "i16_blank write");
+    fits_close_file(f, &status);                  check(status, "i16_blank close");
+}
+
 /* images/img_f32.fits — 5x3 f32, value[i] = i*0.25, with a single IEEE-NaN null at index 7. */
 static void gen_img_f32(const char *root) {
     char path[1024];
@@ -560,6 +591,10 @@ int main(int argc, char **argv) {
 
     /* plain inbound */
     gen_img_i16(root);
+    gen_img_i16_blank(root, "images/img_i16_blank.fits", 0);
+    gen_img_i16_blank(root, "images/img_i16_blank_scaled.fits", 1);
+    /* integer-null tile source (fpack -r translates BLANK to the ZBLANK keyword) */
+    gen_img_i16_blank(root, "compress/src_rice_i16_blank.fits", 0);
     gen_img_f32(root);
     gen_bintable(root);
     gen_ascii(root);

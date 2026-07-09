@@ -383,6 +383,78 @@ test "golden: inbound i16 image (value[i] = i - 8)" {
     }
 }
 
+test "golden: inbound i16 image with BLANK null (raw passthrough + NaN sentinel)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/images/img_i16_blank.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1);
+    try testing.expectEqual(@as(i64, -32768), try hdu.header.getValue(i64, "BLANK"));
+    var v = try fits.ImageView.of(&f, hdu);
+
+    // Integer read with no sentinel: the raw BLANK value passes through unchanged.
+    var raw: [32]i16 = undefined;
+    try v.readAll(i16, &raw, .{});
+    try testing.expectEqual(@as(i16, -32768), raw[3]);
+
+    // Float read with a NaN sentinel: blanked pixels are NaN, others value[i] = i - 8.
+    var out: [32]f64 = undefined;
+    try v.readAll(f64, &out, .{ .null_sentinel = std.math.nan(f64) });
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got));
+        } else {
+            try testing.expectEqual(@as(f64, @floatFromInt(@as(i64, @intCast(i)) - 8)), got);
+        }
+    }
+}
+
+test "golden: inbound i16 BLANK + BSCALE/BZERO — null substitution precedes scaling" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/images/img_i16_blank_scaled.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1);
+    var v = try fits.ImageView.of(&f, hdu);
+    var out: [32]f64 = undefined;
+    try v.readAll(f64, &out, .{ .null_sentinel = std.math.nan(f64) });
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got)); // the sentinel, NOT 2*(-32768)+100
+        } else {
+            try testing.expectEqual(2.0 * @as(f64, @floatFromInt(@as(i64, @intCast(i)) - 8)) + 100.0, got);
+        }
+    }
+}
+
+test "golden: RICE tile with a plain BLANK keyword null (fpack does not rename it to ZBLANK)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/compress/tile_rice_i16_blank.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+
+    // fpack keeps the source image's BLANK spelling in the compressed header (no ZBLANK
+    // keyword or column); CFITSIO reads ZBLANK with a BLANK fallback, and funpack/astropy
+    // both decode NaN here. A float output must substitute NaN at the blanked indices.
+    var out: [32]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got));
+        } else {
+            try testing.expectEqual(@as(f32, @floatFromInt(@as(i64, @intCast(i)) - 8)), got);
+        }
+    }
+
+    // Integer output: the raw sentinel passes through unchanged (mirrors the uncompressed layer).
+    var iout: [32]i16 = undefined;
+    try ti.readAll(i16, &iout);
+    try testing.expectEqual(@as(i16, -32768), iout[3]);
+}
+
 test "golden: inbound f32 image with IEEE-NaN null pixel" {
     try requireCorpus();
     const alloc = testing.allocator;

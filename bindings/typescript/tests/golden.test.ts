@@ -59,6 +59,41 @@ describe("golden images", () => {
     expect(asNums(d.data)).toEqual([...Array(32).keys()].map((i) => i - 8));
   });
 
+  testIf(hasGoldenFile("images", "img_i16_blank.fits"))("img_i16_blank promotes to NaN-masked f4", () => {
+    const d = readImage(goldenPath("images", "img_i16_blank.fits"), 0);
+    expect(d.dtype).toBe("f4"); // astropy width for BITPIX 16 + BLANK
+    const vals = d.data as Float32Array;
+    for (let i = 0; i < 32; i++) {
+      if (i === 3 || i === 17 || i === 31) expect(Number.isNaN(vals[i])).toBe(true);
+      else expect(vals[i]).toBe(i - 8);
+    }
+  });
+
+  testIf(hasGoldenFile("images", "img_i16_blank_scaled.fits"))(
+    "img_i16_blank_scaled substitutes NaN BEFORE BSCALE/BZERO scaling",
+    () => {
+      const d = readImage(goldenPath("images", "img_i16_blank_scaled.fits"), 0);
+      const vals = d.data as Float32Array;
+      for (let i = 0; i < 32; i++) {
+        if (i === 3 || i === 17 || i === 31) expect(Number.isNaN(vals[i])).toBe(true); // NOT 2*(-32768)+100
+        else expect(vals[i]).toBe(2 * (i - 8) + 100);
+      }
+    },
+  );
+
+  testIf(hasGoldenFile("compress", "tile_rice_i16_blank.fits"))(
+    "tile_rice_i16_blank decodes NaN from the plain BLANK spelling (fpack keeps BLANK, not ZBLANK)",
+    () => {
+      const d = readImage(goldenPath("compress", "tile_rice_i16_blank.fits"), 1);
+      expect(d.dtype).toBe("f4");
+      const vals = d.data as Float32Array;
+      for (let i = 0; i < 32; i++) {
+        if (i === 3 || i === 17 || i === 31) expect(Number.isNaN(vals[i])).toBe(true);
+        else expect(vals[i]).toBe(i - 8);
+      }
+    },
+  );
+
   testIf(hasGoldenFile("images", "img_f32.fits"))("img_f32 exposes the NaN null", () => {
     const d = readImage(goldenPath("images", "img_f32.fits"), 0);
     const vals = d.data as Float32Array;

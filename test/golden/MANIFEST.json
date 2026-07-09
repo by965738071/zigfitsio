@@ -8,6 +8,13 @@
   },
   "files": [
     {
+      "path": "compress/tile_rice_i16_blank.fits",
+      "sha256": "3614218ab7ede0c2a3fcce01c1da6903c55165bee90a9352e75e00f7022a7459",
+      "generator": "fpack -C -r (RICE_1) over the CFITSIO 8x4 BITPIX-16 BLANK source (gen_img_i16_blank); fpack keeps the plain BLANK keyword in the compressed header (no ZBLANK)",
+      "consumer": "CMP / X-INTEROP inbound (FR-IMG-8 integer null, tiled)",
+      "expected": "HDU 2 ZIMAGE/RICE_1 with BLANK=-32768; TiledImage.readAll(f32) yields NaN at indices 3/17/31 and value[i] == i - 8 elsewhere; readAll(i16) passes the raw -32768 sentinel through"
+    },
+    {
       "path": "compress/tile_rice.fits",
       "sha256": "bf8d9b6c8d964436cac3493433eea5d8fcc42ad2f361ccbc62d639fe3964cdf3",
       "generator": "fpack -C -r (RICE_1) over a CFITSIO 16x16 BITPIX-32 identity ramp",
@@ -160,6 +167,20 @@
       "generator": "CFITSIO gen_sources.c: 8x4 BITPIX-16 primary image",
       "consumer": "X-INTEROP inbound",
       "expected": "HDU 1 image; ImageView.readAll(i16) yields value[i] == i - 8 for i in 0..31"
+    },
+    {
+      "path": "images/img_i16_blank.fits",
+      "sha256": "5f978f1bf1b5719867408ddfbbd3478fd62f0debcc83ea19ffe8ad50e6a0d533",
+      "generator": "CFITSIO gen_sources.c gen_img_i16_blank: 8x4 BITPIX-16 with BLANK=-32768 stored at indices 3/17/31",
+      "consumer": "X-INTEROP inbound (FR-IMG-8 integer null)",
+      "expected": "HDU 1 image; readAll(i16) passes the raw -32768 sentinel through; readAll(f64, null_sentinel=NaN) yields NaN at 3/17/31 and i - 8 elsewhere (astropy: float32 + NaN)"
+    },
+    {
+      "path": "images/img_i16_blank_scaled.fits",
+      "sha256": "18dd26e7c974dd3f141512df813b9efef7f0acd1234a1db99681909d466da531",
+      "generator": "CFITSIO gen_sources.c gen_img_i16_blank(scaled): as img_i16_blank plus BSCALE=2/BZERO=100",
+      "consumer": "X-INTEROP inbound (FR-IMG-8 null precedes scaling)",
+      "expected": "HDU 1 image; readAll(f64, null_sentinel=NaN) yields NaN at 3/17/31 (NOT 2*(-32768)+100) and 2*(i-8)+100 elsewhere (astropy parity)"
     },
     {
       "path": "images/img_f32.fits",

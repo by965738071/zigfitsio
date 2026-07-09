@@ -217,3 +217,26 @@ def test_astropy_reads_detached_table_data(tmp_fits):
     with afits.open(p) as t:
         assert list(t[1].data["A"]) == [7, 8, 9]
         np.testing.assert_allclose(t[1].data["B"], [0.25, 0.5, 0.75])
+
+def test_blank_int_image_matches_astropy_both_directions(tmp_fits):
+    # astropy-authored int image with BLANK: zigfitsio must return the same NaN-masked floats.
+    data = np.array([[10, -32768, 30], [-32768, 50, 60]], dtype=">i2")
+    p = tmp_fits("ap_blank.fits")
+    hdu = afits.PrimaryHDU(data=data)
+    hdu.header["BLANK"] = -32768
+    hdu.writeto(p, overwrite=True)
+    want = afits.getdata(p)
+    assert want.dtype.kind == "f"
+    with zf.open(p) as hdul:
+        got = hdul[0].data
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(got, want)  # NaN == NaN positionally
+
+    # zigfitsio-authored equivalent: astropy must agree too.
+    h = zf.Header()
+    h["BLANK"] = -32768
+    q = tmp_fits("zf_blank.fits")
+    zf.HDUList([zf.PrimaryHDU(data=data.astype("i2"), header=h)]).writeto(q, overwrite=True)
+    ap = afits.getdata(q)
+    with zf.open(q) as hdul:
+        np.testing.assert_array_equal(hdul[0].data, ap)

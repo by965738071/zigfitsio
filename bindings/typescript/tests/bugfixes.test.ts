@@ -10,7 +10,7 @@ import * as zf from "../src/index.js";
 import * as ll from "../src/lowlevel/index.js";
 import { enc } from "../src/util.js";
 import { fill, tmpFits } from "./_fixtures.js";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 
 const tmp = tmpFits();
 afterAll(() => tmp.cleanup());
@@ -2052,5 +2052,125 @@ describe("non-finite float header values are rejected on write (BUGHUNT 25/27)",
     expect(hh.get("BADF")).toBe("nan");
     expect(hh.get("BADI")).toBe("inf");
     expect(hh.get("GOODF")).toBe(150);
+  });
+});
+
+describe("BLANK/ZBLANK semantics: int images with BLANK read as NaN-masked floats (BUGHUNT 28)", () => {
+  function blankI16Bytes(values: number[], shape: number[], blank = -32768): Uint8Array {
+    const h = new zf.Header();
+    h.set("BLANK", blank);
+    const hdu = new zf.PrimaryHDU({ data: new zf.FitsArray(Int16Array.from(values), shape), header: h });
+    return new zf.HDUList([hdu]).toBytes();
+  }
+
+  test("BLANK int image promotes to f4 with NaN at the sentinels", () => {
+    const hl = zf.fromBytes(blankI16Bytes([1, -32768, 3, 4, 5, -32768], [2, 3]));
+    const d = hl.get(0).data as zf.FitsArray;
+    expect(d.dtype).toBe("f4");
+    const vals = d.data as Float32Array;
+    expect(Number.isNaN(vals[1])).toBe(true);
+    expect(Number.isNaN(vals[5])).toBe(true);
+    expect([vals[0], vals[2], vals[3], vals[4]]).toEqual([1, 3, 4, 5]);
+  });
+
+  test("all-blank image is all NaN", () => {
+    const hl = zf.fromBytes(blankI16Bytes([-32768, -32768], [1, 2]));
+    const vals = (hl.get(0).data as zf.FitsArray).data as Float32Array;
+    expect(Number.isNaN(vals[0]) && Number.isNaN(vals[1])).toBe(true);
+  });
+
+  test("BLANK=0 substitutes too (spec/CFITSIO behavior; astropy 8 has a falsy-zero quirk)", () => {
+    const hl = zf.fromBytes(blankI16Bytes([0, 7], [1, 2], 0));
+    const vals = (hl.get(0).data as zf.FitsArray).data as Float32Array;
+    expect(Number.isNaN(vals[0])).toBe(true);
+    expect(vals[1]).toBe(7);
+  });
+
+  test("unsigned-BZERO convention wins: BLANK ignored, raw u2 returned (astropy parity)", () => {
+    const h = new zf.Header();
+    h.set("BLANK", -32768);
+    const hdu = new zf.PrimaryHDU({ data: new zf.FitsArray(Uint16Array.from([1, 0, 3]), [1, 3]), header: h });
+    const hl = zf.fromBytes(new zf.HDUList([hdu]).toBytes());
+    const d = hl.get(0).data as zf.FitsArray;
+    expect(d.dtype).toBe("u2");
+    expect(asNums(d.data)).toEqual([1, 0, 3]);
+  });
+
+  test("dtype widths match astropy: f4 for BITPIX 16, f8 for 32/64", () => {
+    for (const [arr, want] of [
+      [Int32Array.from([1, -9, 3]), "f8"],
+      [BigInt64Array.from([1n, -9n, 3n]), "f8"],
+    ] as const) {
+      const h = new zf.Header();
+      h.set("BLANK", -9);
+      const hdu = new zf.PrimaryHDU({ data: new zf.FitsArray(arr, [1, 3]), header: h });
+      const hl = zf.fromBytes(new zf.HDUList([hdu]).toBytes());
+      const d = hl.get(0).data as zf.FitsArray;
+      expect(d.dtype).toBe(want);
+      expect(Number.isNaN((d.data as Float64Array)[1])).toBe(true);
+    }
+  });
+
+  test("section() honors BLANK (the zf_read_subset path)", () => {
+    const p = tmp.path();
+    const bytes = blankI16Bytes([1, -32768, 3, 4, 5, -32768], [2, 3]);
+    writeFileSync(p, bytes);
+    const hl = zf.open(p);
+    try {
+      const img = hl.image(0);
+      const cut = img.section({ window: [[0, 2], [1, 3]] }); // cols 1..2 of both rows
+      expect(cut.dtype).toBe("f4");
+      const vals = cut.data as Float32Array;
+      expect(Number.isNaN(vals[0])).toBe(true); // (0,1) is the sentinel
+      expect(vals[1]).toBe(3);
+      expect(Number.isNaN(vals[3])).toBe(true); // (1,2) is the sentinel
+      expect(vals[2]).toBe(5);
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("promoted write-back drops the stale BLANK card; pristine copy keeps the original bytes", () => {
+    const src = tmp.path();
+    const bytes = blankI16Bytes([1, -32768, 3], [1, 3]);
+    writeFileSync(src, bytes);
+
+    // Untouched HDU: pristine byte-copy preserves the original int+BLANK bytes verbatim.
+    const copyPath = tmp.path();
+    let hl = zf.open(src);
+    try {
+      expect((hl.get(0).data as zf.FitsArray).dtype).toBe("f4"); // promoted on read
+      hl.writeTo(copyPath, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    hl = zf.open(copyPath);
+    try {
+      expect(hl.get(0).header.get("BITPIX")).toBe(16);
+      expect(hl.get(0).header.get("BLANK")).toBe(-32768);
+    } finally {
+      hl.close();
+    }
+
+    // Dirtied HDU reconstructs: the emitted data unit is float, so BLANK must be dropped.
+    const dstPath = tmp.path();
+    hl = zf.open(src);
+    try {
+      void hl.get(0).data;
+      hl.get(0).header.set("NOTE", "edited"); // force the reconstruction (non-pristine) path
+      hl.writeTo(dstPath, { overwrite: true });
+    } finally {
+      hl.close();
+    }
+    hl = zf.open(dstPath);
+    try {
+      expect(Number(hl.get(0).header.get("BITPIX"))).toBeLessThan(0);
+      expect(hl.get(0).header.get("BLANK")).toBeUndefined();
+      const vals = (hl.get(0).data as zf.FitsArray).data as Float32Array;
+      expect(Number.isNaN(vals[1])).toBe(true);
+      expect([vals[0], vals[2]]).toEqual([1, 3]);
+    } finally {
+      hl.close();
+    }
   });
 });

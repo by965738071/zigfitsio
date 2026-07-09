@@ -88,3 +88,45 @@ def test_golden_ascii_table(golden_dir):
     with zf.open(path) as hdul:
         rec = hdul[1].data
         assert list(rec["ID"]) == [100, 200, 300]
+
+
+def test_golden_image_i16_blank(golden_dir):
+    path = os.path.join(str(golden_dir), "images", "img_i16_blank.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing img_i16_blank")
+    with zf.open(path) as hdul:
+        d = hdul[0].data.ravel()
+        assert d.dtype == np.dtype("f4")  # astropy width for BITPIX 16 + BLANK
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], np.array(rest, dtype="f4") - 8)
+
+
+def test_golden_image_i16_blank_scaled(golden_dir):
+    """Null substitution happens on the RAW stored value, BEFORE BSCALE/BZERO scaling."""
+    path = os.path.join(str(golden_dir), "images", "img_i16_blank_scaled.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing img_i16_blank_scaled")
+    with zf.open(path) as hdul:
+        d = hdul[0].data.ravel()
+        assert d.dtype.kind == "f"
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()  # NaN, NOT 2*(-32768)+100
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], 2.0 * (np.array(rest) - 8) + 100.0)
+
+
+def test_golden_tile_rice_i16_blank(golden_dir):
+    """fpack keeps the source's plain BLANK keyword in the compressed header (no ZBLANK);
+    the decode must still yield NaN-masked floats, like funpack/astropy."""
+    path = os.path.join(str(golden_dir), "compress", "tile_rice_i16_blank.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing tile_rice_i16_blank")
+    with zf.open(path) as hdul:
+        d = hdul[1].data.ravel()
+        assert d.dtype.kind == "f"
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], np.array(rest, dtype="f8") - 8)

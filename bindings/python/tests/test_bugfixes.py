@@ -1542,3 +1542,107 @@ def test_bare_nan_token_reads_as_string_not_float():
         out = c.c_double()
         kb = b"BADF"
         assert ll.lib.zf_read_key_dbl(hdul[0]._select(), kb, len(kb), c.byref(out)) == 207
+
+
+# ── #28 BLANK semantics: int images with BLANK read as NaN-masked floats ──────────────────────
+def _blank_i16_bytes(values, blank=-32768):
+    h = zf.Header()
+    h["BLANK"] = blank
+    hdu = zf.PrimaryHDU(data=np.array(values, dtype="i2"), header=h)
+    return zf.HDUList([hdu]).to_bytes()
+
+
+def test_blank_int_image_promotes_to_float_nan():
+    # Raw sentinel ints used to leak through as ordinary pixels; astropy/funpack return
+    # NaN-masked floats (float32 for BITPIX 8/16).
+    buf = _blank_i16_bytes([[1, -32768, 3], [4, 5, -32768]])
+    with zf.from_bytes(buf) as hdul:
+        d = hdul[0].data
+        assert d.dtype == np.dtype("f4")
+        assert np.isnan(d[0, 1]) and np.isnan(d[1, 2])
+        np.testing.assert_array_equal(d[~np.isnan(d)], [1.0, 3.0, 4.0, 5.0])
+
+
+def test_blank_all_blank_image_is_all_nan():
+    buf = _blank_i16_bytes([[-32768, -32768]])
+    with zf.from_bytes(buf) as hdul:
+        assert np.isnan(hdul[0].data).all()
+
+
+def test_blank_zero_sentinel_substitutes():
+    # BLANK=0 is a legal sentinel; substitute it too (astropy 8 has a falsy-zero quirk here
+    # and only promotes without substituting — we deliberately follow the spec/CFITSIO).
+    buf = _blank_i16_bytes([[0, 7]], blank=0)
+    with zf.from_bytes(buf) as hdul:
+        d = hdul[0].data.ravel()
+        assert np.isnan(d[0]) and d[1] == 7.0
+
+
+def test_blank_unsigned_convention_stays_unsigned():
+    # astropy parity: the unsigned-BZERO convention wins and BLANK is ignored — the array
+    # comes back as raw unsigned ints, exactly like astropy.
+    h = zf.Header()
+    h["BLANK"] = -32768
+    hdu = zf.PrimaryHDU(data=np.array([[1, 0, 3]], dtype="u2"), header=h)
+    buf = zf.HDUList([hdu]).to_bytes()
+    with zf.from_bytes(buf) as hdul:
+        d = hdul[0].data
+        assert d.dtype == np.dtype("u2")
+        np.testing.assert_array_equal(d, [[1, 0, 3]])
+
+
+def test_blank_promoted_writeback_drops_blank_card(tmp_fits):
+    # Writing the promoted float array back through the RECONSTRUCTION path must not strand
+    # the (now spec-illegal) BLANK card on a negative-BITPIX image. astropy strands it with a
+    # VerifyWarning; we drop it.
+    src, dst, copy = tmp_fits("blank_src.fits"), tmp_fits("blank_dst.fits"), tmp_fits("blank_copy.fits")
+    with open(src, "wb") as f:
+        f.write(_blank_i16_bytes([[1, -32768, 3]]))
+
+    # An untouched HDU takes the pristine byte-copy path: the original int+BLANK bytes are
+    # preserved verbatim (no lossy float rewrite), and re-reading promotes again.
+    with zf.open(src) as hdul:
+        assert hdul[0].data.dtype == np.dtype("f4")  # promoted on read
+        hdul.writeto(copy, overwrite=True)
+    with zf.open(copy) as hdul:
+        assert hdul[0].header["BITPIX"] == 16 and hdul[0].header["BLANK"] == -32768
+        assert np.isnan(hdul[0].data.ravel()[1])
+
+    # A dirtied HDU reconstructs: the emitted data unit is float, so BLANK must be dropped.
+    with zf.open(src) as hdul:
+        _ = hdul[0].data
+        hdul[0].header["NOTE"] = "edited"  # force the reconstruction (non-pristine) path
+        hdul.writeto(dst, overwrite=True)
+    with zf.open(dst) as hdul:
+        assert hdul[0].header["BITPIX"] < 0
+        assert "BLANK" not in hdul[0].header
+        d = hdul[0].data.ravel()
+        assert np.isnan(d[1]) and d[0] == 1.0 and d[2] == 3.0
+
+
+def test_blank_int_dtype_widths_match_astropy():
+    # astropy widths: float32 for BITPIX 8/16, float64 for 32/64.
+    for dtype, want in (("i2", "f4"), ("i4", "f8"), ("i8", "f8")):
+        h = zf.Header()
+        h["BLANK"] = -9
+        hdu = zf.PrimaryHDU(data=np.array([[1, -9, 3]], dtype=dtype), header=h)
+        with zf.from_bytes(zf.HDUList([hdu]).to_bytes()) as hdul:
+            d = hdul[0].data
+            assert d.dtype == np.dtype(want), (dtype, d.dtype)
+            assert np.isnan(d[0, 1]) and d[0, 0] == 1.0
+
+
+def test_blank_promoted_update_mode_flush_fails_loud(tmp_fits):
+    # In-place update of a BLANK-promoted image cannot be expressed in the integer data unit:
+    # the flush fails loud (NaN -> int, status 412) instead of silently corrupting. Use
+    # writeto() to a new file instead (documented in CAVEATS.md).
+    p = tmp_fits("blank_upd.fits")
+    with open(p, "wb") as f:
+        f.write(_blank_i16_bytes([[1, -32768, 3]]))
+    hdul = zf.open(p, mode="update")
+    d = hdul[0].data
+    d[0, 0] = 42.0  # in-place mutation of the promoted float array
+    with pytest.raises(zf.FitsError):
+        hdul.close()
+    with zf.open(p) as h2:  # the file is still structurally readable
+        assert h2[0].data is not None

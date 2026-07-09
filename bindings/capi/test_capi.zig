@@ -448,6 +448,38 @@ test "non-finite float keyword values are rejected with status 207 on the write 
     try testing.expectEqual(@as(f64, 1.5), v);
 }
 
+test "BLANK integer nulls substitute a caller-supplied NaN nulval, before scaling (BUGHUNT 28)" {
+    // Pins the exact ABI contract the Python/TS bindings rely on: `nulval` is dereferenced as
+    // the OUTPUT dtype, and a stored value equal to the header BLANK becomes the sentinel
+    // instead of being scaled through BSCALE/BZERO.
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+
+    const axes = [_]c_long{4};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 16, 1, &axes));
+    const kb = "BLANK";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, kb, kb.len, -32768, null, 0));
+    const sb = "BSCALE";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, sb, sb.len, 2.0, null, 0));
+    const zb = "BZERO";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, zb, zb.len, 100.0, null, 0));
+
+    // Store the raw shorts verbatim (identity scaling override), incl. the sentinel at index 1.
+    const pixels = [_]i16{ 1, -32768, 3, 4 };
+    const identity: abi.ZfScaling = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(hh, I16, 1, 4, null, &identity, &pixels));
+
+    const nan = std.math.nan(f64);
+    var out: [4]f64 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, F64, 1, 4, &nan, null, &out));
+    try testing.expectEqual(@as(f64, 102.0), out[0]); // 2*1 + 100
+    try testing.expect(std.math.isNan(out[1])); // the sentinel, NOT 2*(-32768) + 100
+    try testing.expectEqual(@as(f64, 106.0), out[2]);
+    try testing.expectEqual(@as(f64, 108.0), out[3]);
+}
+
 fn putRecord(hh: *Handle, text: []const u8) !void {
     var card: [80]u8 = [_]u8{' '} ** 80;
     @memcpy(card[0..text.len], text);

@@ -86,6 +86,25 @@ function commentaryCard(kw: string, value: HeaderValue): Uint8Array {
   return asciiBytes((kw.toUpperCase().padEnd(8) + text).slice(0, 80).padEnd(80));
 }
 
+/**
+ * Whether the HDU declares an integer null sentinel: a `BLANK` keyword, or — for a
+ * tile-compressed image, whose visible header is the raw BINTABLE one — `ZBLANK` as a
+ * keyword or a per-tile column. fpack copies the source's `BLANK` unrenamed, so the plain
+ * spelling also covers most compressed files in the wild.
+ */
+function blankDefined(header: Header): boolean {
+  if (header.get("BLANK") != null) return true;
+  if (header.get("ZIMAGE")) {
+    if (header.get("ZBLANK") != null) return true;
+    const nf = Number(header.get("TFIELDS") ?? 0);
+    for (let i = 1; i <= nf; i++) {
+      const t = header.get(`TTYPE${i}`);
+      if (t != null && String(t).trim().toUpperCase() === "ZBLANK") return true;
+    }
+  }
+  return false;
+}
+
 /** Serialize a header value to its FITS card literal (for HIERARCH cards written raw). */
 function fitsValueLiteral(value: HeaderValue): string {
   if (typeof value === "boolean") return value ? "T" : "F";
@@ -546,18 +565,37 @@ export class ImageHDU extends BaseHDU {
     return { bitpix: bitpix[0], axes: out };
   }
 
-  /** @internal Read dtype from BITPIX + BSCALE/BZERO (unsigned convention, scaled → float). */
+  /** @internal Read dtype from BITPIX + BSCALE/BZERO (unsigned convention, BLANK/ZBLANK and
+   * scaled → float). */
   _outputDtype(header: Header, bitpix: number): dt.Dtype {
     const bscale = header.get("BSCALE");
     const bzero = header.get("BZERO");
     const unsignedBzero = dt.UNSIGNED_BZERO[bitpix];
     if (eqNum(bscale, 1, 1) && unsignedBzero !== undefined && eqNum(bzero, 0, unsignedBzero)) {
+      // astropy parity: the unsigned convention wins — BLANK is ignored on this path
+      // (astropy returns the raw unsigned ints too).
       return dt.UNSIGNED_DTYPE[bitpix];
+    }
+    if (bitpix > 0 && blankDefined(header)) {
+      // BLANK/ZBLANK forces float physical values (blanked pixels read as NaN),
+      // at astropy's widths: f4 for BITPIX 8/16, f8 for 32/64.
+      return bitpix === 8 || bitpix === 16 ? "f4" : "f8";
     }
     if (!eqNum(bscale, 1, 1) || !eqNum(bzero, 0, 0)) {
       return bitpix === -32 ? "f4" : "f8";
     }
     return dt.bitpixToDtype(bitpix);
+  }
+
+  /** @internal NaN nulval for a BLANK-declaring integer image promoted to float output.
+   * Stored values equal to BLANK substitute the sentinel BEFORE scaling (FR-IMG-8), matching
+   * astropy/funpack. The tile-compressed path ignores nulval and NaN-substitutes on its own
+   * for float output, so passing it unconditionally is harmless there. */
+  _blankNulval(bitpix: number, outDtype: dt.Dtype): Float32Array | Float64Array | null {
+    if (bitpix > 0 && (outDtype === "f4" || outDtype === "f8") && blankDefined(this.header)) {
+      return outDtype === "f4" ? Float32Array.of(NaN) : Float64Array.of(NaN);
+    }
+    return null;
   }
 
   /** @internal */
@@ -570,7 +608,7 @@ export class ImageHDU extends BaseHDU {
     const buf = dt.allocDtype(outDtype, n);
     if (n > 0) {
       const h = this._select();
-      ll.check(ll.lib.zf_read_img(h, dt.zfCode(outDtype), 1n, BigInt(n), null, null, buf));
+      ll.check(ll.lib.zf_read_img(h, dt.zfCode(outDtype), 1n, BigInt(n), this._blankNulval(bitpix, outDtype), null, buf));
     }
     const arr = new FitsArray(buf, shape);
     // Baseline in ALL modes so both update-mode write-back and the pristine
@@ -669,7 +707,9 @@ export class ImageHDU extends BaseHDU {
     const inc = ll.longArray([...incC].reverse());
     const h = this._select();
     ll.check(
-      ll.lib.zf_read_subset(h, dt.zfCode(outDtype), ndim, lower, upper, inc, BigInt(nelem), null, null, buf),
+      ll.lib.zf_read_subset(
+        h, dt.zfCode(outDtype), ndim, lower, upper, inc, BigInt(nelem), this._blankNulval(bitpix, outDtype), null, buf,
+      ),
     );
     // The returned flat buffer is fastest-first == C-order for `outShape`
     // (the standard FITS↔numpy reinterpretation; no transpose needed).
@@ -726,7 +766,10 @@ export class ImageHDU extends BaseHDU {
     }
     const bitpix = dt.dtypeToBitpix(dtype);
     ll.check(ll.lib.zf_create_img(handle, bitpix, axes.length, ll.longArray(axes)));
-    this._applyUserKeys(handle);
+    // A float image cannot carry BLANK (its null is NaN; validate/fitsverify flag the card).
+    // Reached when writing back a BLANK-promoted read — astropy strands the stale card with
+    // a warning; drop it instead so our own output verifies clean.
+    this._applyUserKeys(handle, bitpix < 0 ? (up) => up === "BLANK" : undefined);
     if (data.size > 0) {
       ll.check(ll.lib.zf_write_img(handle, dt.zfCode(dtype), 1n, BigInt(data.size), null, null, data.data));
     }

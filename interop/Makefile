@@ -28,6 +28,7 @@ golden: $(GEN)
 	# 2. fpack each tile source with a standard codec. -C suppresses timestamped checksum cards
 	#    (determinism); -O names the output directly. fpack refuses an existing target, so clear.
 	rm -f $(CMP)/tile_rice.fits $(CMP)/tile_gzip.fits $(CMP)/tile_hcompress.fits $(CMP)/tile_plio.fits \
+	      $(CMP)/tile_rice_i16_blank.fits \
 	      $(CMP)/tile_hcompress_lossy16.fits $(CMP)/tile_hcompress_lossy16_expected.fits \
 	      $(CMP)/tile_hcompress_clip16.fits $(CMP)/tile_hcompress_clip16_expected.fits \
 	      $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_smooth_expected.fits \
@@ -35,6 +36,8 @@ golden: $(GEN)
 	      $(CMP)/tile_hcompress_fdith_expected.fits $(CMP)/tile_rice_fdith_expected.fits \
 	      $(CMP)/tile_rice_ddith_expected.fits
 	fpack -C -r      -O $(CMP)/tile_rice.fits      $(CMP)/src_rice.fits
+	# integer-null tile: fpack copies the source's BLANK into the compressed header as ZBLANK.
+	fpack -C -r      -O $(CMP)/tile_rice_i16_blank.fits $(CMP)/src_rice_i16_blank.fits
 	fpack -C -g1     -O $(CMP)/tile_gzip.fits      $(CMP)/src_gzip.fits
 	fpack -C -h -s 0 -O $(CMP)/tile_hcompress.fits $(CMP)/src_hcompress.fits
 	fpack -C -p      -O $(CMP)/tile_plio.fits      $(CMP)/src_plio.fits

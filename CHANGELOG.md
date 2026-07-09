@@ -38,6 +38,22 @@ All notable changes to `zigfitsio` are documented here. The format follows
   bare `nan`/`inf`/`1E999` token into a float either: it now applies the same strict
   FITS-real grammar as the TypeScript parser and falls back to the string value, while
   typed C-ABI reads keep failing with 207. (BUGHUNT-2026-07-06 items 25+27)
+- **Python / TypeScript / Core**: integer images declaring a null sentinel are read with
+  **BLANK semantics** — the bindings now detect `BLANK` (and, for tile-compressed images,
+  `ZBLANK` as a keyword or per-tile column), promote the output to float at astropy's widths
+  (`float32` for BITPIX 8/16, `float64` for 32/64), and substitute NaN for blanked pixels
+  **before** BSCALE/BZERO scaling, matching astropy/CFITSIO; previously the raw sentinel
+  values (e.g. `-32768`) leaked through as ordinary pixels. The unsigned-`BZERO`-convention
+  path keeps returning raw unsigned ints (astropy parity: `BLANK` is ignored there). Writing
+  a promoted (float) image back through the reconstruction path drops the now-illegal `BLANK`
+  card instead of stranding it on a negative-BITPIX HDU (astropy leaves it with a
+  `VerifyWarning`); the pristine copy path still preserves the original int+BLANK bytes
+  verbatim. One core fix rode along: the tiled decoder now accepts a plain **`BLANK`** keyword
+  in a compressed header as the `ZBLANK` fallback spelling — which is what **fpack actually
+  writes** (it copies the source's `BLANK` unrenamed) and what CFITSIO reads
+  (`imcomp_get_compressed_image_par` tries `ZBLANK` then `BLANK`). New CFITSIO-authored
+  goldens (`images/img_i16_blank*`, `compress/tile_rice_i16_blank`) pin the behavior across
+  all layers. (BUGHUNT-2026-07-06 item 28)
 - **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
   `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
   boundary — are now readable: out-of-range decoded values **clamp to the type range**

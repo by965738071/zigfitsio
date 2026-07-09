@@ -153,9 +153,16 @@ apply to both language bindings unless noted; TypeScript-specific ones are liste
 
 - **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
   purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
-- **Integer null masks.** Float nulls surface as NaN; for integer images/columns the raw `BLANK`/
-  `TNULLn` values are readable (and exposed via `zf_table_col_info`), but the high-level API does
-  not yet return `numpy.ma` masked arrays for them — masking integer nulls is a follow-up.
+- **Integer null masks.** Float nulls surface as NaN. Integer **images** declaring `BLANK`
+  (or `ZBLANK`/plain `BLANK` in a tile-compressed header) are promoted to float with NaN at the
+  blanked pixels, matching astropy/funpack; the unsigned-`BZERO`-convention path intentionally
+  keeps raw unsigned ints and ignores `BLANK`, exactly as astropy does. In-place **update-mode**
+  write-back of a BLANK-promoted image is not supported: the promoted array is float while the
+  on-disk data unit is integer, so a mutated-data flush fails loud (`NanToInt`, status 412)
+  rather than corrupting — use `writeto()` to a new file (the reconstruction path drops the
+  then-illegal `BLANK` card from the float output). Table `TNULLn` values remain readable (and
+  exposed via `zf_table_col_info`), but the high-level API does not yet return `numpy.ma` masked
+  arrays for integer columns — that masking is a follow-up.
 - **VLA writing.** The high-level `from_columns`/`writeto` path writes variable-length-array
   columns, reserving the heap (`PCOUNT`) up front via `zf_create_tbl_heap`; reading VLAs is
   complete. The lower-level `zf_write_col_vla` still assumes the heap is reserved (create the table
