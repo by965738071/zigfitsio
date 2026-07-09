@@ -47,7 +47,10 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
   `FnNoise5_int`/`quick_select` MAD estimators, bit-exact vs `fits_img_stats_int`) scaling plus
   the SMOOTH request, records `ZVAL1` (float request)/`ZVAL2` exactly like CFITSIO, and uses
   CFITSIO's default row-block tiling; `funpack` decodes zigfitsio's lossy output to exactly the
-  pixels zigfitsio itself decodes (`check_funpack.py`).
+  pixels zigfitsio itself decodes (`check_funpack.py`). A lossy reconstruction that overshoots
+  the `ZBITPIX` range **clamps to the type range exactly as CFITSIO clips it** (the
+  `tile_hcompress_clip16` golden pins this) — PLIO, whose decode is lossless, still strictly
+  rejects out-of-range values as corrupt.
 - `DATASUM` recomputes to a CFITSIO-authored golden vector (`X-SUM`).
 - WCS TAN `pixel→world` agrees with Astropy reference points within tolerance.
 - **Quantized-float writes through the integer codecs are CFITSIO-parity** (closing the former

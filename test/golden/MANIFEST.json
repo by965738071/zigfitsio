@@ -43,6 +43,20 @@
       "expected": "HDU 1 BITPIX-16 32x32 image; the exact pixels zigfitsio must produce from the paired .fz"
     },
     {
+      "path": "compress/tile_hcompress_clip16.fits",
+      "sha256": "0b8ad7aa3fff5ff5a0735e0a76a5e7590e452823bf8ad3785c7401cd3096bbb2",
+      "generator": "fpack -C -h -s -800 (HCOMPRESS_1, ABSOLUTE lossy scale 800, SMOOTH=0) over a CFITSIO 32x32 BITPIX-16 noisy plateau at the i16 ceiling (gen_clip_i16: 32500 + LCG%201, sharp holes at 2000; source max 32700), 32x16 tiles",
+      "consumer": "CMP-6 lossy clamp / X-INTEROP inbound",
+      "expected": "HDU 2 ZIMAGE/HCOMPRESS_1 whose lossy reconstruction overshoots 32767; TiledImage.readAll(i32) reproduces tile_hcompress_clip16_expected.fits (funpack's range-clipped decode) bit-exactly (hunt 2026-07-06 item 42)"
+    },
+    {
+      "path": "compress/tile_hcompress_clip16_expected.fits",
+      "sha256": "2f6940bbccc5cb0d5f18cfc80d483713f087d565fb8c7bdcd64f5ed6f8eab831",
+      "generator": "funpack -C over tile_hcompress_clip16.fits (the authoritative CFITSIO lossy decode, overshoots CLIPPED to the i16 range)",
+      "consumer": "CMP-6 lossy clamp (expected pixels)",
+      "expected": "HDU 1 BITPIX-16 32x32 image containing 8 range-clipped 32767 pixels; the exact pixels zigfitsio must produce from the paired .fz"
+    },
+    {
       "path": "compress/tile_hcompress_lossy32.fits",
       "sha256": "a6a5d180a34f4badb9f3fffcc2ba237b0de74c720ba0af259e5a9448a5d47830",
       "generator": "CFITSIO gen_sources.c fits_img_compress (HCOMPRESS_1, fits_set_hcomp_scale(-16) = ABSOLUTE 16, fits_set_hcomp_smooth(0)) over the 32x32 BITPIX-32 curved surface, 32x16 tiles",

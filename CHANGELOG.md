@@ -7,6 +7,14 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Core**: lossy `HCOMPRESS_1` integer images whose reconstruction overshoots the
+  `ZBITPIX` range — a documented, expected artifact of `fpack -h -s N` near the type
+  boundary — are now readable: out-of-range decoded values **clamp to the type range**
+  (0..255 for `ZBITPIX = 8`, the i16 range for 16), exactly as CFITSIO/funpack clip them,
+  instead of aborting the entire read with error 413 (`DataConstraintViolated`). PLIO's
+  strict out-of-range reject is unchanged (its decode is lossless, so out-of-spec values
+  still mean a corrupt file). A funpack-authored overshooting golden
+  (`compress/tile_hcompress_clip16*`) pins the clamp bit-exactly.
 - **Core**: quantized (lossy) `BITPIX = -64` tile-compressed images are dequantized in
   **full double precision** — `dither.unquantize`/`unquantizeNext` returned `f32`, silently
   truncating every pixel of every quantized double file to a 24-bit mantissa (~6e-5 absolute

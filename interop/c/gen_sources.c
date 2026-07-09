@@ -119,6 +119,36 @@ static void gen_curved_i32(const char *root, const char *rel) {
     fits_close_file(f, &status);                  check(status, "curved_i32 close");
 }
 
+/* ── 32x32 boundary-value source for the lossy-hcompress CLIP golden ──────────────────────
+ * A noisy plateau just under the i16 ceiling (32500 + LCG-noise 0..200, deterministic seed 42)
+ * with sharp dark holes (2000) punched in: irregular high-frequency content next to the type
+ * maximum makes the lossy H-transform reconstruction overshoot 32767. The source max is 32700
+ * (< 32767), so every 32767 in the funpack-authored expectation is a CFITSIO range-clip —
+ * pinning the clamp-not-reject decode contract (CFITSIO imcompress.c treats lossy HCOMPRESS
+ * overflow as expected: it clips and resets the overflow status). fpack -s -800 (absolute
+ * scale, data-independent) reliably clips ~8 pixels of this field. */
+static void gen_clip_i16(const char *root, const char *rel) {
+    char path[1024];
+    mkpath(path, sizeof path, root, rel);
+    int status = 0;
+    fitsfile *f;
+    long naxes[2] = { CURV_W, CURV_H };
+    short sdata[CURV_N];
+    unsigned rng = 42;
+    for (int r = 0; r < CURV_H; r++) {
+        for (int c = 0; c < CURV_W; c++) {
+            rng = rng * 1103515245u + 12345u;
+            short v = (short)(32500 + (rng >> 16) % 201);
+            if ((c % 16) < 2 && (r % 16) < 2) v = 2000;
+            sdata[r * CURV_W + c] = v;
+        }
+    }
+    fits_create_file(&f, path, &status);          check(status, "clip_i16 create");
+    fits_create_img(f, SHORT_IMG, 2, naxes, &status); check(status, "clip_i16 img");
+    fits_write_img(f, TSHORT, 1, CURV_N, sdata, &status); check(status, "clip_i16 write");
+    fits_close_file(f, &status);                  check(status, "clip_i16 close");
+}
+
 /* compress/tile_hcompress_lossy32.fits and compress/tile_hcompress_smooth.fits — HCOMPRESS_1
  * with ABSOLUTE scale 16 (fits_set_hcomp_scale(-16): negative = absolute, so no data-dependent
  * noise estimation enters the committed bytes) over the curved i32 source, 32x16 tiles. The two
@@ -509,6 +539,8 @@ int main(int argc, char **argv) {
 
     /* lossy hcompress: fpack authors the i16 SMOOTH=0 golden from this source… */
     gen_curved_i16(root, "compress/src_hcompress_lossy16.fits");
+    /* …the boundary-value CLIP golden (reconstruction overshoots 32767) from this one… */
+    gen_clip_i16(root, "compress/src_hcompress_clip16.fits");
     /* …and the i32 SMOOTH=0/SMOOTH=1 pair is authored here (fpack has no smooth flag). */
     gen_curved_i32(root, "compress/src_hcompress_lossy32.fits");
     gen_hcomp_lossy(root, "compress/tile_hcompress_lossy32.fits", 0);

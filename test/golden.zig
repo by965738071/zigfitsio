@@ -144,7 +144,9 @@ test "golden: CMP-6 HCOMPRESS_1 lossless tile decodes to ramp (fpack -h -s 0)" {
 // pixels. Lossy HCOMPRESS decode is deterministic integer math, so zigfitsio must reproduce
 // funpack bit-for-bit: `lossy16`/`lossy32` cover the plain (`ZVAL2 = 0`) inverse across both
 // CFITSIO decode variants (int for ZBITPIX 16, LONGLONG for 32), and `smooth` (`ZVAL2 = 1`)
-// proves decode-side hsmooth is CFITSIO-identical — not merely "close".
+// proves decode-side hsmooth is CFITSIO-identical — not merely "close". `clip16` (absolute
+// scale 800 over a noisy plateau at the i16 ceiling) pins the clamp of reconstructions that
+// overshoot the ZBITPIX range — CFITSIO clips those to the type range instead of erroring.
 
 const curv_n = 32 * 32;
 
@@ -179,6 +181,24 @@ fn expectLossyTile(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u
 test "golden: CMP-6 lossy HCOMPRESS_1 i16 tile decodes exactly like funpack (fpack -h -s -16)" {
     try requireCorpus();
     try expectLossyTile(testing.allocator, "compress/tile_hcompress_lossy16.fits", "compress/tile_hcompress_lossy16_expected.fits");
+}
+
+test "golden: CMP-6 overshooting lossy HCOMPRESS_1 i16 tile clamps to the ZBITPIX range exactly like funpack (fpack -h -s -800)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    try expectLossyTile(alloc, "compress/tile_hcompress_clip16.fits", "compress/tile_hcompress_clip16_expected.fits");
+
+    // Non-vacuousness: the source plateau tops out at 32700 (gen_clip_i16), so a 32767 in
+    // funpack's expectation can only be CFITSIO clipping an overshooting reconstruction —
+    // proving this golden actually exercises the clamp path (a strict out-of-range reject
+    // would have failed the whole expectLossyTile read with DataConstraintViolated).
+    var expected: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_clip16_expected.fits", &expected);
+    var clipped: usize = 0;
+    for (expected) |v| {
+        if (v == std.math.maxInt(i16)) clipped += 1;
+    }
+    try testing.expect(clipped > 0);
 }
 
 test "golden: CMP-6 lossy HCOMPRESS_1 i32 tile decodes exactly like funpack (scale -16, SMOOTH=0)" {

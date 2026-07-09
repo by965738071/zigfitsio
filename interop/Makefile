@@ -29,6 +29,7 @@ golden: $(GEN)
 	#    (determinism); -O names the output directly. fpack refuses an existing target, so clear.
 	rm -f $(CMP)/tile_rice.fits $(CMP)/tile_gzip.fits $(CMP)/tile_hcompress.fits $(CMP)/tile_plio.fits \
 	      $(CMP)/tile_hcompress_lossy16.fits $(CMP)/tile_hcompress_lossy16_expected.fits \
+	      $(CMP)/tile_hcompress_clip16.fits $(CMP)/tile_hcompress_clip16_expected.fits \
 	      $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_smooth_expected.fits \
 	      $(CMP)/tile_hcompress_fq0.fits $(CMP)/tile_hcompress_fq0_expected.fits \
 	      $(CMP)/tile_hcompress_fdith_expected.fits $(CMP)/tile_rice_fdith_expected.fits \
@@ -43,6 +44,11 @@ golden: $(GEN)
 	#     pixel files — the authoritative decode each consumer must reproduce EXACTLY.
 	fpack -C -h -s -16 -O $(CMP)/tile_hcompress_lossy16.fits $(CMP)/src_hcompress_lossy16.fits
 	funpack -C -O $(CMP)/tile_hcompress_lossy16_expected.fits $(CMP)/tile_hcompress_lossy16.fits
+	# 2b'. CLIP golden: absolute scale 800 over the boundary-value plateau source makes the
+	#      reconstruction overshoot 32767; funpack CLIPS to the i16 range (CFITSIO treats lossy
+	#      HCOMPRESS overflow as expected) — the expectation pins that clamp-not-reject contract.
+	fpack -C -h -s -800 -O $(CMP)/tile_hcompress_clip16.fits $(CMP)/src_hcompress_clip16.fits
+	funpack -C -O $(CMP)/tile_hcompress_clip16_expected.fits $(CMP)/tile_hcompress_clip16.fits
 	funpack -C -O $(CMP)/tile_hcompress_lossy32_expected.fits $(CMP)/tile_hcompress_lossy32.fits
 	funpack -C -O $(CMP)/tile_hcompress_smooth_expected.fits  $(CMP)/tile_hcompress_smooth.fits
 	# 2c. Quantized-float tiles over the f32 noise source. NO_DITHER (-q0) is seed-free, so

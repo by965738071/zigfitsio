@@ -695,7 +695,7 @@ pub const TiledImage = struct {
             .plio_1 => {
                 const vals = try plio.decompress(alloc, cbytes, @intCast(npix_tile));
                 defer alloc.free(vals);
-                return i32ToBig(alloc, vals, w);
+                return i32ToBig(alloc, vals, w, .strict);
             },
             .hcompress_1 => {
                 if (self.znaxis < 2) return error.BadTiling;
@@ -722,7 +722,9 @@ pub const TiledImage = struct {
                 const dec = try hcompress.decompress(alloc, cbytes, @intCast(npix_tile), .{ .smooth = smooth });
                 defer alloc.free(dec.data);
                 if (dec.ny != tdim[0] or dec.nx != tdim[1]) return error.CorruptTile;
-                return i32ToBig(alloc, dec.data, w);
+                // `.clamp`: a lossy reconstruction may overshoot the ZBITPIX range; CFITSIO
+                // clips those values, so funpack-readable files must stay readable here.
+                return i32ToBig(alloc, dec.data, w, .clamp);
             },
             .unknown => return error.UnsupportedCodec,
         }
@@ -905,21 +907,51 @@ fn nativeToBig(alloc: Allocator, native: []const u8, w: usize) (errors.CompressE
     return out;
 }
 
+// How `i32ToBig` treats a decoded value that does not fit the declared `ZBITPIX` width.
+const RangeMode = enum {
+    // Reject with a typed error rather than silently `@truncate` — every other conversion path
+    // in the library is checked. Right for PLIO_1, whose decode is lossless: an out-of-spec
+    // mask value (> 255 packed as `w == 1`) can only mean a corrupt file.
+    strict,
+    // Clamp to the width's value range. Right for HCOMPRESS_1, whose LOSSY reconstruction can
+    // legitimately overshoot the type range near its boundary — CFITSIO treats that overflow as
+    // expected (imcompress.c clips and, "Hcompress is a special case", resets NUM_OVERFLOW), so
+    // every `fpack -h -s N` integer file whose reconstruction overshoots decodes fine under
+    // funpack; a strict reject would make that whole file class unreadable. Conscious details:
+    //  * The clamp applies to EVERY HCOMPRESS_1 stream, including a lossless (scale <= 1) one
+    //    that decodes out-of-range — CFITSIO's status reset doesn't inspect the scale either.
+    //  * It happens at the ZBITPIX narrowing, so reading with a WIDER output type still yields
+    //    the clamped boundary value (funpack's file-level decode, the parity target). CFITSIO's
+    //    own API clips at the OUTPUT-type conversion instead: fits_read_img(TINT) on a
+    //    ZBITPIX=16 file returns the raw overshot integer.
+    //  * For `w == 1` CFITSIO also clips the pixels but leaves the overflow status set (only
+    //    its TSHORT branch resets) — we clamp silently for both widths, the consistent reading
+    //    of an artifact CFITSIO itself documents as expected.
+    //  * A clamped pixel that lands exactly on `ZBLANK` reads as blank (our blank compare runs
+    //    on the narrowed value, CFITSIO's pre-clip — reachable only by a lossy file declaring
+    //    an in-range ZBLANK).
+    clamp,
+};
+
 // Pack `vals` as big-endian signed integers of width `w`. Used for PLIO_1 / HCOMPRESS_1, which
-// both produce `i32` stored values. A decoded value that does not fit the declared `ZBITPIX` width
-// (e.g. a corrupt/out-of-spec PLIO mask value > 255 packed as `w == 1`) is rejected with a typed
-// error rather than silently `@truncate`d — every other conversion path in the library is checked.
-fn i32ToBig(alloc: Allocator, vals: []const i32, w: usize) (errors.CompressError || Allocator.Error)![]u8 {
+// both produce `i32` stored values. Out-of-width values are handled per `mode` (above).
+fn i32ToBig(alloc: Allocator, vals: []const i32, w: usize, mode: RangeMode) (errors.CompressError || Allocator.Error)![]u8 {
     const out = try alloc.alloc(u8, vals.len * w);
     errdefer alloc.free(out);
     for (vals, 0..) |v, idx| {
         const off = idx * w;
         switch (w) {
             // BITPIX=8 is UNSIGNED (0..255): accept the full byte range (a bright pixel like 200
-            // is valid) and reject only genuinely out-of-range decodes, rather than casting to a
-            // signed i8 whose 127 ceiling would drop legitimate values 128..255.
-            1 => std.mem.writeInt(u8, out[off..][0..1], std.math.cast(u8, v) orelse return error.DataConstraintViolated, .big),
-            2 => std.mem.writeInt(i16, out[off..][0..2], std.math.cast(i16, v) orelse return error.DataConstraintViolated, .big),
+            // is valid) and treat only genuinely out-of-range decodes per `mode`, rather than
+            // casting to a signed i8 whose 127 ceiling would drop legitimate values 128..255.
+            1 => std.mem.writeInt(u8, out[off..][0..1], switch (mode) {
+                .strict => std.math.cast(u8, v) orelse return error.DataConstraintViolated,
+                .clamp => @intCast(std.math.clamp(v, 0, std.math.maxInt(u8))),
+            }, .big),
+            2 => std.mem.writeInt(i16, out[off..][0..2], switch (mode) {
+                .strict => std.math.cast(i16, v) orelse return error.DataConstraintViolated,
+                .clamp => @intCast(std.math.clamp(v, std.math.minInt(i16), std.math.maxInt(i16))),
+            }, .big),
             4 => std.mem.writeInt(i32, out[off..][0..4], v, .big),
             8 => std.mem.writeInt(i64, out[off..][0..8], v, .big),
             else => return error.DataConstraintViolated,
@@ -2760,6 +2792,30 @@ test "writeCompressed PLIO_1 round-trips an 8-bit image with values >= 128 (unsi
     try testing.expectEqualSlices(u8, &src, &out);
 }
 
+test "PLIO_1 stored value outside the declared ZBITPIX width still rejects (strict, not clamp)" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Author a VALID ZBITPIX=32 PLIO tile holding mask values > 255 (PLIO's own range is
+    // 0..2^24-1), then narrow the declared ZBITPIX to 8: the stored values no longer fit the
+    // width. PLIO decode is lossless, so this can only be a corrupt/mislabeled file — the read
+    // must fail loud with the strict reject, NOT clamp like the lossy HCOMPRESS path.
+    const src = [_]i32{ 0, 300, 5, 5, 5, 0, 3, 0, 0, 7, 7, 0 };
+    const hdu = try writeCompressed(i32, &fx.f, .{
+        .bitpix = 32,
+        .axes = &.{ 4, 3 },
+        .tile = &.{ 4, 3 },
+        .codec = .plio_1,
+    }, &src);
+    try hdu.header.update(fx.f.alloc, "ZBITPIX", .{ .int = 8 }, null);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [12]u8 = undefined;
+    try testing.expectError(error.DataConstraintViolated, ti.readAll(u8, &out));
+}
+
 test "writeCompressed HCOMPRESS_1 round-trips a 2-D integer image (lossless)" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc);
@@ -2886,6 +2942,160 @@ test "writeCompressed HCOMPRESS_1 hcomp_smooth: readers smooth, and it changes p
     for (src, smoothed) |o, g| {
         try testing.expect(@abs(@as(i64, o) - @as(i64, g)) <= 64 * 16);
     }
+}
+
+// ── HCOMPRESS_1 lossy overshoot: reconstructions past the ZBITPIX range CLAMP, not error ───
+//
+// A lossy H-transform reconstruction can legitimately land outside the declared integer range
+// (quantization error near the type boundary). CFITSIO treats that overflow as EXPECTED for
+// HCOMPRESS_1 — imcompress.c clips the value to the type range and resets NUM_OVERFLOW — so
+// every `fpack -h -s N` integer file whose smoothed reconstruction overshoots is readable by
+// funpack. A strict reject would make that whole file class unreadable (413). Each test field
+// is an in-range noisy plateau at the type boundary with sharp holes punched in: the holes'
+// high-frequency edges make the large-absolute-scale reconstruction overshoot. The source never
+// touches the boundary value itself, so a boundary pixel in the decode proves the clamp fired.
+
+test "HCOMPRESS_1 lossy decode overshooting maxInt(i16) clamps to 32767 like funpack" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [1024]i16 = undefined;
+    var rng: u32 = 42;
+    for (0..32) |r| {
+        for (0..32) |c| {
+            rng = rng *% 1103515245 +% 12345;
+            var v: i16 = @intCast(32500 + (rng >> 16) % 201); // 32500..32700 < 32767
+            if (c % 16 < 2 and r % 16 < 2) v = 2000;
+            src[r * 32 + c] = v;
+        }
+    }
+    const hdu = try writeCompressed(i16, &fx.f, .{
+        .bitpix = 16,
+        .axes = &.{ 32, 32 },
+        .tile = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -800,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]i16 = undefined;
+    try ti.readAll(i16, &out);
+    var clamped: usize = 0;
+    for (out) |v| {
+        if (v == std.math.maxInt(i16)) clamped += 1;
+    }
+    try testing.expect(clamped > 0);
+}
+
+test "HCOMPRESS_1 lossy decode undershooting minInt(i16) clamps to -32768 like funpack" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    var src: [1024]i16 = undefined;
+    var rng: u32 = 42;
+    for (0..32) |r| {
+        for (0..32) |c| {
+            rng = rng *% 1103515245 +% 12345;
+            var v: i16 = @intCast(-32500 - @as(i32, @intCast((rng >> 16) % 201))); // -32700..-32500
+            if (c % 16 < 2 and r % 16 < 2) v = -2000;
+            src[r * 32 + c] = v;
+        }
+    }
+    const hdu = try writeCompressed(i16, &fx.f, .{
+        .bitpix = 16,
+        .axes = &.{ 32, 32 },
+        .tile = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -800,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]i16 = undefined;
+    try ti.readAll(i16, &out);
+    var clamped: usize = 0;
+    for (out) |v| {
+        if (v == std.math.minInt(i16)) clamped += 1;
+    }
+    try testing.expect(clamped > 0);
+}
+
+test "HCOMPRESS_1 lossy decode below a BITPIX=8 image's 0 floor clamps to 0" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Bright noisy plateau with near-zero holes. Empirically this field's reconstruction
+    // crosses only the FLOOR (hole-edge ringing below 0); nothing reaches 255 — the plateau's
+    // small noise smooths flat at this scale rather than ringing upward. The mirrored test
+    // below covers the 255 ceiling.
+    var src: [1024]u8 = undefined;
+    var rng: u32 = 42;
+    for (0..32) |r| {
+        for (0..32) |c| {
+            rng = rng *% 1103515245 +% 12345;
+            var v: u8 = @intCast(230 + (rng >> 16) % 21); // 230..250, holes at 5: 0 never occurs
+            if (c % 16 < 2 and r % 16 < 2) v = 5;
+            src[r * 32 + c] = v;
+        }
+    }
+    const hdu = try writeCompressed(u8, &fx.f, .{
+        .bitpix = 8,
+        .axes = &.{ 32, 32 },
+        .tile = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -100,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]u8 = undefined;
+    try ti.readAll(u8, &out);
+    var clamped: usize = 0;
+    for (out) |v| {
+        if (v == 0) clamped += 1;
+    }
+    try testing.expect(clamped > 0);
+}
+
+test "HCOMPRESS_1 lossy decode above a BITPIX=8 image's 255 ceiling clamps to 255" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc);
+    defer fx.deinit(alloc);
+
+    // Mirror of the floor test: dark noisy plateau with near-white holes, so the hole-edge
+    // ringing overshoots ABOVE 255 — pinning the w == 1 clamp's upper bound, which the floor
+    // field never reaches.
+    var src: [1024]u8 = undefined;
+    var rng: u32 = 42;
+    for (0..32) |r| {
+        for (0..32) |c| {
+            rng = rng *% 1103515245 +% 12345;
+            var v: u8 = @intCast(5 + (rng >> 16) % 21); // 5..25, holes at 250: 255 never occurs
+            if (c % 16 < 2 and r % 16 < 2) v = 250;
+            src[r * 32 + c] = v;
+        }
+    }
+    const hdu = try writeCompressed(u8, &fx.f, .{
+        .bitpix = 8,
+        .axes = &.{ 32, 32 },
+        .tile = &.{ 32, 32 },
+        .codec = .hcompress_1,
+        .hcomp_scale = -100,
+    }, &src);
+
+    var ti = try TiledImage.of(&fx.f, hdu);
+    defer ti.deinit(alloc);
+    var out: [1024]u8 = undefined;
+    try ti.readAll(u8, &out);
+    var clamped: usize = 0;
+    for (out) |v| {
+        if (v == 255) clamped += 1;
+    }
+    try testing.expect(clamped > 0);
 }
 
 test "writeCompressed HCOMPRESS_1 noise-adaptive scale (request > 0) matches the CFITSIO mapping" {
