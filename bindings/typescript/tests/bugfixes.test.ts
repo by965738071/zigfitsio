@@ -1629,3 +1629,86 @@ describe("commentary cards accumulate and persist (BUGHUNT #6)", () => {
     read(p, (hl) => expect(blanks(hl.get(0).header)).toEqual([]));
   });
 });
+
+describe("flat plain arrays on vector columns count rows by repeat (BUGHUNT 61)", () => {
+  const tableBytes = (col: zf.Column): Uint8Array =>
+    new zf.HDUList([new zf.PrimaryHDU(), zf.BinTableHDU.fromColumns([col])]).toBytes();
+
+  test("flat plain number[] on '3J' makes 2 rows, not 6", () => {
+    const src = tableBytes(new zf.Column("V", "3J", { array: [1, 2, 3, 4, 5, 6] }));
+    const hl = zf.fromBytes(src);
+    try {
+      const rec = hl.get(1).data as zf.TableData;
+      expect(rec.nrows).toBe(2);
+      expect(asNums(rec.row(0).V as zf.TypedArray)).toEqual([1, 2, 3]);
+      expect(asNums(rec.row(1).V as zf.TypedArray)).toEqual([4, 5, 6]);
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("plain-array and TypedArray spellings of a vector column are byte-identical", () => {
+    const plain = tableBytes(new zf.Column("V", "3J", { array: [1, 2, 3, 4, 5, 6] }));
+    const typed = tableBytes(new zf.Column("V", "3J", { array: Int32Array.from([1, 2, 3, 4, 5, 6]) }));
+    expect(plain).toEqual(typed);
+  });
+
+  test("flat plain interleaved floats on complex '3C' count re/im pairs per row", () => {
+    const src = tableBytes(new zf.Column("C", "3C", { array: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] }));
+    const hl = zf.fromBytes(src);
+    try {
+      const rec = hl.get(1).data as zf.TableData;
+      expect(rec.nrows).toBe(2);
+      expect(asNums(rec.complex("C"))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("flat plain bits on '8X' count one row per 8 elements", () => {
+    const src = tableBytes(new zf.Column("B", "8X", { array: [1, 0, 1, 0, 1, 0, 1, 0] }));
+    const hl = zf.fromBytes(src);
+    try {
+      const rec = hl.get(1).data as zf.TableData;
+      expect(rec.nrows).toBe(1);
+      expect(asNums(rec.get("B") as Uint8Array)).toEqual([1, 0, 1, 0, 1, 0, 1, 0]);
+    } finally {
+      hl.close();
+    }
+  });
+
+  test("a flat length that is not a multiple of the repeat fails loud", () => {
+    expect(() => zf.BinTableHDU.fromColumns([new zf.Column("V", "3J", { array: [1, 2, 3, 4, 5] })])).toThrow(
+      RangeError,
+    );
+    expect(() =>
+      zf.BinTableHDU.fromColumns([new zf.Column("V", "3J", { array: Int32Array.from([1, 2, 3, 4, 5]) })]),
+    ).toThrow(RangeError);
+  });
+
+  test("unaffected shapes keep their row counts", () => {
+    const nrowsOf = (col: zf.Column): number => {
+      const hl = zf.fromBytes(tableBytes(col));
+      try {
+        return (hl.get(1).data as zf.TableData).nrows;
+      } finally {
+        hl.close();
+      }
+    };
+    expect(nrowsOf(new zf.Column("S", "1J", { array: [1, 2, 3] }))).toBe(3); // scalar plain
+    expect(nrowsOf(new zf.Column("N", "3J", { array: [[1, 2, 3], [4, 5, 6]] }))).toBe(2); // rows-of-arrays
+    expect(nrowsOf(new zf.Column("T", "10A", { array: ["a", "bb"] }))).toBe(2); // strings
+    expect(nrowsOf(new zf.Column("L", "1L", { array: [true, false] }))).toBe(2); // scalar logical
+    // rows-of-arrays and the flat spelling of the same data are byte-identical
+    expect(tableBytes(new zf.Column("V", "3J", { array: [[1, 2, 3], [4, 5, 6]] }))).toEqual(
+      tableBytes(new zf.Column("V", "3J", { array: [1, 2, 3, 4, 5, 6] })),
+    );
+    // an empty plain array is an empty table
+    const hl = zf.fromBytes(tableBytes(new zf.Column("E", "3J", { array: [] })));
+    try {
+      expect((hl.get(1).data as zf.TableData).nrows).toBe(0);
+    } finally {
+      hl.close();
+    }
+  });
+});

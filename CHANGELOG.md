@@ -29,6 +29,13 @@ All notable changes to `zigfitsio` are documented here. The format follows
   for any CAR header with a southern reference declination (`CRVAL2 < 0`). The native
   longitude from the celestial→native rotation is now wrapped into [−180°, 180°), matching
   WCSLIB's `sphs2x`; zenithal projections are unaffected. (#37)
+- **TypeScript**: a flat plain `number[]`/`bigint[]` on a vector (`repeat > 1`) binary column
+  now counts rows by the format's per-row element count, like a TypedArray —
+  `fromColumns([new Column('V', '3J', { array: [1, 2, 3, 4, 5, 6] })])` previously wrote a
+  **6-row** table with a zero-filled tail instead of 2 rows (complex `nC`/`nM` and bit `nX`
+  columns were miscounted the same way). A flat array whose length is not a multiple of the
+  per-row count now throws `RangeError` instead of silently flooring — including for
+  TypedArrays, which previously dropped the trailing partial row. (#39)
 
 ## [0.1.3] - 2026-07-07
 

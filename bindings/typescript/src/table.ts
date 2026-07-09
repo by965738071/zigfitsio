@@ -398,13 +398,23 @@ function colRowCount(col: Column): number {
   const fmt = col.format.trim().toUpperCase();
   if (fmt.includes("P") || fmt.includes("Q")) return arr.length; // VLA: one cell per row
   if (fmt.includes("A")) return arr.length; // string rows
-  if (Array.isArray(arr)) return arr.length; // rows-of-arrays or flat plain scalars
+  // One entry per row only for rows-of-arrays / boolean rows (mirroring
+  // writeColumn's dispatch); a flat plain numeric array must fall through to
+  // the per-row division like a TypedArray.
+  if (Array.isArray(arr) && (arr.length === 0 || Array.isArray(arr[0]) || isTypedArray(arr[0]) || typeof arr[0] === "boolean")) {
+    return arr.length;
+  }
   // A binary repeat is the LEADING digits ("3J"); ASCII formats are
   // letter-first ("I6", "F12.4") with width digits and always one per row.
   const m = fmt.match(/^(\d+)/);
   const repeat = m ? Math.max(parseInt(m[1], 10), 1) : 1;
   const perRow = dt.binElemDtype(firstLetter(fmt)).isComplex ? repeat * 2 : repeat;
-  return Math.floor(arr.length / Math.max(perRow, 1));
+  if (arr.length % perRow !== 0) {
+    throw new RangeError(
+      `column ${col.name}: array length ${arr.length} is not a multiple of the ${perRow} elements per '${col.format}' row`,
+    );
+  }
+  return arr.length / perRow;
 }
 
 /** Total heap bytes to reserve (PCOUNT) for the VLA columns of a to-be-written table. */
