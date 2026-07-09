@@ -965,3 +965,77 @@ test "ZfOpenOpts.max_naxis_product rejects an oversized image before allocation"
     const small_axes = [_]c_long{ 3, 3 };
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 16, 2, &small_axes));
 }
+
+test "zf_img_param rejects hostile Z* geometry keywords with an error, never a trap" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null)); // primary
+
+    // A binary table posing as a tile-compressed image: ZIMAGE = T with hostile Z* geometry.
+    const ttype = [_]?[*:0]const u8{"COMPRESSED_DATA"};
+    const tform = [_]?[*:0]const u8{"1J"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(hh, 0, 1, 1, &ttype, &tform, null, "COMP"));
+    const zim = "ZIMAGE";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_log(hh, zim, zim.len, 1, null, 0));
+
+    var bitpix: c_int = 0;
+    var naxis: c_int = 0;
+    var got: [9]c_long = undefined;
+    var filled: c_int = 0;
+
+    // ZBITPIX far outside i32: the c_int out-param cannot hold it — error, not a trap
+    // (nor ReleaseFast truncation).
+    const zbp = "ZBITPIX";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 1 << 40, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 211), capi.zf_last_status()); // BAD_BITPIX
+
+    // In-range but illegal BITPIX value.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 7, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 211), capi.zf_last_status()); // BAD_BITPIX
+
+    // Legal ZBITPIX from here on; hostile axes next.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 16, null, 0));
+    const zn = "ZNAXIS";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 1, null, 0));
+
+    // Negative ZNAXISn: error on every platform (mirrors the decompression path's BadTiling).
+    const zn1 = "ZNAXIS1";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn1, zn1.len, -5, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+
+    // ZNAXIS present but out of range: error like the decompression path, not a silent
+    // zero-axis report.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, -1, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 5000, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+
+    // ZNAXIS = 0 stays legal (zero-dimensional): success with zero axes reported.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 0, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled));
+    try testing.expectEqual(@as(c_int, 0), naxis);
+    try testing.expectEqual(@as(c_int, 0), filled);
+
+    // Restore a valid ZNAXIS for the wide-axis case below.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 1, null, 0));
+
+    // ZNAXISn above 2^31: reported faithfully where c_long is 64-bit, an error where it is
+    // 32-bit (Windows LLP64, wasm32) — the ABI cannot represent the value there.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn1, zn1.len, 1 << 40, null, 0));
+    if (@sizeOf(c_long) == 8) {
+        try testing.expectEqual(@as(c_int, 0), capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled));
+        try testing.expectEqual(@as(c_int, 16), bitpix);
+        try testing.expectEqual(@as(c_int, 1), naxis);
+        try testing.expectEqual(@as(c_long, 1 << 40), got[0]);
+    } else {
+        try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+        try testing.expectEqual(@as(c_int, 213), capi.zf_last_status()); // BAD_NAXES
+    }
+}

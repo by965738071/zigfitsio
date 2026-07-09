@@ -1268,3 +1268,52 @@ def test_non_hdu_at_primary_slot_raises_typeerror(tmp_fits):
     with pytest.raises(TypeError):
         h.close()
     assert _file_bytes(p) == before
+
+
+# ── BUGHUNT-2026-07-06 #47: hostile Z* geometry must raise, never abort the process ──────────
+def _zimage_bytes(**zkeys):
+    """A binary table posing as a tile-compressed image (ZIMAGE=T) with the given Z* integers."""
+    def build(handle):
+        ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+        ttype = (c.c_char_p * 1)(b"COMPRESSED_DATA")
+        tform = (c.c_char_p * 1)(b"1J")
+        ll.check(ll.lib.zf_create_tbl(handle, ll.BINARY_TBL, 1, 1, ttype, tform, None, None))
+        kw = b"ZIMAGE"
+        ll.check(ll.lib.zf_write_key_log(handle, kw, len(kw), 1, None, 0))
+        for name, val in zkeys.items():
+            kw = name.encode()
+            ll.check(ll.lib.zf_write_key_lng(handle, kw, len(kw), val, None, 0))
+    return _bytes_from(build)
+
+
+def test_hostile_zbitpix_raises_instead_of_aborting():
+    # #47: ZBITPIX outside i32 hit an unchecked @intCast in zf_img_param — a panic (abort) in
+    # safety-checked builds, silent truncation in ReleaseFast wheels. Must raise instead.
+    hl = zf.from_bytes(_zimage_bytes(ZBITPIX=1 << 40))
+    hdu = hl[1]
+    assert isinstance(hdu, zf.CompImageHDU)
+    with pytest.raises(zf.FitsError):
+        _ = hdu.shape
+
+
+def test_illegal_zbitpix_raises():
+    # #47 follow-up: an in-range but illegal BITPIX code must also error, not be reported as-is.
+    hl = zf.from_bytes(_zimage_bytes(ZBITPIX=7))
+    with pytest.raises(zf.FitsError):
+        _ = hl[1].shape
+
+
+def test_negative_znaxisn_raises():
+    # #47 follow-up: a negative ZNAXISn errors on every platform (mirrors the decompression
+    # path's BadTiling) instead of flowing into the geometry out-params.
+    hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=1, ZNAXIS1=-5))
+    with pytest.raises(ll.FitsCompressError):
+        _ = hl[1].shape
+
+
+def test_out_of_range_znaxis_raises():
+    # #47 review round: ZNAXIS present but out of range used to be treated like missing — a
+    # silent zero-axis report (shape None) for a file the decompression path rejects outright.
+    hl = zf.from_bytes(_zimage_bytes(ZBITPIX=16, ZNAXIS=5000))
+    with pytest.raises(ll.FitsCompressError):
+        _ = hl[1].shape

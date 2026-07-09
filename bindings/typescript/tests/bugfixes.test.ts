@@ -1712,3 +1712,47 @@ describe("flat plain arrays on vector columns count rows by repeat (BUGHUNT 61)"
     }
   });
 });
+
+// ── BUGHUNT-2026-07-06 #47: hostile Z* geometry must throw, never trap the wasm module ───────
+describe("zf_img_param hostile Z* geometry (finding 47)", () => {
+  /** A binary table posing as a tile-compressed image (ZIMAGE=T) with the given Z* integers. */
+  function zimageBytes(zkeys: Record<string, bigint>): Uint8Array {
+    return bytesFrom((handle) => {
+      ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+      ll.check(ll.lib.zf_create_tbl(handle, ll.BINARY_TBL, 1n, 1, ["COMPRESSED_DATA"], ["1J"], null, null));
+      const zi = enc("ZIMAGE");
+      ll.check(ll.lib.zf_write_key_log(handle, zi, zi.length, 1, null, 0));
+      for (const [name, val] of Object.entries(zkeys)) {
+        const kb = enc(name);
+        ll.check(ll.lib.zf_write_key_lng(handle, kb, kb.length, val, null, 0));
+      }
+    });
+  }
+
+  test("ZBITPIX outside i32 throws instead of trapping", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 1n << 40n }));
+    const hdu = hl.get(1);
+    expect(hdu).toBeInstanceOf(zf.CompImageHDU);
+    expect(() => (hdu as zf.CompImageHDU).shape).toThrow(zf.FitsError);
+  });
+
+  test("in-range but illegal ZBITPIX throws", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 7n }));
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsError);
+  });
+
+  test("negative ZNAXISn throws", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 16n, ZNAXIS: 1n, ZNAXIS1: -5n }));
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsCompressError);
+  });
+
+  test("out-of-range ZNAXIS throws instead of silently reporting zero axes", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 16n, ZNAXIS: 5000n }));
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsCompressError);
+  });
+
+  test("ZNAXISn above the wasm32 c_long range throws (the i32 ABI cannot represent it)", () => {
+    const hl = zf.fromBytes(zimageBytes({ ZBITPIX: 16n, ZNAXIS: 1n, ZNAXIS1: 1n << 33n }));
+    expect(() => (hl.get(1) as zf.CompImageHDU).shape).toThrow(zf.FitsError);
+  });
+});

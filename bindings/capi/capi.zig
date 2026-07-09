@@ -300,23 +300,33 @@ pub export fn zf_img_param(h_opt: ?*Handle, bitpix_out: *c_int, naxis_out: *c_in
     const cap: usize = if (axes_cap > 0) @intCast(axes_cap) else 0;
     const compressed = hdu.kind == .binary_table and (hdu.header.getValue(bool, "ZIMAGE") catch false);
     if (compressed) {
-        bitpix_out.* = @intCast(hdu.header.getValue(i64, "ZBITPIX") catch hdu.bitpix);
-        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0;
-        const nax: usize = if (zn > 0 and zn <= 999) @intCast(zn) else 0;
+        // Z* values come straight from an untrusted header (only the real decompression open
+        // validates them), so narrow with checked casts — an error status, never a trap.
+        const zbp = hdu.header.getValue(i64, "ZBITPIX") catch hdu.bitpix;
+        bitpix_out.* = switch (zbp) {
+            8, 16, 32, 64, -32, -64 => @intCast(zbp),
+            else => return abi.fail(&h.diag, error.BadBitpix),
+        };
+        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0; // missing → zero axes, like ZBITPIX's fallback
+        if (zn < 0 or zn > 999) return abi.fail(&h.diag, error.BadTiling);
+        const nax: usize = @intCast(zn);
         naxis_out.* = @intCast(nax);
         const n = @min(nax, cap);
         var name_buf: [16]u8 = undefined;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const kw = std.fmt.bufPrint(&name_buf, "ZNAXIS{d}", .{i + 1}) catch unreachable;
-            axes[i] = @intCast(hdu.header.getValue(i64, kw) catch 0);
+            const v = hdu.header.getValue(i64, kw) catch 0;
+            if (v < 0) return abi.fail(&h.diag, error.BadTiling);
+            axes[i] = std.math.cast(c_long, v) orelse return abi.fail(&h.diag, error.BadDimensions);
         }
         filled.* = @intCast(n);
     } else {
         bitpix_out.* = @intCast(hdu.bitpix);
         naxis_out.* = @intCast(hdu.naxis);
         const n = @min(@as(usize, hdu.naxis), cap);
-        for (0..n) |i| axes[i] = @intCast(hdu.axes[i]);
+        // A parse-valid axis can still exceed a 32-bit `c_long` (LLP64 Windows, wasm32).
+        for (0..n) |i| axes[i] = std.math.cast(c_long, hdu.axes[i]) orelse return abi.fail(&h.diag, error.BadDimensions);
         filled.* = @intCast(n);
     }
     return 0;
