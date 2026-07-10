@@ -6,7 +6,12 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **Python & TypeScript**: duplicate effective table-column names now fail loud with
+  `FitsTableError` (status 219) at every name-keyed high-level boundary instead of allowing
+  update-mode write-back to overwrite the wrong physical column or reconstruction to duplicate /
+  collapse data. Metadata access, low-level positional reads, and pristine byte copies remain
+  available; high-level table builders reject ambiguous names up front.
 
 ## [0.1.4] - 2026-07-09
 

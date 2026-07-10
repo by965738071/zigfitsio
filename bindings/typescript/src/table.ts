@@ -91,12 +91,23 @@ export type RowCell<V> = V extends string[]
  */
 export type Row<T extends ColumnShape = ColumnShape> = { [K in keyof T]: RowCell<T[K]> };
 
+/** Reject names that collapse onto the same high-level lookup key. */
+function assertUniqueColumnNames(names: readonly string[]): void {
+  const seen = new Set<string>();
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i].trim() || `col${i + 1}`;
+    if (seen.has(name)) throw new FitsTableError(219, `column name is ambiguous: ${name}`);
+    seen.add(name);
+  }
+}
+
 export class TableData<T extends ColumnShape = ColumnShape> implements Iterable<Row<T>> {
   readonly names: readonly string[];
   readonly columns: ReadonlyMap<string, ColumnData>;
   readonly nrows: number;
 
   constructor(names: readonly string[], columns: ReadonlyMap<string, ColumnData>, nrows: number) {
+    assertUniqueColumnNames(names);
     this.names = names;
     this.columns = columns;
     this.nrows = nrows;
@@ -598,17 +609,16 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       const nrowsOut = ll.outI64();
       ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
       const nrows = Number(nrowsOut[0]);
-      // Resolve each column to its slot in the FILE, not its position in this
-      // (possibly reordered) TableData — writing by iteration index would put a
-      // changed column's values into the wrong on-disk column. First card wins,
-      // matching TableData.column()/get().
+      // Resolve each column to its unique slot in the FILE, not its position in
+      // this (possibly reordered) TableData. Duplicate effective names are
+      // rejected before any write because a name cannot identify either slot.
       const ncolsOut = ll.outI32();
       ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
+      const fileNames: string[] = [];
+      for (let j = 0; j < ncolsOut[0]; j++) fileNames.push(colName(t, j) || `col${j + 1}`);
+      assertUniqueColumnNames(fileNames);
       const fileIndex = new Map<string, number>();
-      for (let j = 0; j < ncolsOut[0]; j++) {
-        const nm = colName(t, j) || `col${j + 1}`;
-        if (!fileIndex.has(nm)) fileIndex.set(nm, j);
-      }
+      for (let j = 0; j < fileNames.length; j++) fileIndex.set(fileNames[j], j);
       for (let i = 0; i < rec.names.length; i++) {
         const name = rec.names[i];
         const newFp = colFp(rec.column(name));
@@ -674,13 +684,15 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       const ncols = ncolsOut[0];
 
       const names: string[] = [];
-      const columns = new Map<string, ColumnData>();
+      const infos: ll.ColInfo[] = [];
       for (let col = 0; col < ncols; col++) {
-        const info = readColInfo(t, col);
         const name = colName(t, col) || `col${col + 1}`;
         names.push(name);
-        columns.set(name, this._columnPlan(t, col, info, nrows));
+        infos.push(readColInfo(t, col));
       }
+      assertUniqueColumnNames(names);
+      const columns = new Map<string, ColumnData>();
+      for (let col = 0; col < ncols; col++) columns.set(names[col], this._columnPlan(t, col, infos[col], nrows));
       const data = new TableData(names, columns, Math.max(nrows, 0));
       // Baselines for write-back AND the writeTo pristine gate (all modes).
       this._colFingerprints = new Map(names.map((n) => [n, colFp(data.column(n))]));
@@ -799,6 +811,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
    */
   _emitColumns(): { cols: Column[]; nrows: number; srcIndex: (number | null)[] | null } {
     if (this._columns.length > 0) {
+      assertUniqueColumnNames(this._columns.map((col) => col.name));
       return { cols: [...this._columns], nrows: this._nrows, srcIndex: null };
     }
     const data = this.data;
@@ -822,16 +835,14 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     return withTable(h, (t) => {
       const ncolsOut = ll.outI32();
       ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
-      // Map file columns by NAME so a reassigned TableData keeps each column's
-      // true format even when reordered/filtered; a positional pairing would
-      // hand a column the wrong TFORM and silently truncate it. First card
-      // wins, and the `col${j+1}` fallback matches _readTable's name for a
-      // column lacking TTYPE.
+      // Map file columns by unique effective NAME so a reassigned TableData
+      // keeps each column's true format even when reordered/filtered. The
+      // `col${j+1}` fallback matches _readTable for a column lacking TTYPE.
+      const fileNames: string[] = [];
+      for (let j = 0; j < ncolsOut[0]; j++) fileNames.push(colName(t, j) || `col${j + 1}`);
+      assertUniqueColumnNames(fileNames);
       const fileInfo = new Map<string, { info: ll.ColInfo; index: number }>();
-      for (let j = 0; j < ncolsOut[0]; j++) {
-        const nm = colName(t, j) || `col${j + 1}`;
-        if (!fileInfo.has(nm)) fileInfo.set(nm, { info: readColInfo(t, j), index: j });
-      }
+      for (let j = 0; j < fileNames.length; j++) fileInfo.set(fileNames[j], { info: readColInfo(t, j), index: j });
       const cols: Column[] = [];
       const srcIndex: (number | null)[] = [];
       for (const name of data.names) {
@@ -922,6 +933,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
   }
 
   static fromColumnsInto<H extends TableHDU<ColumnShape>>(hdu: H, columns: readonly Column[], options: FromColumnsOptions = {}): H {
+    assertUniqueColumnNames(columns.map((col) => col.name));
     hdu._columns = [...columns];
     hdu._name = options.name ?? hdu._name;
     const present = columns.filter((c) => c.array !== null).map((c) => colRowCount(c));

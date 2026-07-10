@@ -163,6 +163,11 @@ apply to both language bindings unless noted; TypeScript-specific ones are liste
   then-illegal `BLANK` card from the float output). Table `TNULLn` values remain readable (and
   exposed via `zf_table_col_info`), but the high-level API does not yet return `numpy.ma` masked
   arrays for integer columns — that masking is a follow-up.
+- **Duplicate table column names require positional access.** The high-level table data models are
+  keyed by effective name (trimmed `TTYPE`, or `colN` when unnamed), so materializing a table with
+  duplicate effective names raises `FitsTableError` (status 219) rather than hiding or mis-writing
+  a physical column. Metadata inspection and pristine byte-for-byte copies remain available; use
+  the low-level indexed column API when duplicate names must be addressed.
 - **VLA writing.** The high-level `from_columns`/`writeto` path writes variable-length-array
   columns, reserving the heap (`PCOUNT`) up front via `zf_create_tbl_heap`; reading VLAs is
   complete. The lower-level `zf_write_col_vla` still assumes the heap is reserved (create the table
@@ -230,7 +235,7 @@ unchanged and always sufficient. Honest boundaries of that sugar:
   first, so a section never lags `.data`; in read-only mode it reads the file **as opened**, so
   unflushed in-memory edits are not visible. Windows are 0-based, half-open `[start, stop)` in
   C-order; negative, out-of-bounds, or empty windows throw `RangeError`.
-- **In-place table write-back matches columns by name and cannot add columns.** Setting a
+- **In-place table write-back matches unique columns by name and cannot add columns.** Setting a
   reordered `TableData` in update mode writes each changed column to its true on-disk slot; a
   `TableData` carrying a column name absent from the file fails loud (`NotSupportedError`) rather
   than silently mis-writing (an index-based match would corrupt a reordered table). Row-count,

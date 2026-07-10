@@ -55,6 +55,46 @@ function scaledColBytes(tform: string, raw: zf.TypedArray, zfCode: number, tscal
   });
 }
 
+/** A two-column table whose distinct physical columns share the effective name X. */
+function duplicateNameTableBytes(tableType: number): Uint8Array {
+  return bytesFrom((handle) => {
+    ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+    const formats = tableType === ll.ASCII_TBL ? ["I6", "I6"] : ["1J", "1J"];
+    ll.check(ll.lib.zf_create_tbl(handle, tableType, 3n, 2, ["X", "X"], formats, null, null));
+    const tout = ll.outU64();
+    ll.check(ll.lib.zf_table_open(handle, tout));
+    try {
+      ll.check(ll.lib.zf_write_col(tout[0], ll.ZF_INT32, 0, 1n, 3n, null, Int32Array.from([1, 2, 3])));
+      ll.check(ll.lib.zf_write_col(tout[0], ll.ZF_INT32, 1, 1n, 3n, null, Int32Array.from([10, 20, 30])));
+    } finally {
+      ll.lib.zf_table_close(tout[0]);
+    }
+  });
+}
+
+/** Read both columns by physical index, bypassing intentionally-ambiguous name lookup. */
+function physicalIntColumns(bytes: Uint8Array): number[][] {
+  const out = ll.outU64();
+  ll.check(ll.lib.zf_open_memory(bytes, bytes.length, ll.READONLY, null, out));
+  const handle = out[0];
+  try {
+    ll.check(ll.lib.zf_select(handle, 2));
+    const tout = ll.outU64();
+    ll.check(ll.lib.zf_table_open(handle, tout));
+    try {
+      const columns = [new Int32Array(3), new Int32Array(3)];
+      for (let i = 0; i < columns.length; i++) {
+        ll.check(ll.lib.zf_read_col(tout[0], ll.ZF_INT32, i, 1n, 3n, null, columns[i]));
+      }
+      return columns.map(asNums);
+    } finally {
+      ll.lib.zf_table_close(tout[0]);
+    }
+  } finally {
+    ll.lib.zf_close(handle);
+  }
+}
+
 const filterRows = (rec: zf.TableData, keep: number[]): zf.TableData => {
   const columns = new Map<string, zf.ColumnData>();
   for (const name of rec.names) {
@@ -470,6 +510,89 @@ describe("construction guards", () => {
       zf.FitsError,
     );
   });
+
+  test("duplicate effective column names raise, while positional unnamed fallbacks remain unique", () => {
+    const values = Int32Array.from([1, 2]);
+    expect(() =>
+      zf.BinTableHDU.fromColumns([
+        new zf.Column("X", "1J", { array: values }),
+        new zf.Column("X", "1J", { array: values }),
+      ]),
+    ).toThrow(zf.FitsTableError);
+    expect(() =>
+      zf.AsciiTableHDU.fromColumns([
+        new zf.Column("col2", "I6", { array: values }),
+        new zf.Column("", "I6", { array: values }),
+      ]),
+    ).toThrow(zf.FitsTableError);
+    expect(() =>
+      zf.BinTableHDU.fromColumns([
+        new zf.Column("", "1J", { array: values }),
+        new zf.Column("", "1J", { array: values }),
+      ]),
+    ).not.toThrow();
+    expect(() => new zf.TableData(["X", "X"], new Map(), 0)).toThrow(zf.FitsTableError);
+  });
+});
+
+describe("duplicate table column names", () => {
+  for (const [label, tableType] of [
+    ["binary", ll.BINARY_TBL],
+    ["ASCII", ll.ASCII_TBL],
+  ] as const) {
+    test(`${label}: high-level read fails loud and update close preserves both physical columns`, () => {
+      const p = tmp.path();
+      const source = duplicateNameTableBytes(tableType);
+      writeFileSync(p, source);
+      const hl = zf.open(p, "update");
+      expect((hl.get(1) as zf.TableHDU).columns).toEqual(["X", "X"]);
+      expect(() => hl.get(1).data).toThrow(zf.FitsTableError);
+      hl.close();
+      expect(physicalIntColumns(readFileSync(p))).toEqual([[1, 2, 3], [10, 20, 30]]);
+    });
+
+    test(`${label}: assigned data cannot bypass the duplicate-name update guard`, () => {
+      const p = tmp.path();
+      writeFileSync(p, duplicateNameTableBytes(tableType));
+      const hl = zf.open(p, "update");
+      const columns = new Map<string, zf.ColumnData>([
+        ["X", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([99, 98, 97]) }],
+      ]);
+      (hl.get(1) as zf.TableHDU).data = new zf.TableData(["X"], columns, 3);
+      expect(() => hl.close()).toThrow(zf.FitsTableError);
+      expect(physicalIntColumns(readFileSync(p))).toEqual([[1, 2, 3], [10, 20, 30]]);
+    });
+
+    test(`${label}: pristine copies stay byte-exact, but reconstruction fails loud`, () => {
+      const source = duplicateNameTableBytes(tableType);
+      const pristine = zf.fromBytes(source);
+      try {
+        expect(pristine.toBytes()).toEqual(source);
+      } finally {
+        pristine.close();
+      }
+
+      const dirty = zf.fromBytes(source);
+      try {
+        dirty.get(1).header.set("OBSERVER", "duplicate-name test");
+        expect(() => dirty.toBytes()).toThrow(zf.FitsTableError);
+      } finally {
+        dirty.close();
+      }
+
+      const assigned = zf.fromBytes(source);
+      try {
+        const columns = new Map<string, zf.ColumnData>([
+          ["X", { kind: "numeric", dtype: "i4", repeat: 1, values: Int32Array.from([99, 98, 97]) }],
+        ]);
+        (assigned.get(1) as zf.TableHDU).data = new zf.TableData(["X"], columns, 3);
+        expect(() => assigned.toBytes()).toThrow(zf.FitsTableError);
+      } finally {
+        assigned.close();
+      }
+      expect(physicalIntColumns(source)).toEqual([[1, 2, 3], [10, 20, 30]]);
+    });
+  }
 });
 
 describe("update-mode write-back and lifecycle", () => {

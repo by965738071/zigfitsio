@@ -398,6 +398,16 @@ def _validated_table_data(value):
     return arr
 
 
+def _assert_unique_column_names(names):
+    """Reject names that collapse onto the same high-level lookup key."""
+    seen = set()
+    for i, raw in enumerate(names):
+        name = raw.strip() or f"col{i + 1}"
+        if name in seen:
+            raise ll.FitsTableError(219, f"column name is ambiguous: {name}")
+        seen.add(name)
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # HDU classes
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -916,7 +926,8 @@ class _TableHDU(_HDU):
         if self._col_fingerprints is None:
             return
         rec = self._data
-        if rec.dtype.names is None:  # unreachable post-validation; defense in depth
+        rec_names = rec.dtype.names
+        if rec_names is None:  # unreachable post-validation; defense in depth
             raise ll.FitsTypeError(410, "table data must be a structured/record array")
         h = self._select()
         t = _VOID()
@@ -930,16 +941,17 @@ class _TableHDU(_HDU):
             # `or f"col{j+1}"` matches _read_table's synthetic name for a column lacking TTYPE, so a
             # legal unnamed-column table doesn't trip the column-set guard on a clean no-op close.
             file_cols = [self._col_name(t, j) or f"col{j + 1}" for j in range(ncols_.value)]
+            _assert_unique_column_names(file_cols)
             col_index = {nm: j for j, nm in enumerate(file_cols)}
             # Address file columns by NAME, not by the recarray's positional order (a reassigned
             # recarray may reorder its columns). A changed column set — renamed/added/dropped — can't
             # be applied in place without rewriting the file, so fail loud (leaving the file intact)
             # and steer to writeto(), mirroring the row-count guard below.
-            if set(rec.dtype.names) != set(file_cols):
+            if len(rec_names) != len(file_cols) or set(rec_names) != set(file_cols):
                 raise NotImplementedError(
                     "in-place table update cannot change the column set; use writeto() to a new file"
                 )
-            for name in rec.dtype.names:
+            for name in rec_names:
                 new_fp = _col_fp(rec[name])
                 if new_fp == self._col_fingerprints.get(name):
                     continue  # column unchanged
@@ -1011,6 +1023,7 @@ class _TableHDU(_HDU):
                 fields.append((name, field_dtype))
                 readers.append(reader)
 
+            _assert_unique_column_names([name for name, _ in fields])
             rec = np.empty(max(nrows, 0), dtype=np.dtype(fields))
             for (name, _), reader in zip(fields, readers):
                 rec[name] = reader()
@@ -1132,11 +1145,14 @@ class _TableHDU(_HDU):
         from an assigned record array for a detached HDU, or columns reconstructed from the live
         table for an attached one (so a copied table keeps its rows)."""
         if self._columns:
+            _assert_unique_column_names([col.name for col in self._columns])
             return list(self._columns), self._nrows
         data = self.data
         if data is None:
             return [], 0
-        if data.dtype.names is None:  # unreachable post-validation; defense in depth
+        data_names = data.dtype.names
+        data_fields = data.dtype.fields
+        if data_names is None or data_fields is None:  # unreachable post-validation; defense in depth
             raise ll.FitsTypeError(410, "table data must be a structured/record array")
         nrows = len(data)
         if self._hdulist is None:
@@ -1148,8 +1164,8 @@ class _TableHDU(_HDU):
                     "build the table with AsciiTableHDU.from_columns(...)"
                 )
             cols = [
-                Column(n, _binary_tform_for(None, data.dtype.fields[n][0]), array=data[n])
-                for n in data.dtype.names
+                Column(n, _binary_tform_for(None, data_fields[n][0]), array=data[n])
+                for n in data_names
             ]
             return cols, nrows
         h = self._select()
@@ -1158,19 +1174,21 @@ class _TableHDU(_HDU):
         try:
             ncols_ = c.c_int()
             ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
-            # Map file columns by NAME so a reassigned recarray keeps each field's true format even
-            # when reordered; a positional pairing would hand a field the wrong column's TFORM and
-            # silently truncate it. A new/retyped field synthesizes its format from the numpy dtype
-            # (see _binary_tform_for / _tform_from_dtype).
+            # Map file columns by unique effective NAME so a reassigned recarray keeps each field's
+            # true format even when reordered; a positional pairing would hand a field the wrong
+            # column's TFORM and silently truncate it. A new/retyped field synthesizes its format
+            # from the numpy dtype (see _binary_tform_for / _tform_from_dtype).
+            file_names = [self._col_name(t, j) or f"col{j + 1}" for j in range(ncols_.value)]
+            _assert_unique_column_names(file_names)
             file_info = {}
             for j in range(ncols_.value):
                 info = ll.ZfColInfo()
                 ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
                 # `or f"col{j+1}"` matches _read_table's name for a column lacking TTYPE, so an
                 # unnamed column reuses its file format instead of collapsing under the "" key.
-                file_info[self._col_name(t, j) or f"col{j + 1}"] = info
+                file_info[file_names[j]] = info
             cols = []
-            for name in data.dtype.names:
+            for name in data_names:
                 info = file_info.get(name)
                 if self._table_type == ll.ASCII_TBL:
                     if info is None:
@@ -1180,7 +1198,7 @@ class _TableHDU(_HDU):
                         )
                     fmt = _ascii_tform_of(info)
                 else:
-                    fmt = _binary_tform_for(info, data.dtype.fields[name][0])
+                    fmt = _binary_tform_for(info, data_fields[name][0])
                 cols.append(Column(name, fmt, array=data[name]))
             return cols, nrows
         finally:
@@ -1261,8 +1279,10 @@ class _TableHDU(_HDU):
 
     @classmethod
     def from_columns(cls, columns: Sequence[Column], nrows: int | None = None, name: str | None = None):
+        columns = list(columns)
+        _assert_unique_column_names([col.name for col in columns])
         hdu = cls(name=name)
-        hdu._columns = list(columns)
+        hdu._columns = columns
         present = [len(col.array) for col in columns if col.array is not None]
         if present and len(set(present)) > 1:
             raise ValueError(f"columns have differing lengths {sorted(set(present))}; all must match")

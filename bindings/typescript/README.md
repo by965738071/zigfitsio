@@ -174,6 +174,9 @@ ll.lib.zf_close(out[0]);
   module is single-threaded and its heap never shrinks while loaded.
 - In-place update of compressed images, VLA or scaled columns, or a changed row count throws
   `NotSupportedError` — use `writeTo()` to a new file.
+- Tables with duplicate effective column names can be inspected as metadata or copied verbatim,
+  but high-level data access/reconstruction throws `FitsTableError` (status 219); use low-level
+  indexed column reads when duplicates must be addressed.
 - Integer `BLANK`/`TNULLn` values are not auto-masked; float nulls surface as NaN.
 - `table<T>()` column shapes are compile-time only — the runtime-checked reads are
   `numeric()`/`strings()`/`vla()`/`complex()` (throw on kind mismatch).

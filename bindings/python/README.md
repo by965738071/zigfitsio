@@ -112,6 +112,9 @@ ll.lib.zf_close(h)
 - Integer `BLANK`/`TNULLn` values are not auto-masked (no `numpy.ma`); float nulls surface as NaN.
 - In-place update of compressed images, VLA or scaled columns, or a changed row count raises —
   use `writeto()` to a new file instead.
+- Tables with duplicate effective column names can be inspected as metadata or copied verbatim,
+  but high-level data access/reconstruction raises `FitsTableError` (status 219); use low-level
+  indexed column reads when duplicates must be addressed.
 - `writeto()` of a *scanned* quantized-float compressed image re-quantizes at the default level
   (the FITS header does not record the level).
 

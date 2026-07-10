@@ -50,6 +50,50 @@ def _scaled_col_bytes(tform, raw, zf_code, tscal, tzero):
     return _bytes_from(build)
 
 
+def _duplicate_name_table_bytes(table_type):
+    """A two-column table whose distinct physical columns share the effective name X."""
+    def build(handle):
+        ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
+        ttype = (c.c_char_p * 2)(b"X", b"X")
+        formats = (b"I6", b"I6") if table_type == ll.ASCII_TBL else (b"1J", b"1J")
+        tform = (c.c_char_p * 2)(*formats)
+        tunit = (c.c_char_p * 2)(None, None)
+        ll.check(ll.lib.zf_create_tbl(handle, table_type, 3, 2, ttype, tform, tunit, None))
+        table = c.c_void_p()
+        ll.check(ll.lib.zf_table_open(handle, c.byref(table)))
+        try:
+            for col, values in enumerate(([1, 2, 3], [10, 20, 30])):
+                array = np.array(values, dtype="i4")
+                ll.check(ll.lib.zf_write_col(
+                    table, ll.ZF_INT32, col, 1, array.size, None, array.ctypes.data_as(c.c_void_p)
+                ))
+        finally:
+            ll.lib.zf_table_close(table)
+    return _bytes_from(build)
+
+
+def _physical_int_columns(raw):
+    """Read both columns by physical index, bypassing ambiguous name lookup."""
+    source = c.create_string_buffer(raw)
+    handle = c.c_void_p()
+    ll.check(ll.lib.zf_open_memory(source, len(raw), ll.READONLY, None, c.byref(handle)))
+    try:
+        ll.check(ll.lib.zf_select(handle, 2))
+        table = c.c_void_p()
+        ll.check(ll.lib.zf_table_open(handle, c.byref(table)))
+        try:
+            columns = [np.empty(3, dtype="i4"), np.empty(3, dtype="i4")]
+            for col, array in enumerate(columns):
+                ll.check(ll.lib.zf_read_col(
+                    table, ll.ZF_INT32, col, 1, array.size, None, array.ctypes.data_as(c.c_void_p)
+                ))
+            return [array.tolist() for array in columns]
+        finally:
+            ll.lib.zf_table_close(table)
+    finally:
+        ll.lib.zf_close(handle)
+
+
 # ── #1 critical: open -> writeto / to_bytes must not drop data ────────────────────────────────
 def test_copy_image_preserves_data(tmp_fits):
     orig = np.arange(6, dtype="i2").reshape(2, 3)
@@ -437,6 +481,80 @@ def test_non_ascii_column_raises():
     col = zf.Column("S", "8A", array=np.array(["café", "ok"]))
     with pytest.raises((UnicodeEncodeError, zf.FitsError)):
         zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([col])]).to_bytes()
+
+
+def test_duplicate_effective_column_names_raise_while_unnamed_fallbacks_remain_unique():
+    values = np.array([1, 2], dtype="i4")
+    with pytest.raises(zf.FitsTableError):
+        zf.BinTableHDU.from_columns([
+            zf.Column("X", "1J", array=values),
+            zf.Column("X", "1J", array=values),
+        ])
+    with pytest.raises(zf.FitsTableError):
+        zf.AsciiTableHDU.from_columns([
+            zf.Column("col2", "I6", array=values),
+            zf.Column("", "I6", array=values),
+        ])
+    zf.BinTableHDU.from_columns([
+        zf.Column("", "1J", array=values),
+        zf.Column("", "1J", array=values),
+    ])
+
+
+@pytest.mark.parametrize("table_type", [ll.BINARY_TBL, ll.ASCII_TBL], ids=["binary", "ascii"])
+def test_duplicate_name_read_fails_loud_and_update_close_preserves_physical_columns(tmp_fits, table_type):
+    p = tmp_fits(f"duplicate-{table_type}.fits")
+    source = _duplicate_name_table_bytes(table_type)
+    with open(p, "wb") as f:
+        f.write(source)
+
+    with zf.open(p, mode="update") as h:
+        assert h[1].columns == ["X", "X"]
+        with pytest.raises(zf.FitsTableError) as exc:
+            _ = h[1].data
+        assert exc.value.status == 219
+
+    with open(p, "rb") as f:
+        assert _physical_int_columns(f.read()) == [[1, 2, 3], [10, 20, 30]]
+
+
+@pytest.mark.parametrize("table_type", [ll.BINARY_TBL, ll.ASCII_TBL], ids=["binary", "ascii"])
+def test_assigned_data_cannot_bypass_duplicate_name_update_guard(tmp_fits, table_type):
+    p = tmp_fits(f"duplicate-assigned-{table_type}.fits")
+    with open(p, "wb") as f:
+        f.write(_duplicate_name_table_bytes(table_type))
+
+    h = zf.open(p, mode="update")
+    h[1].data = np.array([(99,), (98,), (97,)], dtype=[("X", "i4")])
+    with pytest.raises(zf.FitsTableError):
+        h.close()
+
+    with open(p, "rb") as f:
+        assert _physical_int_columns(f.read()) == [[1, 2, 3], [10, 20, 30]]
+
+
+@pytest.mark.parametrize("table_type", [ll.BINARY_TBL, ll.ASCII_TBL], ids=["binary", "ascii"])
+def test_duplicate_name_pristine_copy_is_exact_but_reconstruction_fails_loud(table_type):
+    source = _duplicate_name_table_bytes(table_type)
+    with zf.from_bytes(source) as pristine:
+        assert pristine.to_bytes() == source
+
+    dirty = zf.from_bytes(source)
+    try:
+        dirty[1].header["OBSERVER"] = "duplicate-name test"
+        with pytest.raises(zf.FitsTableError):
+            dirty.to_bytes()
+    finally:
+        dirty.close()
+
+    assigned = zf.from_bytes(source)
+    try:
+        assigned[1].data = np.array([(99,), (98,), (97,)], dtype=[("X", "i4")])
+        with pytest.raises(zf.FitsTableError):
+            assigned.to_bytes()
+    finally:
+        assigned.close()
+    assert _physical_int_columns(source) == [[1, 2, 3], [10, 20, 30]]
 
 
 # ── #15 update-mode data write-back ───────────────────────────────────────────────────────────
