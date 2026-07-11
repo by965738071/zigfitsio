@@ -1,9 +1,13 @@
 """Cross-check that zigfitsio and astropy agree (both directions)."""
 
+import ctypes as c
+import os
+
 import numpy as np
 import pytest
 
 import zigfitsio as zf
+from zigfitsio import lowlevel as ll
 
 afits = pytest.importorskip("astropy.io.fits")
 
@@ -53,6 +57,109 @@ def test_zigfitsio_reads_astropy_table(tmp_fits):
         rec = hdul[1].data
         assert list(rec["ID"]) == [1, 2, 3]
         np.testing.assert_allclose(rec["VAL"], [0.1, 0.2, 0.3])
+
+
+def _object_cells(*cells):
+    out = np.empty(len(cells), dtype=object)
+    out[:] = cells
+    return out
+
+
+def test_astropy_reads_zigfitsio_packed_vla_columns(tmp_fits):
+    p_cells = _object_cells(
+        np.array([1, 2, 3], dtype="i4"),
+        np.array([], dtype="i4"),
+        np.array([4], dtype="i4"),
+    )
+    q_cells = _object_cells(
+        np.array([], dtype="i8"),
+        np.array([2**40], dtype="i8"),
+        np.array([-5, 6], dtype="i8"),
+    )
+    path = tmp_fits("zigfitsio_vla.fits")
+    zf.HDUList([
+        zf.PrimaryHDU(),
+        zf.BinTableHDU.from_columns([
+            zf.Column("P", "1PJ", array=p_cells),
+            zf.Column("Q", "1QK", array=q_cells),
+        ]),
+    ]).writeto(path, overwrite=True)
+
+    with afits.open(path) as hdul:
+        assert [cell.tolist() for cell in hdul[1].data["P"]] == [[1, 2, 3], [], [4]]
+        assert [cell.tolist() for cell in hdul[1].data["Q"]] == [[], [2**40], [-5, 6]]
+
+
+def test_zigfitsio_reads_and_updates_astropy_packed_vla_columns(tmp_fits):
+    p_cells = _object_cells(
+        np.array([1, 2, 3], dtype="i4"),
+        np.array([], dtype="i4"),
+        np.array([4], dtype="i4"),
+        np.array([5, 6], dtype="i4"),
+    )
+    q_cells = _object_cells(
+        np.array([10], dtype="i4"),
+        np.array([20, 30], dtype="i4"),
+        np.array([], dtype="i4"),
+        np.array([40], dtype="i4"),
+    )
+    c_cells = _object_cells(
+        np.array([1 + 2j, 3 - 4j], dtype="c8"),
+        np.array([], dtype="c8"),
+        np.array([5 + 6j], dtype="c8"),
+        np.array([-7 + 8j], dtype="c8"),
+    )
+    path = tmp_fits("astropy_vla.fits")
+    afits.HDUList([
+        afits.PrimaryHDU(),
+        afits.BinTableHDU.from_columns([
+            afits.Column(name="P", format="PJ()", array=p_cells),
+            afits.Column(name="Q", format="QJ()", array=q_cells),
+            afits.Column(name="C", format="PC()", array=c_cells),
+        ]),
+    ]).writeto(path)
+
+    with zf.open(path) as hdul:
+        table = hdul[1].data
+        assert [cell.tolist() for cell in table["P"]] == [[1, 2, 3], [], [4], [5, 6]]
+        assert [cell.tolist() for cell in table["Q"]] == [[10], [20, 30], [], [40]]
+        for got, expected in zip(table["C"], c_cells):
+            np.testing.assert_array_equal(got, expected)
+        assert table["P"][0].base is table["P"][2].base
+
+    # Repartition the same six P payload values after reopening a fully populated,
+    # multi-column heap. The packed writer must free the complete target range before it
+    # reallocates: row-at-a-time freeing cannot grow row 3 from one to three values here.
+    handle = c.c_void_p()
+    table_handle = c.c_void_p()
+    raw_path = os.fsencode(path)
+    ll.check(ll.lib.zf_open_file(raw_path, len(raw_path), ll.READWRITE, None, c.byref(handle)))
+    try:
+        ll.check(ll.lib.zf_select(handle, 2))
+        ll.check(ll.lib.zf_table_open(handle, c.byref(table_handle)))
+        offsets = np.array([0, 2, 2, 5, 6], dtype=np.uint64)
+        values = np.array([9, 8, 7, 6, 5, 4], dtype=np.int32)
+        ll.check(ll.lib.zf_write_col_vla_packed(
+            table_handle,
+            ll.ZF_INT32,
+            0,
+            1,
+            4,
+            offsets.ctypes.data_as(c.POINTER(c.c_uint64)),
+            offsets.size,
+            values.ctypes.data,
+            values.size,
+        ))
+    finally:
+        if table_handle.value:
+            ll.lib.zf_table_close(table_handle)
+        ll.lib.zf_close(handle)
+
+    with afits.open(path) as hdul:
+        assert [cell.tolist() for cell in hdul[1].data["P"]] == [[9, 8], [], [7, 6, 5], [4]]
+        assert [cell.tolist() for cell in hdul[1].data["Q"]] == [[10], [20, 30], [], [40]]
+        for got, expected in zip(hdul[1].data["C"], c_cells):
+            np.testing.assert_array_equal(got, expected)
 
 
 def test_astropy_decodes_zigfitsio_rice(tmp_fits):

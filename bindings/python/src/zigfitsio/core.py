@@ -1064,25 +1064,35 @@ class _TableHDU(_HDU):
                 read_code = dt.zf_code(elem_dtype)
 
             def read_vla():
+                # Measure the whole column once, then transfer every cell into one flat buffer.
+                # Offsets count transfer scalar slots (complex cells use two float slots per
+                # logical element), so they can be used directly as numpy slice boundaries.
+                offsets = np.empty(nrows + 1, dtype=np.uint64)
+                total_ = c.c_uint64()
+                ll.check(ll.lib.zf_read_col_vla_layout(
+                    t, col, 1, nrows,
+                    offsets.ctypes.data_as(c.POINTER(c.c_uint64)), offsets.size,
+                    c.byref(total_),
+                ))
+                total = int(total_.value)
+                transfer_dtype = float_dtype if is_complex else elem_dtype
+                if total > np.iinfo(np.intp).max // max(transfer_dtype.itemsize, 1):
+                    raise ll.FitsOverflowError(412, f"VLA column requires {total} transfer slots")
+                flat = np.empty(total, dtype=transfer_dtype)
+                if total:
+                    ll.check(ll.lib.zf_read_col_vla_packed(
+                        t, read_code, col, 1, nrows, _ptr(flat), total,
+                    ))
                 out = np.empty(nrows, dtype=object)
                 for r in range(nrows):
-                    ln = c.c_longlong()
-                    off = c.c_longlong()
-                    ll.check(ll.lib.zf_read_descript(t, col, r + 1, c.byref(ln), c.byref(off)))
-                    count = int(ln.value)
-                    if count < 0:
-                        raise ll.FitsError(412, f"corrupt VLA descriptor: negative length {count}")
-                    got = c.c_longlong()
+                    start = int(offsets[r])
+                    stop = int(offsets[r + 1])
+                    cell = flat[start:stop]
                     if is_complex:
-                        cap = count * 2  # ABI returns 2 float slots per complex element
-                        cell_f = np.empty(max(cap, 1), dtype=float_dtype)
-                        if count:
-                            ll.check(ll.lib.zf_read_col_vla(t, read_code, col, r + 1, cap, _ptr(cell_f), c.byref(got)))
-                        out[r] = cell_f[: int(got.value)].view(cdtype)
+                        if cell.size % 2:
+                            raise ll.FitsError(264, "corrupt complex VLA layout has an odd scalar count")
+                        out[r] = cell.view(cdtype)
                     else:
-                        cell = np.empty(count, dtype=elem_dtype)
-                        if count:
-                            ll.check(ll.lib.zf_read_col_vla(t, read_code, col, r + 1, count, _ptr(cell), c.byref(got)))
                         out[r] = cell
                 return out
 
@@ -1273,9 +1283,30 @@ class _TableHDU(_HDU):
         if is_complex:
             raise NotImplementedError("writing complex VLA columns is not supported")
         arr = col.array
+        offsets = np.empty(nrows + 1, dtype=np.uint64)
+        offsets[0] = 0
+        total = 0
+        for r in range(nrows):
+            size = int(np.asarray(arr[r]).size)
+            if size < 0 or total > ((1 << 64) - 1) - size:
+                raise ll.FitsOverflowError(412, "VLA column element count overflows uint64")
+            total += size
+            offsets[r + 1] = total
+        if total > np.iinfo(np.intp).max // max(elem_dtype.itemsize, 1):
+            raise ll.FitsOverflowError(412, f"VLA column requires {total} transfer slots")
+        flat = np.empty(total, dtype=elem_dtype)
         for r in range(nrows):
             cell = _native(np.asarray(arr[r]).astype(elem_dtype, copy=False)).reshape(-1)
-            ll.check(ll.lib.zf_write_col_vla(t, dt.zf_code(elem_dtype), i, r + 1, _ptr(cell), int(cell.size)))
+            start = int(offsets[r])
+            stop = int(offsets[r + 1])
+            if cell.size != stop - start:
+                raise ll.FitsTableError(308, "VLA cell size changed while packing the column")
+            flat[start:stop] = cell
+        ll.check(ll.lib.zf_write_col_vla_packed(
+            t, dt.zf_code(elem_dtype), i, 1, nrows,
+            offsets.ctypes.data_as(c.POINTER(c.c_uint64)), offsets.size,
+            _ptr(flat), total,
+        ))
 
     @classmethod
     def from_columns(cls, columns: Sequence[Column], nrows: int | None = None, name: str | None = None):

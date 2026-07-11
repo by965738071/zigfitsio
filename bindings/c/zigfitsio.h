@@ -196,6 +196,20 @@ int  zf_delete_col(ZfTable* t, int col);
 int  zf_read_descript(ZfTable* t, int col, long long row, long long* out_len, long long* out_off);
 int  zf_read_col_vla(ZfTable* t, int dtype, int col, long long row, long long cap, void* array, long long* out_nelem);
 int  zf_write_col_vla(ZfTable* t, int dtype, int col, long long row, const void* array, long long nelem);
+/* Measure a row range for packed VLA transfer. `offsets` receives `nrows + 1` scalar-slot
+ * offsets, beginning at zero; `out_nslots` receives the terminal offset. Complex values use
+ * two scalar slots (real, imaginary) per logical element. Rows are 1-based and columns 0-based. */
+int  zf_read_col_vla_layout(ZfTable* t, int col, long long firstrow, long long nrows,
+                            uint64_t* offsets, size_t offsets_cap, uint64_t* out_nslots);
+/* Read a row range contiguously into `array`. `cap` is measured in transfer scalar slots and
+ * must match the layout's terminal offset. A NULL `array` is valid only when `cap == 0`. */
+int  zf_read_col_vla_packed(ZfTable* t, int dtype, int col, long long firstrow,
+                            long long nrows, void* array, uint64_t cap);
+/* Write a row range from one contiguous scalar-slot buffer. `offsets` must contain exactly
+ * `nrows + 1` monotonic entries beginning at zero and ending at `nelem`. */
+int  zf_write_col_vla_packed(ZfTable* t, int dtype, int col, long long firstrow,
+                             long long nrows, const uint64_t* offsets, size_t offsets_len,
+                             const void* array, uint64_t nelem);
 
 /* ── Data integrity ──────────────────────────────────────────────────────────────────────── */
 int  zf_write_chksum(ZfFits* h);

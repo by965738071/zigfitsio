@@ -1254,16 +1254,217 @@ fn vlaWrite(ty: ZfType, tbl: *fits.BinTable, mgr: *fits.heap.HeapManager, col: u
     };
 }
 
-/// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. Uses a heap manager
-/// created lazily for the table (assumes the heap starts empty / PCOUNT was reserved).
+/// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. The heap manager is
+/// created lazily and reconstructs its high-water mark from every live VLA descriptor in the
+/// table, so opening and rewriting an already-populated heap cannot overlap another cell.
 pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, array: *const anyopaque, nelem: c_longlong) c_int {
     const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or nelem < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    // Match the core write predicate before lazily reconstructing the heap. A read-only write is
+    // guaranteed to fail, so it must not scan or allocate based on untrusted live descriptors.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
     if (t.mgr == null) {
         t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
     }
     vlaWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(row - 1), array, @intCast(nelem)) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+fn alignedMutSlice(comptime T: type, ptr: *anyopaque, len: usize) fits.Error![]T {
+    if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.WrongValueType;
+    return @as([*]T, @ptrCast(@alignCast(ptr)))[0..len];
+}
+
+fn alignedConstSlice(comptime T: type, ptr: *const anyopaque, len: usize) fits.Error![]const T {
+    if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.WrongValueType;
+    return @as([*]const T, @ptrCast(@alignCast(ptr)))[0..len];
+}
+
+fn vlaPackedReadT(
+    comptime T: type,
+    tbl: *fits.BinTable,
+    col: u16,
+    first_row: u64,
+    nrows: u64,
+    array: ?*anyopaque,
+    cap: usize,
+) fits.Error!void {
+    var empty: [0]T = .{};
+    const out: []T = if (cap == 0)
+        empty[0..]
+    else
+        try alignedMutSlice(T, array orelse return error.CellOutOfRange, cap);
+    try fits.heap.readVlaColumnInto(T, tbl, .{ .index = col }, first_row, nrows, out);
+}
+
+fn vlaPackedRead(
+    ty: ZfType,
+    tbl: *fits.BinTable,
+    col: u16,
+    first_row: u64,
+    nrows: u64,
+    array: ?*anyopaque,
+    cap: usize,
+) fits.Error!void {
+    return switch (ty) {
+        .uint8 => vlaPackedReadT(u8, tbl, col, first_row, nrows, array, cap),
+        .int8 => vlaPackedReadT(i8, tbl, col, first_row, nrows, array, cap),
+        .int16 => vlaPackedReadT(i16, tbl, col, first_row, nrows, array, cap),
+        .uint16 => vlaPackedReadT(u16, tbl, col, first_row, nrows, array, cap),
+        .int32 => vlaPackedReadT(i32, tbl, col, first_row, nrows, array, cap),
+        .uint32 => vlaPackedReadT(u32, tbl, col, first_row, nrows, array, cap),
+        .int64 => vlaPackedReadT(i64, tbl, col, first_row, nrows, array, cap),
+        .uint64 => vlaPackedReadT(u64, tbl, col, first_row, nrows, array, cap),
+        .float32 => vlaPackedReadT(f32, tbl, col, first_row, nrows, array, cap),
+        .float64 => vlaPackedReadT(f64, tbl, col, first_row, nrows, array, cap),
+        else => error.WrongValueType,
+    };
+}
+
+fn vlaPackedWriteT(
+    comptime T: type,
+    tbl: *fits.BinTable,
+    mgr: *fits.heap.HeapManager,
+    col: u16,
+    first_row: u64,
+    offsets: []const u64,
+    array: ?*const anyopaque,
+    nelem: usize,
+) fits.Error!void {
+    const in: []const T = if (nelem == 0)
+        &.{}
+    else
+        try alignedConstSlice(T, array orelse return error.CellOutOfRange, nelem);
+    try fits.heap.writeVlaColumn(T, gpa, tbl, mgr, .{ .index = col }, first_row, offsets, in);
+}
+
+fn vlaPackedWrite(
+    ty: ZfType,
+    tbl: *fits.BinTable,
+    mgr: *fits.heap.HeapManager,
+    col: u16,
+    first_row: u64,
+    offsets: []const u64,
+    array: ?*const anyopaque,
+    nelem: usize,
+) fits.Error!void {
+    return switch (ty) {
+        .uint8 => vlaPackedWriteT(u8, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int8 => vlaPackedWriteT(i8, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int16 => vlaPackedWriteT(i16, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint16 => vlaPackedWriteT(u16, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int32 => vlaPackedWriteT(i32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint32 => vlaPackedWriteT(u32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int64 => vlaPackedWriteT(i64, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint64 => vlaPackedWriteT(u64, tbl, mgr, col, first_row, offsets, array, nelem),
+        .float32 => vlaPackedWriteT(f32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .float64 => vlaPackedWriteT(f64, tbl, mgr, col, first_row, offsets, array, nelem),
+        else => error.WrongValueType,
+    };
+}
+
+/// Measure a VLA row range for packed transfer. Rows are 1-based at the ABI; `offsets`
+/// receives `nrows + 1` scalar-slot offsets beginning at zero.
+pub export fn zf_read_col_vla_layout(
+    t_opt: ?*TableHandle,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    offsets_opt: ?*anyopaque,
+    offsets_cap: usize,
+    out_nslots_opt: ?*anyopaque,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+
+    const offsets_raw = offsets_opt orelse return abi.failNull();
+    const out_raw = out_nslots_opt orelse return abi.failNull();
+    if (@intFromPtr(offsets_raw) % @alignOf(u64) != 0 or @intFromPtr(out_raw) % @alignOf(u64) != 0) {
+        return abi.fail(&t.owner.diag, error.WrongValueType);
+    }
+
+    const nr: u64 = @intCast(nrows);
+    const needed_u64 = std.math.add(u64, nr, 1) catch return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const needed = std.math.cast(usize, needed_u64) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    if (offsets_cap < needed) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+
+    const offsets_ptr: [*]u64 = @ptrCast(@alignCast(offsets_raw));
+    const out_nslots: *u64 = @ptrCast(@alignCast(out_raw));
+    const total = fits.heap.vlaColumnLayout(tbl, .{ .index = @intCast(col) }, @intCast(firstrow - 1), offsets_ptr[0..needed]) catch |e| return abi.fail(&t.owner.diag, e);
+    out_nslots.* = total;
+    return 0;
+}
+
+/// Read a VLA row range into one contiguous scalar-slot buffer. `cap` must exactly match the
+/// measured layout. A null `array` is valid only for a zero-slot transfer.
+pub export fn zf_read_col_vla_packed(
+    t_opt: ?*TableHandle,
+    dtype: c_int,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    array: ?*anyopaque,
+    cap: u64,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+    if (cap != 0 and array == null) return abi.failNull();
+    const n: usize = std.math.cast(usize, cap) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    vlaPackedRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(firstrow - 1), @intCast(nrows), array, n) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+/// Write a VLA row range from one contiguous scalar-slot buffer. The offset vector must have
+/// exactly `nrows + 1` entries and terminate at `nelem`.
+pub export fn zf_write_col_vla_packed(
+    t_opt: ?*TableHandle,
+    dtype: c_int,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    offsets_opt: ?*const anyopaque,
+    offsets_len: usize,
+    array: ?*const anyopaque,
+    nelem: u64,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+    const offsets_raw = offsets_opt orelse return abi.failNull();
+    if (nelem != 0 and array == null) return abi.failNull();
+    if (@intFromPtr(offsets_raw) % @alignOf(u64) != 0) return abi.fail(&t.owner.diag, error.WrongValueType);
+
+    const nr: u64 = @intCast(nrows);
+    const needed_u64 = std.math.add(u64, nr, 1) catch return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const needed = std.math.cast(usize, needed_u64) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    if (offsets_len != needed) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    const n: usize = std.math.cast(usize, nelem) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const offsets_ptr: [*]const u64 = @ptrCast(@alignCast(offsets_raw));
+
+    // Preserve ABI pointer/range validation precedence, then reject the guaranteed failure before
+    // either the temporary zero-row manager or full live-heap reconstruction can do any work.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
+
+    // Preserve the core's full dtype/column/range/offset validation for a zero-row write without
+    // reconstructing and sorting a populated heap merely to perform a no-op. No allocation can
+    // reach this temporary zero-capacity manager because the validated range contains no cells.
+    if (nr == 0 and t.mgr == null) {
+        var empty_mgr = fits.heap.HeapManager.init(0);
+        defer empty_mgr.deinit(gpa);
+        vlaPackedWrite(@enumFromInt(dtype), tbl, &empty_mgr, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
+        return 0;
+    }
+
+    if (t.mgr == null) {
+        t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
+    }
+    vlaPackedWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 

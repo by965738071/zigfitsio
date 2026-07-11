@@ -145,6 +145,316 @@ test "binary table create, write columns, read back" {
     try testing.expectEqualStrings("gamma", std.mem.trimEnd(u8, name_out[16..24], " \x00"));
 }
 
+test "packed VLA ABI matches legacy P/Q/complex transfers and rejects invalid buffers" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "P", "Q", "C" };
+    const tform = [_]?[*:0]const u8{ "1PJ", "1QJ", "1PC" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(hh, 0, 4, 3, &ttype, &tform, null, "VLA", 1024));
+
+    var t: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+    defer capi.zf_table_close(t);
+    const th = t.?;
+
+    // Seed P/Q cells through the legacy row-at-a-time ABI, including empty cells.
+    var dummy_i32 = [_]i32{0};
+    var p0 = [_]i32{ 1, 2, 3 };
+    var p2 = [_]i32{4};
+    var p3 = [_]i32{ 5, 6 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 1, &p0, p0.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 2, &dummy_i32, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 3, &p2, p2.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 4, &p3, p3.len));
+
+    var q0 = [_]i32{100};
+    var q1 = [_]i32{ 200, 300 };
+    var q3 = [_]i32{400};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 1, &q0, q0.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 2, &q1, q1.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 3, &dummy_i32, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 4, &q3, q3.len));
+
+    // A complex descriptor's logical length is two here, but its packed layout has four f32
+    // scalar slots (real/imaginary pairs).
+    var complex = [_]f32{ 1.25, -2.5, 3.75, 4.5 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, F32, 2, 1, &complex, complex.len));
+
+    var p_offsets: [5]u64 = undefined;
+    var p_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, p_offsets.len, &p_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 3, 3, 4, 6 }, &p_offsets);
+    try testing.expectEqual(@as(u64, 6), p_total);
+    var p_packed: [6]i32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, &p_packed, p_packed.len));
+    try testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 5, 6 }, &p_packed);
+
+    var q_offsets: [5]u64 = undefined;
+    var q_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 1, 1, 4, &q_offsets, q_offsets.len, &q_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 1, 3, 3, 4 }, &q_offsets);
+    var q_packed: [4]i32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 1, 1, 4, &q_packed, q_total));
+    try testing.expectEqualSlices(i32, &.{ 100, 200, 300, 400 }, &q_packed);
+
+    var c_offsets: [2]u64 = undefined;
+    var c_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 2, 1, 1, &c_offsets, c_offsets.len, &c_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 4 }, &c_offsets);
+    var c_packed: [4]f32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, F32, 2, 1, 1, &c_packed, c_total));
+    try testing.expectEqualSlices(f32, &complex, &c_packed);
+
+    // Packed write, then prove the legacy cell reader observes identical row boundaries/data.
+    const replacement_offsets = [_]u64{ 0, 2, 2, 5, 6 };
+    var replacement = [_]i32{ 9, 8, 7, 6, 5, 4 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+        th,
+        I32,
+        0,
+        1,
+        4,
+        &replacement_offsets,
+        replacement_offsets.len,
+        &replacement,
+        replacement.len,
+    ));
+    var legacy_out: [3]i32 = undefined;
+    var legacy_n: c_longlong = -1;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 1, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 2), legacy_n);
+    try testing.expectEqualSlices(i32, &.{ 9, 8 }, legacy_out[0..2]);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 2, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 0), legacy_n);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 3, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 3), legacy_n);
+    try testing.expectEqualSlices(i32, &.{ 7, 6, 5 }, &legacy_out);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 4, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 1), legacy_n);
+    try testing.expectEqual(@as(i32, 4), legacy_out[0]);
+
+    // Zero-row ranges still have the canonical one-entry layout and accept null payloads.
+    var empty_layout = [_]u64{99};
+    var empty_total: u64 = 99;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 5, 0, &empty_layout, 1, &empty_total));
+    try testing.expectEqualSlices(u64, &.{0}, &empty_layout);
+    try testing.expectEqual(@as(u64, 0), empty_total);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 5, 0, null, 0));
+
+    // ABI-side validation must return statuses rather than trapping on bad casts/pointers.
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_layout(th, 0, 1, 4, null, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, 5, null));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, 4, &p_total));
+    try testing.expectEqual(@as(c_int, 307), capi.zf_read_col_vla_layout(th, 0, 0, 4, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 307), capi.zf_read_col_vla_layout(th, 0, 1, -1, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 219), capi.zf_read_col_vla_layout(th, 70000, 1, 4, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, null, 1));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, &p_packed, 5));
+    try testing.expectEqual(@as(c_int, 410), capi.zf_read_col_vla_packed(th, 999, 0, 1, 4, &p_packed, 6));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, null, 5, &replacement, 6));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &replacement_offsets, 4, &replacement, 6));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &replacement_offsets, 5, null, 6));
+
+    // A malformed offset vector is rejected before mutation; compare the complete FITS image.
+    var data_size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(hh, &data_size));
+    const before = try testing.allocator.alloc(u8, @intCast(data_size));
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, @intCast(data_size));
+    defer testing.allocator.free(after);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(hh, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+    const bad_offsets = [_]u64{ 0, 2, 1, 5, 6 };
+    try testing.expectEqual(@as(c_int, 308), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &bad_offsets, bad_offsets.len, &replacement, replacement.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(hh, 0, after.ptr, after.len, &got));
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "read-only VLA writes reject before lazy heap reconstruction" {
+    // Build a minimal VLA table, export its bytes, then forge its sole descriptor so a heap scan
+    // would fail with BadDescriptor. The write APIs must return READONLY_FILE before attempting
+    // that scan, leaving both the lazy manager and the complete file image untouched.
+    var source: ?*Handle = null;
+    defer if (source) |handle| capi.zf_close(handle);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{"P"};
+    const tform = [_]?[*:0]const u8{"1PJ"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(src, 0, 1, 1, &ttype, &tform, null, "RO", 16));
+    const descriptor_off: usize = @intCast(src.fits.current().data_off);
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const forged = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(forged);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, forged.ptr, forged.len, &got));
+    try testing.expectEqual(forged.len, got);
+    capi.zf_close(source);
+    source = null;
+
+    // P descriptor: one J element at a heap-relative offset beyond the reserved 16-byte heap.
+    std.mem.writeInt(i32, forged[descriptor_off..][0..4], 1, .big);
+    std.mem.writeInt(i32, forged[descriptor_off + 4 ..][0..4], 1024, .big);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(forged.ptr, forged.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(ro, 2));
+
+    const before = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(ro, &table));
+    defer capi.zf_table_close(table);
+    const th = table.?;
+    try testing.expect(th.mgr == null);
+
+    var value = [_]i32{42};
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla(th, I32, 0, 1, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    const offsets = [_]u64{ 0, 1 };
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla_packed(th, I32, 0, 1, 1, &offsets, offsets.len, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, after.ptr, after.len, &got));
+    try testing.expectEqual(after.len, got);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "lazy VLA manager preserves every live column when rewriting a populated heap" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "A", "B" };
+    const tform = [_]?[*:0]const u8{ "1PJ", "1QJ" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(hh, 0, 2, 2, &ttype, &tform, null, "LIVE", 256));
+
+    // Populate four distinct live heap extents, then close the table view. Reopening creates a
+    // fresh CAPI handle whose lazy HeapManager must reconstruct occupancy from the descriptors.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const th = t.?;
+        var a0 = [_]i32{ 11, 12 };
+        var a1 = [_]i32{ 13, 14 };
+        var b0 = [_]i32{ 21, 22 };
+        var b1 = [_]i32{ 23, 24 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 1, &a0, a0.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 2, &a1, a1.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 1, &b0, b0.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 2, &b1, b1.len));
+    }
+
+    // Reopen and grow B[0] through the packed API. An empty-assuming manager would allocate at
+    // heap offset zero and overwrite A; reconstruction must place it after all live extents.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const no_rows = [_]u64{0};
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+            t.?,
+            I32,
+            1,
+            3,
+            0,
+            &no_rows,
+            no_rows.len,
+            null,
+            0,
+        ));
+        try testing.expect(t.?.mgr == null); // a no-op must not scan/reconstruct the live heap
+
+        const offsets = [_]u64{ 0, 3 };
+        var replacement = [_]i32{ 91, 92, 93 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+            t.?,
+            I32,
+            1,
+            1,
+            1,
+            &offsets,
+            offsets.len,
+            &replacement,
+            replacement.len,
+        ));
+    }
+
+    // Reopen once more and grow A[1] through the legacy cell API, exercising its independent
+    // lazy-manager call site against an already-populated, non-contiguous heap.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        var replacement = [_]i32{ 71, 72, 73 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(t.?, I32, 0, 2, &replacement, replacement.len));
+    }
+
+    // Both rewritten cells and both untouched cells must remain distinct and byte-correct.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const th = t.?;
+
+        var offsets: [3]u64 = undefined;
+        var total: u64 = 0;
+        var a: [5]i32 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 1, 2, &offsets, offsets.len, &total));
+        try testing.expectEqualSlices(u64, &.{ 0, 2, 5 }, &offsets);
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 1, 2, &a, total));
+        try testing.expectEqualSlices(i32, &.{ 11, 12, 71, 72, 73 }, &a);
+
+        var b: [5]i32 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 1, 1, 2, &offsets, offsets.len, &total));
+        try testing.expectEqualSlices(u64, &.{ 0, 3, 5 }, &offsets);
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 1, 1, 2, &b, total));
+        try testing.expectEqualSlices(i32, &.{ 91, 92, 93, 23, 24 }, &b);
+
+        // The four live J payloads must not alias after either rewrite.
+        const cells = [_]struct { col: c_int, row: c_longlong }{
+            .{ .col = 0, .row = 1 },
+            .{ .col = 0, .row = 2 },
+            .{ .col = 1, .row = 1 },
+            .{ .col = 1, .row = 2 },
+        };
+        var lens: [cells.len]c_longlong = undefined;
+        var offs: [cells.len]c_longlong = undefined;
+        for (cells, 0..) |cell, i| {
+            try testing.expectEqual(@as(c_int, 0), capi.zf_read_descript(th, cell.col, cell.row, &lens[i], &offs[i]));
+            try testing.expect(lens[i] > 0 and offs[i] >= 0);
+        }
+        for (0..cells.len) |i| {
+            const i_start: u64 = @intCast(offs[i]);
+            const i_end = i_start + @as(u64, @intCast(lens[i])) * @sizeOf(i32);
+            for (i + 1..cells.len) |j| {
+                const j_start: u64 = @intCast(offs[j]);
+                const j_end = j_start + @as(u64, @intCast(lens[j])) * @sizeOf(i32);
+                try testing.expect(i_end <= j_start or j_end <= i_start);
+            }
+        }
+    }
+}
+
 test "table view survives owner close without use-after-free; bad indices error, never trap" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));

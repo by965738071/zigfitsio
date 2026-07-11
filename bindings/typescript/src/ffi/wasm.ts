@@ -58,6 +58,9 @@ export const BUF_DIRS: Readonly<Record<string, Readonly<Record<number, "in" | "o
   zf_write_col: { 6: "in" },
   zf_read_col_str: { 6: "out" },
   zf_write_col_str: { 6: "in" },
+  zf_read_col_vla_layout: { 4: "out", 6: "out" },
+  zf_read_col_vla_packed: { 5: "out" },
+  zf_write_col_vla_packed: { 5: "in", 7: "in" },
   zf_read_bytes: { 2: "out" }, //         (handle, offset, [dst], len, out_read)
   zf_open_memory: { 0: "in" }, //         ([bytes], len, mode, opts, out) — read-only source copy
   zf_open_gzip: { 0: "in" }, //           ([bytes], len, opts, out) — read-only source copy
@@ -76,10 +79,16 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
   const dv = (): DataView => new DataView(ex.memory.buffer);
 
   const alloc = (len: number): number => {
+    // `zf_walloc` takes a wasm32 `usize`. Never let JS-to-wasm i32 coercion wrap a malformed
+    // or oversized request (in particular, 4 GiB used to become a zero-byte allocation via
+    // `>>> 0`). Buffers at the exact 4-GiB boundary are also unaddressable as one wasm32 span.
+    if (!Number.isSafeInteger(len) || len < 0 || len >= 0x1_0000_0000) {
+      throw new RangeError(`zigfitsio(wasm): buffer length ${len} is not representable by wasm32`);
+    }
     // wasm i32 returns are signed in JS; `>>> 0` reads the offset as unsigned so a heap grown past
     // 2 GiB (offsets with the high bit set) does not surface as a negative index that would crash
     // `set`/`subarray` or silently address the wrong region.
-    const p = ex.zf_walloc(len >>> 0) >>> 0;
+    const p = ex.zf_walloc(len) >>> 0;
     if (p === 0 && len > 0) throw new Error(`zigfitsio(wasm): out of memory allocating ${len} bytes`);
     return p;
   };
@@ -204,7 +213,14 @@ export function openWasmLibrary(ex: WasmExports, protos: readonly Proto[]): Nati
               // wasm i64 params require BigInt.
               call[i] = typeof v === "bigint" ? v : BigInt(v as number);
               break;
-            case "usize":
+            case "usize": {
+              const n = typeof v === "bigint" ? v : BigInt(v as number);
+              if (n < 0n || n >= 0x1_0000_0000n) {
+                throw new RangeError(`zigfitsio(wasm): usize ${String(v)} is not representable by wasm32`);
+              }
+              call[i] = Number(n);
+              break;
+            }
             case "long":
               // 32-bit on wasm32 → pass as an i32 number.
               call[i] = typeof v === "bigint" ? Number(v) : (v as number);

@@ -5,7 +5,7 @@
  * `values` is a flat TypedArray (numeric; `nrows*repeat` elements, complex
  * interleaved re/im), a `string[]`, or a per-row array of TypedArrays (VLA).
  */
-import { FitsError, FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
+import { FitsOverflowError, FitsTableError, FitsTypeError, NotSupportedError } from "./errors.js";
 import * as ll from "./lowlevel/index.js";
 import * as dt from "./dtypes.js";
 import { BaseHDU, DATA_UNSET, writeConventionOffset, writeKeyValue, isTableStructuralKeyword, type HDUOptions } from "./hdu.js";
@@ -355,6 +355,114 @@ function binaryTformFor(info: ll.ColInfo | undefined, cd: ColumnData): string {
 
 const isTypedArray = (v: unknown): v is dt.TypedArray => ArrayBuffer.isView(v) && !(v instanceof DataView);
 
+// Keep any one host↔Wasm staging allocation comfortably below wasm32's address-space limit.
+// A row containing more than this budget is still transferred alone (provided it is < 4 GiB),
+// because the packed ABI deliberately chunks on row boundaries.
+const WASM_STAGE_BUDGET = 64 * 1024 * 1024;
+const MAX_LAYOUT_ROWS_PER_CALL = Math.floor(WASM_STAGE_BUDGET / BigUint64Array.BYTES_PER_ELEMENT) - 1;
+const MAX_WASM_BUFFER_BYTES = 0x1_0000_0000n;
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_U64 = 0xffff_ffff_ffff_ffffn;
+// `values` is a normal JS Array and `offsets` needs one extra entry.
+const MAX_MATERIALIZED_ROWS = 0xffff_fffen;
+
+function safeMaterializedRows(value: bigint, what = "table row count"): number {
+  if (value < 0n || value > MAX_MATERIALIZED_ROWS) {
+    throw new FitsOverflowError(412, `${what} ${value} cannot be materialized as a JavaScript array`);
+  }
+  return Number(value);
+}
+
+function safeSlotCount(value: bigint, scalarBytes: number, what: string): number {
+  if (value < 0n || value > MAX_SAFE_BIGINT || value * BigInt(scalarBytes) > MAX_SAFE_BIGINT) {
+    throw new FitsOverflowError(412, `${what} ${value} is too large to materialize as a TypedArray`);
+  }
+  return Number(value);
+}
+
+function requireWasmBufferSize(slots: bigint, scalarBytes: number, what: string): void {
+  const bytes = slots * BigInt(scalarBytes);
+  if (bytes < 0n || bytes >= MAX_WASM_BUFFER_BYTES) {
+    throw new FitsOverflowError(412, `${what} requires ${bytes} bytes, which cannot be staged in wasm32`);
+  }
+}
+
+function allocTransferArray(dtype: dt.Dtype, slots: number, what: string): dt.TypedArray {
+  try {
+    return dt.allocDtype(dtype, slots);
+  } catch (e) {
+    if (e instanceof RangeError) {
+      throw new FitsOverflowError(412, `${what} with ${slots} scalar slots is too large to allocate`);
+    }
+    throw e;
+  }
+}
+
+/** Row ranges whose offsets and payload can each be staged in bounded wasm32 buffers. */
+function* vlaTransferChunks(
+  offsets: BigUint64Array,
+  scalarBytes: number,
+): IterableIterator<{ first: number; end: number; firstSlot: bigint; endSlot: bigint }> {
+  const nrows = offsets.length - 1;
+  const budgetSlots = BigInt(Math.max(Math.floor(WASM_STAGE_BUDGET / scalarBytes), 1));
+  let first = 0;
+  while (first < nrows) {
+    const firstSlot = offsets[first];
+    const rowLimit = Math.min(first + MAX_LAYOUT_ROWS_PER_CALL, nrows);
+    let end = first + 1; // a single large cell is indivisible; transfer it alone
+    while (end < rowLimit && offsets[end + 1] - firstSlot <= budgetSlots) end++;
+    const endSlot = offsets[end];
+    requireWasmBufferSize(endSlot - firstSlot, scalarBytes, "packed VLA row range");
+    yield { first, end, firstSlot, endSlot };
+    first = end;
+  }
+}
+
+/** Measure all VLA cells through bounded layout calls and rebase them to one global offset array. */
+function readVlaLayout(t: bigint, col: number, nrows: number): BigUint64Array {
+  const offsets = new BigUint64Array(nrows + 1);
+  if (nrows === 0) {
+    const total = ll.outU64();
+    ll.check(ll.lib.zf_read_col_vla_layout(t, col, 1n, 0n, offsets, offsets.length, total));
+    if (offsets[0] !== 0n || total[0] !== 0n) {
+      throw new FitsTableError(264, "packed VLA layout for an empty row range was not [0]");
+    }
+    return offsets;
+  }
+
+  let base = 0n;
+  for (let first = 0; first < nrows; first += MAX_LAYOUT_ROWS_PER_CALL) {
+    const end = Math.min(first + MAX_LAYOUT_ROWS_PER_CALL, nrows);
+    const local = offsets.subarray(first, end + 1);
+    const total = ll.outU64();
+    ll.check(
+      ll.lib.zf_read_col_vla_layout(
+        t,
+        col,
+        BigInt(first + 1),
+        BigInt(end - first),
+        local,
+        local.length,
+        total,
+      ),
+    );
+    if (local[0] !== 0n || local[local.length - 1] !== total[0]) {
+      throw new FitsTableError(264, "packed VLA layout returned inconsistent terminal offsets");
+    }
+    let previous = 0n;
+    for (let k = 1; k < local.length; k++) {
+      const value = local[k];
+      if (value < previous) throw new FitsTableError(264, "packed VLA layout offsets are not monotonic");
+      if (value > MAX_U64 - base) throw new FitsOverflowError(412, "packed VLA layout total exceeds uint64");
+      previous = value;
+      local[k] = base + value;
+    }
+    local[0] = base;
+    base += total[0];
+  }
+  return offsets;
+}
+
 /**
  * A plain JS value destined for an int64 slot: rounds (the same net behavior
  * as Python routing floats through the library's float→int conversion) and
@@ -608,10 +716,10 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     withTable(h, (t) => {
       const nrowsOut = ll.outI64();
       ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
-      const nrows = Number(nrowsOut[0]);
-      // Resolve each column to its unique slot in the FILE, not its position in
-      // this (possibly reordered) TableData. Duplicate effective names are
-      // rejected before any write because a name cannot identify either slot.
+      const nrows = safeMaterializedRows(nrowsOut[0]);
+      // Resolve each column to its unique slot in the FILE, not its position in this
+      // (possibly reordered) TableData. Duplicate effective names are rejected before any
+      // write because a name cannot identify either physical slot.
       const ncolsOut = ll.outI32();
       ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
       const fileNames: string[] = [];
@@ -678,7 +786,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
     return withTable(h, (t) => {
       const nrowsOut = ll.outI64();
       ll.check(ll.lib.zf_table_nrows(t, nrowsOut));
-      const nrows = Number(nrowsOut[0]);
+      const nrows = safeMaterializedRows(nrowsOut[0]);
       const ncolsOut = ll.outI32();
       ll.check(ll.lib.zf_table_ncols(t, ncolsOut));
       const ncols = ncolsOut[0];
@@ -693,7 +801,7 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       assertUniqueColumnNames(names);
       const columns = new Map<string, ColumnData>();
       for (let col = 0; col < ncols; col++) columns.set(names[col], this._columnPlan(t, col, infos[col], nrows));
-      const data = new TableData(names, columns, Math.max(nrows, 0));
+      const data = new TableData(names, columns, nrows);
       // Baselines for write-back AND the writeTo pristine gate (all modes).
       this._colFingerprints = new Map(names.map((n) => [n, colFp(data.column(n))]));
       return data;
@@ -719,38 +827,42 @@ export abstract class TableHDU<T extends ColumnShape = ColumnShape> extends Base
       return { kind: "string", dtype: "u1", repeat: Math.max(width, 1), values };
     }
 
-    // VLA column -> per-row arrays. Element type comes from info.typecode
-    // (the TFORM char is 'P'/'Q', the descriptor kind — not the element type).
+    // VLA column -> zero-copy row views into one JS-owned flat array. The core measures and
+    // validates all descriptors in packed ranges, then fills each range without per-cell ABI
+    // crossings or allocations. Element type comes from info.typecode (the TFORM char itself is
+    // 'P'/'Q', the descriptor kind — not the element type).
     if (info.isVla) {
       const code = info.typecode;
       const isComplex = code === ll.ZF_COMPLEX64 || code === ll.ZF_COMPLEX128;
       const elem: dt.Dtype = isComplex ? (code === ll.ZF_COMPLEX64 ? "c8" : "c16") : dt.zfToDtype(code);
       const floatElem: dt.Dtype = code === ll.ZF_COMPLEX64 ? "f4" : "f8";
-      const readCode = isComplex ? dt.zfCode(floatElem) : dt.zfCode(elem);
-      const values: dt.TypedArray[] = [];
+      const scalarElem = isComplex ? floatElem : elem;
+      const scalarBytes = dt.itemBytes(scalarElem);
+      const readCode = dt.zfCode(scalarElem);
+      const offsets = readVlaLayout(t, col, nrows);
+      const total = offsets[offsets.length - 1];
+      const flat = allocTransferArray(scalarElem, safeSlotCount(total, scalarBytes, "packed VLA payload"), "packed VLA payload");
+
+      for (const chunk of vlaTransferChunks(offsets, scalarBytes)) {
+        const firstSlot = Number(chunk.firstSlot);
+        const endSlot = Number(chunk.endSlot);
+        const out = flat.subarray(firstSlot, endSlot) as dt.TypedArray;
+        ll.check(
+          ll.lib.zf_read_col_vla_packed(
+            t,
+            readCode,
+            col,
+            BigInt(chunk.first + 1),
+            BigInt(chunk.end - chunk.first),
+            out,
+            chunk.endSlot - chunk.firstSlot,
+          ),
+        );
+      }
+
+      const values = new Array<dt.TypedArray>(nrows);
       for (let r = 0; r < nrows; r++) {
-        const len = ll.outI64();
-        const off = ll.outI64();
-        ll.check(ll.lib.zf_read_descript(t, col, BigInt(r + 1), len, off));
-        const count = Number(len[0]);
-        if (count < 0) throw new FitsError(412, `corrupt VLA descriptor: negative length ${count}`);
-        const got = ll.outI64();
-        if (isComplex) {
-          const cap = count * 2; // ABI returns 2 float slots per complex element
-          if (count > 0) {
-            const cell = dt.allocDtype(floatElem, cap);
-            ll.check(ll.lib.zf_read_col_vla(t, readCode, col, BigInt(r + 1), BigInt(cap), cell, got));
-            values.push(cell.subarray(0, Number(got[0])) as dt.TypedArray);
-          } else {
-            values.push(dt.allocDtype(floatElem, 0));
-          }
-        } else {
-          const cell = dt.allocDtype(elem, count);
-          if (count > 0) {
-            ll.check(ll.lib.zf_read_col_vla(t, readCode, col, BigInt(r + 1), BigInt(count), cell, got));
-          }
-          values.push(cell);
-        }
+        values[r] = flat.subarray(Number(offsets[r]), Number(offsets[r + 1])) as dt.TypedArray;
       }
       return { kind: "vla", dtype: elem, repeat: 1, values };
     }
@@ -1023,9 +1135,54 @@ function writeVlaColumn(t: bigint, i: number, col: Column, nrows: number): void 
   const { dtype: elem, isComplex } = vlaElemDtype(col.format.trim().toUpperCase());
   if (isComplex) throw new NotSupportedError(410, "writing complex VLA columns is not supported");
   const arr = col.array as readonly (dt.TypedArray | readonly number[])[];
+  const offsets = new BigUint64Array(nrows + 1);
+  const cells = new Array<dt.TypedArray>(nrows);
+  let total = 0n;
   for (let r = 0; r < nrows; r++) {
     const cell = castTypedArray(arr[r], elem);
-    ll.check(ll.lib.zf_write_col_vla(t, dt.zfCode(elem), i, BigInt(r + 1), cell, BigInt(cell.length)));
+    cells[r] = cell;
+    const length = BigInt(cell.length);
+    if (length > MAX_U64 - total) throw new FitsOverflowError(412, "packed VLA payload exceeds uint64 slots");
+    total += length;
+    offsets[r + 1] = total;
+  }
+
+  const scalarBytes = dt.itemBytes(elem);
+  const flat = allocTransferArray(elem, safeSlotCount(total, scalarBytes, "packed VLA payload"), "packed VLA payload");
+  let at = 0;
+  for (const cell of cells) {
+    // All cells and `flat` have exactly `elem`, but the TypedArray union does not expose a
+    // common bigint/number-safe `set` overload.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (flat as any).set(cell, at);
+    at += cell.length;
+  }
+
+  // The zero-row case is a useful ABI no-op and keeps all VLA writes on the packed path.
+  if (nrows === 0) {
+    ll.check(ll.lib.zf_write_col_vla_packed(t, dt.zfCode(elem), i, 1n, 0n, offsets, offsets.length, flat, 0n));
+    return;
+  }
+
+  for (const chunk of vlaTransferChunks(offsets, scalarBytes)) {
+    const localOffsets = new BigUint64Array(chunk.end - chunk.first + 1);
+    for (let k = 0; k < localOffsets.length; k++) {
+      localOffsets[k] = offsets[chunk.first + k] - chunk.firstSlot;
+    }
+    const values = flat.subarray(Number(chunk.firstSlot), Number(chunk.endSlot)) as dt.TypedArray;
+    ll.check(
+      ll.lib.zf_write_col_vla_packed(
+        t,
+        dt.zfCode(elem),
+        i,
+        BigInt(chunk.first + 1),
+        BigInt(chunk.end - chunk.first),
+        localOffsets,
+        localOffsets.length,
+        values,
+        chunk.endSlot - chunk.firstSlot,
+      ),
+    );
   }
 }
 

@@ -6,7 +6,7 @@
 import { describe, expect, test } from "./_harness/index.js";
 import { FitsError, FitsOverflowError, KeywordNotFound } from "../src/errors.js";
 import * as ll from "../src/lowlevel/index.js";
-import { BUF_DIRS } from "../src/ffi/wasm.js";
+import { BUF_DIRS, openWasmLibrary, type WasmExports } from "../src/ffi/wasm.js";
 import { PROTOS } from "../src/lowlevel/protos.js";
 import { enc } from "../src/util.js";
 
@@ -90,6 +90,61 @@ describe("lowlevel basics", () => {
       const nope = enc("NOPE");
       expect(Number(ll.lib.zf_key_exists(h, simple, simple.length))).toBe(1);
       expect(Number(ll.lib.zf_key_exists(h, nope, nope.length))).toBe(0);
+    } finally {
+      ll.lib.zf_close(h);
+    }
+  });
+});
+
+describe("packed VLA ABI", () => {
+  test("P/Q layouts, empty cells, BigInt values, complex scalar slots, and zero rows", () => {
+    const h = createMemory();
+    try {
+      emptyPrimary(h);
+      ll.check(ll.lib.zf_create_tbl_heap(h, ll.BINARY_TBL, 3n, 3, ["P", "Q", "C"], ["1PJ", "1QK", "1PC"], null, null, 64n));
+      const tout = ll.outU64();
+      ll.check(ll.lib.zf_table_open(h, tout));
+      const t = tout[0];
+      try {
+        const poff = BigUint64Array.from([0n, 3n, 4n, 4n]);
+        ll.check(ll.lib.zf_write_col_vla_packed(t, ll.ZF_INT32, 0, 1n, 3n, poff, poff.length, Int32Array.from([1, 2, 3, 4]), 4n));
+        const qoff = BigUint64Array.from([0n, 1n, 3n, 3n]);
+        const qvals = BigInt64Array.from([9007199254740993n, -9007199254740995n, 17n]);
+        ll.check(ll.lib.zf_write_col_vla_packed(t, ll.ZF_INT64, 1, 1n, 3n, qoff, qoff.length, qvals, 3n));
+        ll.check(ll.lib.zf_write_col_vla(t, ll.ZF_FLOAT32, 2, 1n, Float32Array.from([1, -2]), 2n));
+        ll.check(ll.lib.zf_write_col_vla(t, ll.ZF_FLOAT32, 2, 2n, Float32Array.from([3, 4, -5, 6]), 4n));
+
+        for (const [col, want] of [
+          [0, [0n, 3n, 4n, 4n]],
+          [1, [0n, 1n, 3n, 3n]],
+          [2, [0n, 2n, 6n, 6n]],
+        ] as const) {
+          const got = new BigUint64Array(4);
+          const total = ll.outU64();
+          ll.check(ll.lib.zf_read_col_vla_layout(t, col, 1n, 3n, got, got.length, total));
+          expect(Array.from(got)).toEqual(want);
+          expect(total[0]).toBe(want[3]);
+        }
+
+        const pgot = new Int32Array(4);
+        ll.check(ll.lib.zf_read_col_vla_packed(t, ll.ZF_INT32, 0, 1n, 3n, pgot, 4n));
+        expect(Array.from(pgot)).toEqual([1, 2, 3, 4]);
+        const qgot = new BigInt64Array(3);
+        ll.check(ll.lib.zf_read_col_vla_packed(t, ll.ZF_INT64, 1, 1n, 3n, qgot, 3n));
+        expect(Array.from(qgot)).toEqual(Array.from(qvals));
+        const cgot = new Float32Array(6);
+        ll.check(ll.lib.zf_read_col_vla_packed(t, ll.ZF_FLOAT32, 2, 1n, 3n, cgot, 6n));
+        expect(Array.from(cgot)).toEqual([1, -2, 3, 4, -5, 6]);
+
+        const emptyLayout = BigUint64Array.from([99n]);
+        const emptyTotal = BigUint64Array.from([99n]);
+        ll.check(ll.lib.zf_read_col_vla_layout(t, 0, 1n, 0n, emptyLayout, 1, emptyTotal));
+        expect(Array.from(emptyLayout)).toEqual([0n]);
+        expect(emptyTotal[0]).toBe(0n);
+        ll.check(ll.lib.zf_read_col_vla_packed(t, ll.ZF_INT32, 0, 1n, 0n, null, 0n));
+      } finally {
+        ll.lib.zf_table_close(t);
+      }
     } finally {
       ll.lib.zf_close(h);
     }
@@ -294,6 +349,12 @@ describe("allocate-and-return", () => {
 // so a future reordering of the C ABI can never silently skip a needed copy-in/copy-back.
 describe("wasm buf-direction map", () => {
   const byName = new Map(PROTOS.map((p) => [p.name, p]));
+  test("prototype count and packed VLA directions match the ABI", () => {
+    expect(PROTOS).toHaveLength(89);
+    expect(BUF_DIRS.zf_read_col_vla_layout).toEqual({ 4: "out", 6: "out" });
+    expect(BUF_DIRS.zf_read_col_vla_packed).toEqual({ 5: "out" });
+    expect(BUF_DIRS.zf_write_col_vla_packed).toEqual({ 5: "in", 7: "in" });
+  });
   for (const [name, dirs] of Object.entries(BUF_DIRS)) {
     test(`${name}: annotated indices are buf args`, () => {
       const proto = byName.get(name);
@@ -303,4 +364,31 @@ describe("wasm buf-direction map", () => {
       }
     });
   }
+});
+
+describe("wasm32 marshalling limits", () => {
+  test("oversized, negative, and unsafe buffer/usize lengths fail before wasm coercion", () => {
+    let allocations = 0;
+    const ex = {
+      memory: new WebAssembly.Memory({ initial: 1 }),
+      zf_walloc: () => {
+        allocations++;
+        return 8;
+      },
+      zf_wfree: () => undefined,
+      zf_test_buf: () => 0,
+      zf_test_usize: () => 0,
+    } as unknown as WasmExports;
+    const lib = openWasmLibrary(ex, [
+      { name: "zf_test_buf", returns: "int", args: ["buf"] },
+      { name: "zf_test_usize", returns: "int", args: ["usize"] },
+    ]);
+    const fake = (byteLength: number): ArrayBufferView =>
+      ({ buffer: new ArrayBuffer(0), byteOffset: 0, byteLength } as ArrayBufferView);
+    for (const bad of [-1, 0x1_0000_0000, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => lib.fn.zf_test_buf(fake(bad))).toThrow(RangeError);
+      expect(() => lib.fn.zf_test_usize(bad)).toThrow(RangeError);
+    }
+    expect(allocations).toBe(0);
+  });
 });

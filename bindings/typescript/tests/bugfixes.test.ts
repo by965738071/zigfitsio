@@ -250,24 +250,66 @@ describe("unsigned conventions", () => {
 });
 
 describe("VLA columns", () => {
-  test("VLA int32 write and read (incl. empty cell)", () => {
-    const vla = [Int32Array.from([1, 2, 3]), Int32Array.from([4]), new Int32Array(0)];
+  test("packed P/Q write/read keeps empty cells, BigInts, shared views, and mutations", () => {
+    const p = [Int32Array.from([1, 2, 3]), Int32Array.from([4]), new Int32Array(0)];
+    const q = [BigInt64Array.from([9007199254740993n]), BigInt64Array.from([-7n, 11n]), new BigInt64Array(0)];
     const src = new zf.HDUList([
       new zf.PrimaryHDU(),
-      zf.BinTableHDU.fromColumns([new zf.Column("V", "1PJ", { array: vla })]),
+      zf.BinTableHDU.fromColumns([
+        new zf.Column("P", "1PJ", { array: p }),
+        new zf.Column("Q", "1QK", { array: q }),
+        new zf.Column("EMPTY", "1PB", { array: [new Uint8Array(0), new Uint8Array(0), new Uint8Array(0)] }),
+      ]),
     ]).toBytes();
     const hl = zf.fromBytes(src);
+    let retained: zf.TypedArray[] = [];
     try {
-      const col = (hl.get(1).data as zf.TableData).column("V");
-      expect(col.kind).toBe("vla");
-      expect(col.dtype).toBe("i4");
-      const cells = col.values as zf.TypedArray[];
-      expect(asNums(cells[0])).toEqual([1, 2, 3]);
-      expect(asNums(cells[1])).toEqual([4]);
-      expect(cells[2].length).toBe(0);
+      const rec = hl.get(1).data as zf.TableData;
+      const pcells = rec.vla("P");
+      retained = pcells;
+      expect(pcells.map(asNums)).toEqual([[1, 2, 3], [4], []]);
+      expect(pcells[0].buffer).toBe(pcells[1].buffer);
+      expect(pcells[0].byteOffset + pcells[0].byteLength).toBe(pcells[1].byteOffset);
+      const qcells = rec.vla("Q") as BigInt64Array[];
+      expect(qcells.map((c) => Array.from(c))).toEqual([[9007199254740993n], [-7n, 11n], []]);
+      expect(qcells[0].buffer).toBe(qcells[1].buffer);
+      expect(rec.vla("EMPTY").map((c) => c.length)).toEqual([0, 0, 0]);
+
+      (pcells[1] as Int32Array)[0] = 99;
+      expect(asNums(pcells[0])).toEqual([1, 2, 3]);
+      const changed = hl.toBytes();
+      const reopened = zf.fromBytes(changed);
+      try {
+        expect((reopened.get(1).data as zf.TableData).vla("P").map(asNums)).toEqual([[1, 2, 3], [99], []]);
+      } finally {
+        reopened.close();
+      }
     } finally {
       hl.close();
     }
+    expect(retained.map(asNums)).toEqual([[1, 2, 3], [99], []]);
+  });
+
+  test("packed complex VLA read uses scalar-slot boundaries and survives close", () => {
+    const src = bytesFrom((handle) => {
+      ll.check(ll.lib.zf_create_img(handle, 8, 0, null));
+      ll.check(ll.lib.zf_create_tbl_heap(handle, ll.BINARY_TBL, 3n, 1, ["C"], ["1PC"], null, null, 24n));
+      const tout = ll.outU64();
+      ll.check(ll.lib.zf_table_open(handle, tout));
+      try {
+        ll.check(ll.lib.zf_write_col_vla(tout[0], ll.ZF_FLOAT32, 0, 1n, Float32Array.from([1, -2]), 2n));
+        ll.check(ll.lib.zf_write_col_vla(tout[0], ll.ZF_FLOAT32, 0, 2n, Float32Array.from([3, 4, -5, 6]), 4n));
+      } finally {
+        ll.lib.zf_table_close(tout[0]);
+      }
+    });
+    const hl = zf.fromBytes(src);
+    const cells = (hl.get(1).data as zf.TableData).vla("C");
+    expect((hl.get(1).data as zf.TableData).column("C").dtype).toBe("c8");
+    expect(cells.map(asNums)).toEqual([[1, -2], [3, 4, -5, 6], []]);
+    expect(cells[0].buffer).toBe(cells[1].buffer);
+    hl.close();
+    expect(cells.map(asNums)).toEqual([[1, -2], [3, 4, -5, 6], []]);
   });
 });
 

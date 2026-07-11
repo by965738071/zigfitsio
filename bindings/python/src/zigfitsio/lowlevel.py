@@ -297,6 +297,9 @@ _PROTOS = [
     ("zf_read_descript", INT, [VOID, INT, LL, PLL, PLL]),
     ("zf_read_col_vla", INT, [VOID, INT, INT, LL, LL, VOID, PLL]),
     ("zf_write_col_vla", INT, [VOID, INT, INT, LL, VOID, LL]),
+    ("zf_read_col_vla_layout", INT, [VOID, INT, LL, LL, PU64, SZ, PU64]),
+    ("zf_read_col_vla_packed", INT, [VOID, INT, INT, LL, LL, VOID, U64]),
+    ("zf_write_col_vla_packed", INT, [VOID, INT, INT, LL, LL, PU64, SZ, VOID, U64]),
     # integrity
     ("zf_write_chksum", INT, [VOID]),
     ("zf_update_chksum_all", INT, [VOID]),

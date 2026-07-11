@@ -6,6 +6,23 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Core / C ABI**: packed variable-length-array column transfer via
+  `vlaColumnLayout`/`readVlaColumnInto`/`writeVlaColumn` and the additive
+  `zf_read_col_vla_layout`, `zf_read_col_vla_packed`, and `zf_write_col_vla_packed`
+  exports. A row range is measured once and moved through one flat scalar buffer, including
+  P/Q descriptors, empty cells, scaling, and interleaved complex values.
+
+### Changed
+- **Python / TypeScript**: VLA columns now use packed core transfers instead of one descriptor
+  read, allocation, and ABI call per row. Cell arrays are zero-copy views over one binding-owned
+  flat buffer; TypeScript bounds host/Wasm staging by row ranges and rejects sizes that cannot be
+  represented by wasm32.
+- **Core**: `HeapManager.initForTable` reconstructs the live high-water mark of a populated heap
+  and rejects aliased/overlapping extents before writes. Packed rewrites release their complete
+  target range before reallocating, preventing reopened multi-column heaps from recycling bytes
+  that are still live.
+
 ### Fixed
 - **Python & TypeScript**: duplicate effective table-column names now fail loud with
   `FitsTableError` (status 219) at every name-keyed high-level boundary instead of allowing

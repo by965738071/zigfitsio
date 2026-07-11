@@ -1,5 +1,5 @@
 /**
- * The 86 `zf_*` prototypes, mirroring `bindings/c/zigfitsio.h` (and the
+ * The 89 `zf_*` prototypes, mirroring `bindings/c/zigfitsio.h` (and the
  * Python `lowlevel.py` `_PROTOS` table) exactly, in header order.
  *
  * ctypes → neutral mapping: handle args → "handle"; every out-scalar /
@@ -95,6 +95,9 @@ export const PROTOS: readonly Proto[] = [
   p("zf_read_descript", "int", "handle", "int", "i64", "buf", "buf"),
   p("zf_read_col_vla", "int", "handle", "int", "int", "i64", "i64", "buf", "buf"),
   p("zf_write_col_vla", "int", "handle", "int", "int", "i64", "buf", "i64"),
+  p("zf_read_col_vla_layout", "int", "handle", "int", "i64", "i64", "buf", "usize", "buf"),
+  p("zf_read_col_vla_packed", "int", "handle", "int", "int", "i64", "i64", "buf", "u64"),
+  p("zf_write_col_vla_packed", "int", "handle", "int", "int", "i64", "i64", "buf", "usize", "buf", "u64"),
   // ── integrity ──
   p("zf_write_chksum", "int", "handle"),
   p("zf_update_chksum_all", "int", "handle"),

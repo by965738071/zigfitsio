@@ -187,15 +187,52 @@ def test_unsigned_column_write_round_trips(dtype, tform, vals):
 
 
 # ── #7 / #23 VLA columns: element type honored on read, writable on write ─────────────────────
-def test_vla_int32_write_and_read():
+@pytest.mark.parametrize("tform", ["1PJ", "1QJ"])
+def test_vla_int32_write_and_read(tform):
     vla = np.empty(3, dtype=object)
     vla[0] = np.array([1, 2, 3], dtype="i4")
     vla[1] = np.array([4], dtype="i4")
     vla[2] = np.array([], dtype="i4")
-    src = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("V", "1PJ", array=vla)])]).to_bytes()
+    src = zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("V", tform, array=vla)])]).to_bytes()
     got = zf.from_bytes(src)[1].data["V"]
     assert got[0].dtype == np.dtype("i4")
     assert np.array_equal(got[0], [1, 2, 3]) and np.array_equal(got[1], [4]) and got[2].size == 0
+
+
+def test_vla_packed_views_survive_close_and_mutation_reserializes():
+    vla = np.empty(4, dtype=object)
+    vla[:] = [np.array([1, 2], dtype="i4"), np.array([], dtype="i4"),
+              np.array([3], dtype="i4"), np.array([4, 5, 6], dtype="i4")]
+    src = zf.HDUList([
+        zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("V", "1PJ", array=vla)])
+    ]).to_bytes()
+    hl = zf.from_bytes(src)
+    col = hl[1].data["V"]
+    first = col[0]
+    # The packed representation is one flat allocation sliced into disjoint cell views.
+    assert col[0].base is col[2].base is col[3].base
+    assert not np.shares_memory(col[0], col[2])
+    first[0] = 99
+    rewritten = hl.to_bytes()
+    hl.close()
+    assert np.array_equal(first, [99, 2])  # numpy owns the flat buffer, not the native handle
+    chk = zf.from_bytes(rewritten)
+    try:
+        assert np.array_equal(chk[1].data["V"][0], [99, 2])
+    finally:
+        chk.close()
+
+
+def test_vla_all_empty_column_round_trips():
+    vla = np.empty(5, dtype=object)
+    for i in range(vla.size):
+        vla[i] = np.array([], dtype="i4")
+    src = zf.HDUList([
+        zf.PrimaryHDU(), zf.BinTableHDU.from_columns([zf.Column("V", "1PJ", array=vla)])
+    ]).to_bytes()
+    with zf.from_bytes(src) as hl:
+        got = hl[1].data["V"]
+        assert len(got) == 5 and all(cell.dtype == np.dtype("i4") and cell.size == 0 for cell in got)
 
 
 # ── #8 numpy scalar keywords; #13 out-of-range int ───────────────────────────────────────────
