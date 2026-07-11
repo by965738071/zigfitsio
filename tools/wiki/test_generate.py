@@ -19,7 +19,7 @@ from generate import (
 )
 
 
-TAG = "v0.1.4"
+TAG = "v0.1.5"
 SHA = "a" * 40
 REPOSITORY = "owner/repo"
 
@@ -27,7 +27,7 @@ REPOSITORY = "owner/repo"
 class GenerateWikiTests(unittest.TestCase):
     def test_all_project_versions_agree(self) -> None:
         versions = _read_versions()
-        self.assertEqual(set(versions.values()), {"0.1.4"})
+        self.assertEqual(set(versions.values()), {"0.1.5"})
 
     def test_c_header_has_ordered_neutral_abi(self) -> None:
         prototypes = _header_zf_prototypes()
@@ -68,7 +68,7 @@ class GenerateWikiTests(unittest.TestCase):
                 "TypeScript-API-Low-Level-Prototypes.md",
             ):
                 (output / name).write_text(f"# {name}\n", encoding="utf-8")
-            _common_pages(output, "0.1.4", TAG, SHA, REPOSITORY)
+            _common_pages(output, "0.1.5", TAG, SHA, REPOSITORY)
             _stamp_pages(output, TAG, SHA, REPOSITORY)
             pages = _validate_pages(output, TAG, SHA)
             self.assertEqual(len(pages), 10)
@@ -85,7 +85,7 @@ class GenerateWikiTests(unittest.TestCase):
                 "TypeScript-API-Low-Level-Prototypes.md",
             ):
                 (output / name).write_text(f"# {name}\n", encoding="utf-8")
-            _common_pages(output, "0.1.4", TAG, SHA, REPOSITORY)
+            _common_pages(output, "0.1.5", TAG, SHA, REPOSITORY)
             with (output / "Home.md").open("a", encoding="utf-8") as handle:
                 handle.write("\n[missing](Does-Not-Exist.md)\n")
             _stamp_pages(output, TAG, SHA, REPOSITORY)
@@ -104,7 +104,7 @@ class GenerateWikiTests(unittest.TestCase):
                 "TypeScript-API-Low-Level-Prototypes.md",
             ):
                 (output / name).write_text(f"# {name}\n", encoding="utf-8")
-            _common_pages(output, "0.1.4", TAG, SHA, REPOSITORY)
+            _common_pages(output, "0.1.5", TAG, SHA, REPOSITORY)
             with (output / "Home.md").open("a", encoding="utf-8") as handle:
                 handle.write("\n[broken](Python-API.md#not-a-real-heading)\n")
             _stamp_pages(output, TAG, SHA, REPOSITORY)

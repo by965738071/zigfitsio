@@ -1037,7 +1037,7 @@ def _parser() -> argparse.ArgumentParser:
         help="directory containing zigfitsio/__init__.py",
     )
     parser.add_argument("--out", type=Path, required=True, help="clean Wiki staging directory")
-    parser.add_argument("--tag", required=True, help="release tag, for example v0.1.4")
+    parser.add_argument("--tag", required=True, help="release tag, for example v0.1.5")
     parser.add_argument("--sha", required=True, help="full source commit SHA")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help="GitHub repository URL")
     parser.add_argument("--repo-root", type=Path, default=repo_root, help="repository root")

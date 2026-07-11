@@ -19,10 +19,10 @@ import {
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PROTOS_SOURCE = path.join(REPO_ROOT, "bindings", "typescript", "src", "lowlevel", "protos.ts");
 const METADATA = {
-  tag: "v0.1.4",
+  tag: "v0.1.5",
   sha: "0123456789abcdef0123456789abcdef01234567",
   repository: "anhydrous99/zigfitsio",
-  packageVersion: "0.1.4",
+  packageVersion: "0.1.5",
 };
 const TOOLCHAIN = {
   typedoc: "0.28.20",
@@ -149,7 +149,7 @@ test("normalizes a miniature two-entrypoint project and validates symbol/prototy
       normalized.manifest.symbols.typedoc.find((symbol) => symbol.qualifiedName === "index.Box.value")?.page,
       "TypeScript-API-High-Level.Class.Box.md",
     );
-    assert.match(normalized.pages.get(TYPESCRIPT_ENTRY_PAGE), /v0\.1\.4/);
+    assert.match(normalized.pages.get(TYPESCRIPT_ENTRY_PAGE), /v0\.1\.5/);
     assert.match(normalized.pages.get(TYPESCRIPT_PROTOS_PAGE), /lib\.zf_close\(arg0: bigint \| number \| null\): undefined/);
 
     await writeFile(

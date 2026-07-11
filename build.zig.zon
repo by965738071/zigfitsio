@@ -1,6 +1,6 @@
 .{
     .name = .zigfitsio,
-    .version = "0.1.4",
+    .version = "0.1.5",
     .minimum_zig_version = "0.16.0",
     // .fingerprint is REQUIRED but MUST be the value `zig build` prints on first run — its
     // low 32 bits checksum `.name`, so a hand-picked literal is rejected (and 0x0 is reserved).

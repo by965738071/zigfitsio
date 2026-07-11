@@ -6,6 +6,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.5] - 2026-07-11
+
 ### Added
 - **Documentation / Releases**: release-pinned Zig, Python, and TypeScript API references
   are now published to a managed GitHub Wiki and attached to each GitHub Release as a
