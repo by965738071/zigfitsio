@@ -31,9 +31,10 @@
 //!     type receives NaN; an integer output type (which has no representable null) passes the raw
 //!     `ZBLANK` value through unchanged. On the dithered-float path a declared `ZBLANK` overrides
 //!     the convention's reserved `null_value` sentinel (§10.2.1).
-//!   * The write path records `RICE_1`'s `BLOCKSIZE` (default 32) and `BYTEPIX` (= |ZBITPIX|/8) and
-//!     `HCOMPRESS_1`'s `SCALE` (= 0, lossless) as `ZNAMEn`/`ZVALn` pairs; the RICE read path derives
-//!     `BYTEPIX` from `ZBITPIX` and `SCALE` is carried in the HCOMPRESS stream header.
+//!   * The write path records `RICE_1`'s `BLOCKSIZE` (default 32) and stored-value `BYTEPIX`
+//!     (= 4 for quantized floats, otherwise |ZBITPIX|/8), and `HCOMPRESS_1`'s `SCALE` (= 0,
+//!     lossless) as `ZNAMEn`/`ZVALn` pairs. The RICE read path derives that stored width from the
+//!     logical decode path, while `SCALE` is carried in the HCOMPRESS stream header.
 const std = @import("std");
 const builtin = @import("builtin");
 const errors = @import("../errors.zig");
@@ -685,8 +686,8 @@ pub const TiledImage = struct {
 
     // Dispatch the `COMPRESSED_DATA` cell bytes to the codec named by `ZCMPTYPE`, returning the
     // tile's stored values as **big-endian** width-`w` bytes (the form the placement loop reads).
-    // RICE_1 takes `BLOCKSIZE`/`BYTEPIX` from the `ZNAMEn`/`ZVALn` parameters; HCOMPRESS_1 needs
-    // the 2-D tile dims (`tdim[0]` fastest = columns, `tdim[1]` = rows).
+    // RICE_1 takes `BLOCKSIZE` from the `ZNAMEn`/`ZVALn` parameters and its stored-value width
+    // from `w`; HCOMPRESS_1 needs the 2-D tile dims (`tdim[0]` fastest = columns, `tdim[1]` = rows).
     fn decodeCompressed(self: *TiledImage, alloc: Allocator, cbytes: []const u8, w: usize, npix_tile: u64, tdim: []const u64, cap: u64) ReadError![]u8 {
         switch (self.ztype) {
             .gzip_1 => return gzip.gzipDecode(alloc, cbytes, cap),
@@ -1514,7 +1515,10 @@ fn buildCompressedHeader(alloc: Allocator, spec: CompressSpec, codec_name: []con
             try h.appendValue(alloc, "ZNAME1", .{ .string = "BLOCKSIZE" }, null);
             try h.appendValue(alloc, "ZVAL1", .{ .int = @intCast(default_rice_blocksize) }, null);
             try h.appendValue(alloc, "ZNAME2", .{ .string = "BYTEPIX" }, null);
-            try h.appendValue(alloc, "ZVAL2", .{ .int = @intCast(w) }, null);
+            // Quantized floating-point tiles are stored as 32-bit integers regardless of the
+            // logical ZBITPIX width. BYTEPIX describes those stored RICE elements, not the
+            // uncompressed floating-point pixels.
+            try h.appendValue(alloc, "ZVAL2", .{ .int = if (do_quantize) 4 else @intCast(w) }, null);
         },
         .hcompress_1 => {
             // ZVAL1 records the float scale REQUEST (CFITSIO `request_hcomp_scale`, ffpkye) —
@@ -3483,6 +3487,11 @@ test "writeCompressed quantized f64: dequantization keeps full double precision 
         .zdither0 = 1,
         .quantize_level = -0.25, // absolute step ⇒ deterministic |err| ≤ 0.125 bound
     }, &src);
+
+    const bytepix_name = try hdu.header.getString(alloc, "ZNAME2");
+    defer alloc.free(bytepix_name);
+    try testing.expectEqualStrings("BYTEPIX", std.mem.trim(u8, bytepix_name, " "));
+    try testing.expectEqual(@as(i64, 4), try hdu.header.getValue(i64, "ZVAL2"));
 
     var ti = try TiledImage.of(&fx.f, hdu);
     defer ti.deinit(alloc);

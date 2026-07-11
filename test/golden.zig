@@ -313,6 +313,7 @@ fn expectQuantizedTileF64(alloc: Allocator, fz_rel: []const u8, expected_rel: []
     defer alloc.free(zq);
     try testing.expectEqualStrings(quantiz, std.mem.trim(u8, zq, " "));
     try testing.expectEqual(@as(i64, -64), try hdu.header.getValue(i64, "ZBITPIX"));
+    try testing.expectEqual(@as(i64, 4), try hdu.header.getValue(i64, "ZVAL2"));
     var ti = try fits.TiledImage.of(&f, hdu);
     defer ti.deinit(alloc);
     try testing.expectEqual(@as(u64, npix), ti.elementCount());

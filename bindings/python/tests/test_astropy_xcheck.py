@@ -173,6 +173,36 @@ def test_astropy_decodes_zigfitsio_rice(tmp_fits):
         t.close()
 
 
+def test_astropy_decodes_zigfitsio_quantized_f64_rice(tmp_fits):
+    """RICE BYTEPIX describes the stored i32 codes, not the logical f64 pixels."""
+    y, x = np.mgrid[0:32, 0:32]
+    rng = np.random.default_rng(12345)
+    field = (1000.0 + 0.1 * y + 0.03 * x + rng.normal(0.0, 1.0, (32, 32))).astype("f8")
+    p = tmp_fits("rice_quantized_f64.fits")
+    zf.HDUList([
+        zf.PrimaryHDU(),
+        zf.CompImageHDU(
+            field,
+            compression="RICE_1",
+            quantize="SUBTRACTIVE_DITHER_1",
+            quantize_level=-0.25,
+        ),
+    ]).writeto(p, overwrite=True)
+
+    # Inspect the physical compressed-table header before Astropy presents its logical image view.
+    with afits.open(p, disable_image_compression=True) as raw:
+        assert int(raw[1].header["ZBITPIX"]) == -64
+        assert str(raw[1].header["ZNAME2"]).strip() == "BYTEPIX"
+        assert int(raw[1].header["ZVAL2"]) == 4
+
+    with afits.open(p) as hdul:
+        out = hdul[1].data
+        assert out.dtype == np.dtype("f8")
+        assert np.isfinite(out).all()
+        # Absolute step 0.25 gives a half-step reconstruction bound, plus f64 arithmetic slack.
+        np.testing.assert_allclose(out, field, rtol=0.0, atol=0.125 + 1e-9)
+
+
 @pytest.mark.parametrize(
     "value",
     [
