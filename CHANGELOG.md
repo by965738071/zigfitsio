@@ -7,6 +7,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Documentation / Releases**: release-pinned Zig, Python, and TypeScript API references
+  are now published to a managed GitHub Wiki and attached to each GitHub Release as a
+  reproducible archive. Release gates verify public API coverage and exact C/Python/TypeScript
+  ABI parity before package publication. (#53)
 - **Core / C ABI**: packed variable-length-array column transfer via
   `vlaColumnLayout`/`readVlaColumnInto`/`writeVlaColumn` and the additive
   `zf_read_col_vla_layout`, `zf_read_col_vla_packed`, and `zf_write_col_vla_packed`
@@ -24,6 +28,10 @@ All notable changes to `zigfitsio` are documented here. The format follows
   that are still live.
 
 ### Fixed
+- **Core**: quantized `BITPIX = -64` `RICE_1` writes now record `BYTEPIX = 4`, matching
+  the stored 32-bit integer stream, instead of deriving `8` from the logical image width.
+  Astropy honored the incorrect card and silently decoded affected files as zero/garbage data;
+  core, CFITSIO-golden, and astropy pixel-value regressions now pin the interoperable header. (#55)
 - **Core / C ABI**: ASCII-table `writeCell`, `writeColumn`, and `writeCellStr` now reject
   logically read-only handles with `NotWritable` / `READONLY_FILE` before touching writable
   in-memory backing storage, including buffers opened directly or inflated from gzip.
