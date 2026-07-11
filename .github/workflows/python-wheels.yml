@@ -13,7 +13,7 @@ name: Python wheels & release
 
 on:
   push:
-    branches: [main]
+    branches: [zig-0.17-dev]
     tags: ["v*"]
   pull_request:
     paths:

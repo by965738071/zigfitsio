@@ -7,7 +7,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [zig-0.17-dev]
   pull_request:
   schedule:
     # Weekly, unconditional run of the `interop` job (bypassing its path filter below) so
