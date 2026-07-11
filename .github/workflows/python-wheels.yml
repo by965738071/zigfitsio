@@ -23,7 +23,9 @@ on:
       - "build.zig.zon"
       - "pyproject.toml"
       - "hatch_build.py"
+      - "tools/wiki/**"
       - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/publish-wiki.yml"
   workflow_dispatch:
     inputs:
       publish_testpypi:
@@ -52,8 +54,8 @@ jobs:
     name: version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Versions agree across build.zig.zon / src/version.zig / pyproject.toml
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Versions agree across build.zig.zon / src/version.zig / pyproject.toml / package.json
         run: |
           set -euo pipefail
           zon="$(grep -Eo '\.version = "[^"]+"' build.zig.zon | cut -d'"' -f2)"
@@ -62,9 +64,10 @@ jobs:
           # keeps the script runnable locally on older interpreters.
           py="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' 2>/dev/null ||
             grep -Eo '^version *= *"[^"]+"' pyproject.toml | head -n1 | cut -d'"' -f2)"
-          echo "build.zig.zon=$zon  src/version.zig=$zig  pyproject.toml=$py"
-          if [ "$zon" != "$zig" ] || [ "$zon" != "$py" ]; then
-            echo "::error::version mismatch: build.zig.zon=$zon src/version.zig=$zig pyproject.toml=$py"
+          ts="$(grep -Eo '"version": *"[^"]+"' bindings/typescript/package.json | head -n1 | cut -d'"' -f4)"
+          echo "build.zig.zon=$zon  src/version.zig=$zig  pyproject.toml=$py  package.json=$ts"
+          if [ "$zon" != "$zig" ] || [ "$zon" != "$py" ] || [ "$zon" != "$ts" ]; then
+            echo "::error::version mismatch: build.zig.zon=$zon src/version.zig=$zig pyproject.toml=$py package.json=$ts"
             exit 1
           fi
           if ! grep -qF "expectEqualStrings(\"$zon\"" src/version.zig; then
@@ -83,6 +86,56 @@ jobs:
             fi
           fi
 
+  api-docs:
+    name: generated API Wiki bundle
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bindings/typescript/package-lock.json
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Test Wiki generators and publication guards
+        run: |
+          python3 -m unittest discover -s tools/wiki -p 'test_*.py' -v
+          python3 -m pip install pytest==8.3.5
+          python3 -m pytest tools/wiki/tests -q
+          npm run test:docs --prefix bindings/typescript
+          zig build wiki-zig-test
+      - name: Generate twice and validate deterministic public API references
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag="v${version}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag="$GITHUB_REF_NAME"; fi
+          python3 tools/wiki/generate.py \
+            --out "$RUNNER_TEMP/wiki" --tag "$tag" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+          python3 tools/wiki/generate.py \
+            --out "$RUNNER_TEMP/wiki-check" --tag "$tag" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+          diff -ru "$RUNNER_TEMP/wiki" "$RUNNER_TEMP/wiki-check"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-wiki-preview-${{ github.sha }}
+          path: ${{ runner.temp }}/wiki
+          if-no-files-found: error
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 90
+
   # Tag pushes do not trigger ci.yml (its full matrix already ran on the same commit's main
   # push); this single cell gates publishing on the core Zig suite.
   zig-test:
@@ -90,8 +143,8 @@ jobs:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
@@ -113,16 +166,27 @@ jobs:
             windows-latest,
           ]
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
+      # PRs build a single CPython per OS (cp312, matching the smoke job) — the bindings are
+      # pure ctypes so the per-interpreter wheels differ only in tag, and this lane is the only
+      # ReleaseFast coverage in CI, so at least one wheel build+test per OS must stay. Main
+      # pushes, tags, and dispatch runs skip this step, leaving CIBW_BUILD unset so the full
+      # [tool.cibuildwheel].build matrix from pyproject.toml applies (env vars override the
+      # config file only when defined). Do NOT refactor to an always-set env var with an empty
+      # else-arm: cibuildwheel treats CIBW_BUILD="" as "*" (build everything).
+      - name: Restrict PR builds to CPython 3.12
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo 'CIBW_BUILD=cp312-*' >> "$GITHUB_ENV"
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21.3
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
         env:
           # Forward the pin to install_zig.sh inside the manylinux container.
           CIBW_ENVIRONMENT_PASS_LINUX: ZIG_VERSION
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
@@ -134,13 +198,13 @@ jobs:
     name: sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Build sdist
         run: pipx run build --sdist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -152,11 +216,11 @@ jobs:
     name: smoke test (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - run: zig build capi
@@ -173,7 +237,7 @@ jobs:
   publish-testpypi:
     name: publish to TestPyPI (rehearsal)
     if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
-    needs: [version-check, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -181,12 +245,17 @@ jobs:
     permissions:
       id-token: write # OIDC trusted publishing; no API token anywhere
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: wheels-*
           path: dist
-          merge-multiple: true # flatten wheels-* + sdist into dist/
+          merge-multiple: true # flatten wheels-* into dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
       - run: ls -l dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
           # TestPyPI files are immutable too; re-running the rehearsal for an
@@ -197,7 +266,7 @@ jobs:
     name: publish to PyPI
     # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version-check, zig-test, wheels, sdist, smoke]
+    needs: [version-check, api-docs, zig-test, wheels, sdist, smoke]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -205,13 +274,18 @@ jobs:
     permissions:
       id-token: write # OIDC trusted publishing; no API token anywhere
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: wheels-*
           path: dist
-          merge-multiple: true # flatten wheels-* + sdist into dist/
+          merge-multiple: true # flatten wheels-* into dist/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
       - run: ls -l dist/
       # No skip-existing: a duplicate upload to PyPI should fail loudly.
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
 
   github-release:
     name: GitHub release
@@ -221,11 +295,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdist
+          path: dist
       - name: Extract the CHANGELOG section for ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -240,7 +319,7 @@ jobs:
             echo "::error::extracted CHANGELOG section for $ver is empty"
             exit 1
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true # appended after the CHANGELOG excerpt

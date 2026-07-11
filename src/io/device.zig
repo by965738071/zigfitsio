@@ -15,6 +15,7 @@ pub const Device = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// Backend operations used by the type-erased random-access device handle.
     pub const VTable = struct {
         /// Read up to `buf.len` bytes at `offset`; returns the count read (0 ⇒ end).
         pread: *const fn (ctx: *anyopaque, buf: []u8, offset: u64) IoError!usize,

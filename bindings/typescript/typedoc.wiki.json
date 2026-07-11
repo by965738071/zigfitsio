@@ -1,0 +1,20 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts", "src/lowlevel/index.ts"],
+  "entryPointStrategy": "resolve",
+  "tsconfig": "tsconfig.json",
+  "plugin": ["typedoc-plugin-markdown", "typedoc-github-wiki-theme"],
+  "readme": "none",
+  "entryFileName": "TypeScript-API.md",
+  "sidebar": {
+    "autoConfiguration": false
+  },
+  "excludeInternal": true,
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "githubPages": false,
+  "sort": ["source-order"],
+  "validation": {
+    "notExported": false
+  }
+}

@@ -1,0 +1,13 @@
+{
+  // Type-checks the public API + the TS-native surface tests (which carry
+  // compile-time type assertions). Scoped to the new, fully-typed test file
+  // and its helpers; the legacy runtime tests are transpiled by bun/vitest
+  // without type-checking and are intentionally out of scope here.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src", "tests/ts-api.test.ts", "tests/_fixtures.ts", "tests/_harness/index.ts"]
+}

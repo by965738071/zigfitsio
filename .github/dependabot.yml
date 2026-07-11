@@ -1,0 +1,28 @@
+# Keeps the SHA-pinned actions in .github/workflows fresh (Dependabot updates the pinned
+# commit and its version comment together) and watches the Python dependency surfaces.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # codeql-action/init and .../analyze are separate "dependencies" to Dependabot but
+      # MUST move in lockstep — a v3 init writes a config a v4 analyze rejects ("Loaded a
+      # configuration file for version '3.x', but running version '4.x'"). Group them so
+      # every bump updates both paths in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+  - package-ecosystem: pip
+    directory: / # pyproject.toml (bindings runtime dep: numpy)
+    schedule:
+      interval: monthly
+  - package-ecosystem: npm
+    directory: /bindings/typescript # koffi runtime dep + TS/vitest dev deps
+    schedule:
+      interval: monthly
+  - package-ecosystem: pip
+    directory: /interop # CI-only interop lane (astropy/numpy caps)
+    schedule:
+      interval: monthly

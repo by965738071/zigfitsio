@@ -10,6 +10,7 @@ Data is exchanged as native-endian NumPy arrays; image arrays use C-order with r
 from __future__ import annotations
 
 import ctypes as c
+import math
 import os
 from typing import Any, Sequence
 
@@ -17,7 +18,7 @@ import numpy as np
 
 from . import _dtypes as dt
 from . import lowlevel as ll
-from .header import Header, parse_cards
+from .header import Header, _wrap_commentary, parse_cards
 
 _VOID = c.c_void_p
 
@@ -72,6 +73,84 @@ def _ascii_tform_of(info) -> str:
     if code in (ll.ZF_FLOAT32, ll.ZF_FLOAT64):
         return f"E{w}.{max(w - 7, 1)}"  # leave room for sign, decimal point, and E±dd exponent
     return f"I{w}"  # integer column of any width
+
+
+# numpy element dtype -> binary-table TFORM letter (the inverse of dtypes._TFORM_BIN). Unsigned
+# integers map to the signed letter of matching width; _write_to re-applies the TZEROn convention
+# (see _unsigned_col_tzero) so the column still round-trips as unsigned. Note the intentional
+# asymmetry: bool -> 'L' but u1 -> 'B'. A logical/bit column reads back as u1, so its synthesized
+# letter is 'B'; _tform_interchangeable keeps the file column's own 'L'/'X' on reconstruction.
+_DTYPE_TO_TFORM = {
+    np.dtype("bool"): "L",
+    np.dtype("u1"): "B", np.dtype("i1"): "B",
+    np.dtype("i2"): "I", np.dtype("u2"): "I",
+    np.dtype("i4"): "J", np.dtype("u4"): "J",
+    np.dtype("i8"): "K", np.dtype("u8"): "K",
+    np.dtype("f4"): "E", np.dtype("f8"): "D",
+    np.dtype("c8"): "C", np.dtype("c16"): "M",
+}
+
+
+def _tform_from_dtype(field_dtype) -> str:
+    """Synthesize a binary-table TFORM from a numpy structured-field dtype (the inverse of
+    :func:`_dtypes.bin_elem_dtype`). Handles subarray repeat counts, fixed-width strings, complex,
+    bool, and the unsigned-integer convention. Used to format a field that has no matching file
+    column (a reassigned recarray that added or retyped a column) so its values are never truncated
+    to a stale TFORM."""
+    base = field_dtype
+    repeat = 1
+    if field_dtype.subdtype is not None:  # e.g. ('f4', (3,)) -> a length-3 vector column
+        base, shape = field_dtype.subdtype
+        repeat = int(np.prod(shape)) if shape else 1
+    base = base.newbyteorder("=")
+    if base.kind in ("S", "U"):  # fixed-width text -> character column 'wA'
+        width = base.itemsize // 4 if base.kind == "U" else base.itemsize
+        return f"{max(int(width), 1) * repeat}A"
+    letter = _DTYPE_TO_TFORM.get(base)
+    if letter is None:
+        raise ll.FitsTypeError(410, f"cannot synthesize a table TFORM for numpy dtype {field_dtype!r}")
+    return f"{repeat}{letter}"
+
+
+def _tform_repeat_letter(fmt: str):
+    """(repeat, uppercase type letter) for a scalar/vector binary TFORM like '1J' or '8A'."""
+    s = fmt.strip().upper()
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    return int(s[:i] or "1"), s[i:i + 1]
+
+
+def _tform_interchangeable(have: str, synth: str) -> bool:
+    """True when a file column's stored TFORM ``have`` still faithfully represents a field whose
+    numpy dtype synthesizes to ``synth`` — same repeat and same element dtype. Distinct letters that
+    decode to the same element dtype (L/X/B all read as u1) are interchangeable, so a logical or bit
+    column keeps its own 'L'/'X' letter instead of being flattened to the generic 'B'. Strings ('A',
+    whose width lives in the repeat) only match letter-for-letter."""
+    rh, lh = _tform_repeat_letter(have)
+    rs, ls = _tform_repeat_letter(synth)
+    if rh != rs:
+        return False
+    if lh == ls:
+        return True
+    if "A" in (lh, ls):
+        return False
+    return dt.bin_elem_dtype(ord(lh)) == dt.bin_elem_dtype(ord(ls))
+
+
+def _binary_tform_for(info, field) -> str:
+    """Choose a binary-table TFORM for a recarray field on write-back/copy. Reuse the same-named
+    file column's stored TFORM when it still describes the field — the only way to reproduce VLA,
+    unsigned, scaled, logical/bit, or exact-width string columns — otherwise synthesize one from the
+    numpy dtype so a new or retyped field is never written under a stale (truncating) format.
+    ``info`` is the matching file column (or None when the field has no counterpart)."""
+    if info is not None and (info.is_vla or field == np.dtype(object)):
+        return _tform_of(info)  # object/VLA: only the file descriptor can describe it
+    synth = _tform_from_dtype(field)
+    if info is None:
+        return synth  # added/renamed field with no file counterpart
+    have = _tform_of(info)  # a scaled column raises here (unreconstructable) — preserved as today
+    return have if _tform_interchangeable(have, synth) else synth
 
 
 def _vla_elem_dtype(fmt: str):
@@ -141,7 +220,7 @@ def _fits_value_literal(value) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        return repr(value)
+        return repr(value).replace("e", "E")  # FITS exponents are uppercase (§4.2.4)
     return "'" + str(value).replace("'", "''") + "'"
 
 
@@ -151,12 +230,73 @@ def _commentary_card(kw: str, value) -> bytes:
     return (kw.upper().ljust(8) + text)[:80].ljust(80).encode("ascii", "replace")
 
 
-def _hierarch_card(kw: str, value, comment) -> bytes:
-    """A best-effort 80-byte HIERARCH card: ``HIERARCH tokens = value [/ comment]``."""
-    body = "HIERARCH " + kw.strip() + " = " + _fits_value_literal(value)
-    if comment:
-        body += " / " + comment
-    return body[:80].ljust(80).encode("ascii", "replace")
+def _pair_safe_take(esc: str, want: int) -> int:
+    """Largest cut ≤ ``want`` that does not split a ``''`` escape pair.
+
+    ``esc`` always starts on a pair boundary (callers only advance by pair-safe takes), so a
+    left-to-right walk decides pair membership unambiguously; a cut that would land between the
+    two quotes of a pair backs off one column.
+    """
+    j = 0
+    while j < want:
+        if esc[j] == "'":
+            if j + 1 == want:
+                return want - 1
+            j += 2
+        else:
+            j += 1
+    return want
+
+
+def _hierarch_cards(kw: str, value, comment) -> "list[bytes]":
+    """The 80-byte card run for a HIERARCH keyword: one card when it fits, else HIERARCH+CONTINUE.
+
+    Long string values are continued across CONTINUE cards in astropy's layout: the base fragment
+    fills to column 80 with the ``&`` sentinel inside the quotes, continuations carry the value
+    from column 11, and the comment rides the last fragment or a dedicated
+    ``CONTINUE  '' / comment`` card. The escaped text is chunked so a ``''`` escape pair is never
+    split across cards. A non-string value never continues (the convention applies to strings
+    only, FITS 4.0 §4.2.1.2): its comment may be truncated, but a value that cannot fit raises
+    ValueError instead of being silently cut (the old single-card builder truncated at 80 bytes).
+    """
+    tokens = kw.strip()
+    if tokens[:9].upper() == "HIERARCH ":  # never double the prefix
+        tokens = tokens[9:].lstrip()
+    prefix = "HIERARCH " + tokens + " = "
+    lit = _fits_value_literal(value)
+    body = prefix + lit + ((" / " + comment) if comment else "")
+    if len(body) <= 80:  # fast path: bytes identical to the single-card form
+        return [body.ljust(80).encode("ascii", "replace")]
+    is_string = not isinstance(value, (bool, int, float)) and value is not None
+    if not is_string:
+        if len(prefix + lit) <= 80:  # keep the value exact; only the comment is cut
+            return [body[:80].ljust(80).encode("ascii", "replace")]
+        raise ValueError(f"HIERARCH card for {tokens!r} does not fit in 80 columns")
+    esc = str(value).replace("'", "''")
+    if not esc:  # empty string value: only the comment overflows — truncate it
+        return [(prefix + "'' / " + comment)[:80].ljust(80).encode("ascii", "replace")]
+    ccost = (3 + len(comment)) if comment else 0
+    cards: "list[str]" = []
+    pos, first, comment_done = 0, True, not comment
+    while pos < len(esc):
+        head = prefix if first else "CONTINUE  "
+        cap = 80 - len(head) - 2  # columns between the quotes (incl. a possible '&')
+        remaining = len(esc) - pos
+        terminal = remaining <= cap - ccost
+        take = remaining if terminal else _pair_safe_take(esc[pos:], min(cap - 1, remaining))
+        if take <= 0:
+            raise ValueError(f"HIERARCH keyword {tokens!r} leaves no room for a value")
+        frag = esc[pos : pos + take]
+        pos += take
+        first = False
+        if terminal:
+            cards.append(head + "'" + frag + "'" + ((" / " + comment) if comment else ""))
+            comment_done = True
+            break
+        cards.append(head + "'" + frag + "&'")
+    if not comment_done:  # astropy's dedicated comment card
+        cards.append(("CONTINUE  '' / " + comment)[:80])
+    return [t.ljust(80).encode("ascii", "replace") for t in cards]
 
 
 def _ptr(arr: np.ndarray) -> _VOID:
@@ -178,14 +318,19 @@ _INT64_MAX = 2**63 - 1
 
 
 def _coerce_kw_value(value: Any) -> Any:
-    """Normalize a header value for the C ABI: numpy scalars → Python scalars, and reject integers
-    that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints)."""
+    """Normalize a header value for the C ABI: numpy scalars → Python scalars, reject integers
+    that would silently wrap the ``c_longlong`` keyword slot (ctypes masks out-of-range ints), and
+    reject non-finite floats — the FITS real grammar has no NaN/Inf spelling, so they would produce
+    cards no reader (including this library) can parse. This guard also covers the HIERARCH paths,
+    which build raw 80-byte cards client-side and bypass the Zig-core rejection."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, np.integer):
         value = int(value)
     if isinstance(value, np.floating):
-        return float(value)
+        value = float(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ll.FitsHeaderError(207, f"non-finite float keyword value {value!r}: FITS headers cannot represent NaN/Inf")
     if isinstance(value, int):  # bool already handled above
         if not (_INT64_MIN <= value <= _INT64_MAX):
             raise ll.FitsOverflowError(412, f"integer keyword value {value} out of signed-64-bit range")
@@ -196,6 +341,27 @@ def _coerce_kw_value(value: Any) -> Any:
 _STRUCTURAL = {
     "SIMPLE", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "XTENSION", "END", "BSCALE", "BZERO",
 }
+
+
+def _blank_defined(header) -> bool:
+    """Whether the HDU declares an integer null sentinel: a ``BLANK`` keyword, or — for a
+    tile-compressed image, whose Python-visible header is the raw BINTABLE one — ``ZBLANK`` as
+    a keyword or a per-tile column. fpack copies the source's ``BLANK`` unrenamed, so the plain
+    spelling also covers most compressed files in the wild."""
+    if header.get("BLANK") is not None:
+        return True
+    if header.get("ZIMAGE"):
+        if header.get("ZBLANK") is not None:
+            return True
+        try:
+            nfields = int(header.get("TFIELDS", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        for i in range(1, nfields + 1):
+            t = header.get(f"TTYPE{i}")
+            if t is not None and str(t).strip().upper() == "ZBLANK":
+                return True
+    return False
 
 
 def _write_bzero(handle, bzero: int) -> None:
@@ -221,9 +387,36 @@ class Column:
         self.array = None if array is None else np.asarray(array)
 
 
+def _validated_table_data(value):
+    """Coerce a table-data assignment to a structured array, or raise. A plain (unstructured)
+    array has no columns to serialize — accepting it used to write an EMPTY table silently."""
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.dtype.names is None:
+        raise TypeError(f"table data must be a structured/record array, got dtype {arr.dtype!r}")
+    return arr
+
+
+def _assert_unique_column_names(names):
+    """Reject names that collapse onto the same high-level lookup key."""
+    seen = set()
+    for i, raw in enumerate(names):
+        name = raw.strip() or f"col{i + 1}"
+        if name in seen:
+            raise ll.FitsTableError(219, f"column name is ambiguous: {name}")
+        seen.add(name)
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # HDU classes
 # ════════════════════════════════════════════════════════════════════════════════════════════
+# "Data never materialized" marker for _HDU._data. Distinct from None, which is an EXPLICIT
+# `hdu.data = None` clear: the lazy getter re-reads only on _UNSET, so a clear is never
+# silently resurrected from the open file.
+_UNSET = object()
+
+
 class _HDU:
     """Base HDU. Either *attached* (from an open file: ``_hdulist`` + ``_index``) or *detached*
     (built in Python with ``_data``/``_header`` for writing)."""
@@ -233,7 +426,7 @@ class _HDU:
     def __init__(self, data=None, header: Header | None = None, name: str | None = None):
         self._hdulist: Any = None
         self._index: int | None = None
-        self._data = data
+        self._data = _UNSET if data is None else data
         self._data_fingerprint = None  # baseline for update-mode data write-back
         self._header: Header | None = header if header is not None else Header()
         self._name = name
@@ -281,20 +474,45 @@ class _HDU:
         if self._writable():
             hdr._persist = self._write_key
             hdr._delete = self._delete_key
+            hdr._resync = self._resync_commentary
         # A read-only header edit is not persisted to the handle; flag it so save reconstructs.
         hdr._dirty_cb = self._mark_dirty
         return hdr
 
     def _write_key(self, key: str, value: Any, comment: str | None):
         up = key.upper()
+        if up in ("COMMENT", "HISTORY", ""):
+            # Commentary cards are appended verbatim (insert-before-END) as raw records, never
+            # written as valued keywords. Callers pre-split long text into ≤72-char chunks.
+            ll.check(ll.lib.zf_write_record(self._select(), _commentary_card(up, value)))
+            return
         if up in _STRUCTURAL or up.startswith("NAXIS"):
             raise ll.FitsHeaderError(207, f"cannot set structural keyword {key!r} on an open header")
         value = _coerce_kw_value(value)
+        key_s = key.strip()
+        if " " in key_s or len(key_s) > 8:
+            # HIERARCH-convention keyword: the fixed-format ABI cannot express it (>8 chars fails
+            # Name.parse; an embedded space would stamp a spec-invalid keyword). Build the cards
+            # FIRST so a bad value cannot delete the old card and then fail; the Zig-side delete
+            # also removes an old CONTINUE run, so replacement never orphans continuations.
+            cards = _hierarch_cards(key_s, value, comment)
+            h = self._select()
+            kb = _enc(key_s)
+            try:
+                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))  # matches HIERARCH names in Zig
+            except ll.KeywordNotFound:
+                pass
+            for card in cards:
+                ll.check(ll.lib.zf_write_record(h, card))  # sequential insert-before-END keeps order
+            return
         h = self._select()
         kb = _enc(key)
         cb = _enc(comment) if comment else None
         cl = len(cb) if cb else 0
-        if isinstance(value, bool):
+        if value is None:
+            # An undefined-value card (blank value field), never the literal string 'None'.
+            ll.check(ll.lib.zf_write_key_undef(h, kb, len(kb), cb, cl))
+        elif isinstance(value, bool):
             ll.check(ll.lib.zf_write_key_log(h, kb, len(kb), 1 if value else 0, cb, cl))
         elif isinstance(value, int):
             ll.check(ll.lib.zf_write_key_lng(h, kb, len(kb), value, cb, cl))
@@ -311,6 +529,25 @@ class _HDU:
         h = self._select()
         kb = _enc(key)
         ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
+
+    def _resync_commentary(self, keyword: str, texts):
+        """Rewrite every commentary card of ``keyword`` in the open handle to ``texts``: delete all
+        by name, then re-append (before END) as raw records. Used for in-place commentary edits,
+        deletions, and list replace-all, where a single append cannot express the new state. Same
+        delete-then-write-records idiom as the HIERARCH replacement path in ``_write_key``. Rewritten
+        cards migrate to the header end (spec-legal); exact placement holds via reconstruction. For
+        the blank keyword this also rewrites blank *separator* cards (they share the empty name), so
+        an in-place edit/delete of blank commentary reorders every blank card — same as astropy."""
+        h = self._select()
+        kb = _enc(keyword)
+        while True:
+            try:
+                ll.check(ll.lib.zf_delete_key(h, kb, len(kb)))
+            except ll.KeywordNotFound:
+                break
+        up = keyword.upper()
+        for t in texts:
+            ll.check(ll.lib.zf_write_record(h, _commentary_card(up, t)))
 
     @property
     def name(self) -> str:
@@ -334,8 +571,15 @@ class ImageHDU(_HDU):
 
     @property
     def data(self):
-        if self._hdulist is not None and self._data is None:
-            self._data = self._read_image()
+        """The lazily loaded image as a native-endian NumPy array, or ``None``."""
+
+        if self._data is _UNSET:
+            if self._hdulist is None:
+                return None
+            arr = self._read_image()
+            if arr is None:
+                return None  # empty (NAXIS=0) HDU: stay unset, a mere read is not a clear
+            self._data = arr
         return self._data
 
     @data.setter
@@ -344,10 +588,14 @@ class ImageHDU(_HDU):
         self._mark_dirty()  # a replaced array is not in the open handle's bytes
 
     def _data_changed(self) -> bool:
-        return self._data is not None and _ndarray_fp(self._data) != self._data_fingerprint
+        if self._data is _UNSET or self._data is None:
+            return False
+        return _ndarray_fp(self._data) != self._data_fingerprint
 
     @property
     def shape(self):
+        """The image array shape, or ``None`` for an empty HDU."""
+
         d = self.data
         return None if d is None else d.shape
 
@@ -364,7 +612,13 @@ class ImageHDU(_HDU):
         bscale = header.get("BSCALE", 1)
         bzero = header.get("BZERO", 0)
         if bscale in (1, 1.0) and bitpix in _UNSIGNED_BZERO and bzero == _UNSIGNED_BZERO[bitpix]:
+            # astropy parity: the unsigned convention wins — BLANK is ignored on this path
+            # (astropy returns the raw unsigned ints too).
             return _UNSIGNED_DTYPE[bitpix]
+        if bitpix > 0 and _blank_defined(header):
+            # BLANK/ZBLANK forces float physical values (blanked pixels read as NaN),
+            # at astropy's widths: float32 for BITPIX 8/16, float64 for 32/64.
+            return np.dtype("f4") if bitpix in (8, 16) else np.dtype("f8")
         if bscale not in (1, 1.0) or bzero not in (0, 0.0):
             return np.dtype("f4") if bitpix == -32 else np.dtype("f8")
         return dt.bitpix_to_dtype(bitpix)
@@ -379,7 +633,15 @@ class ImageHDU(_HDU):
         n = int(arr.size)
         if n:
             h = self._select()
-            ll.check(ll.lib.zf_read_img(h, dt.zf_code(out_dtype), 1, n, None, None, _ptr(arr)))
+            nulref = None
+            if bitpix > 0 and out_dtype.kind == "f" and _blank_defined(self.header):
+                # Stored values equal to BLANK substitute this sentinel BEFORE scaling
+                # (FR-IMG-8), matching astropy/funpack. The tile-compressed path ignores
+                # nulval and NaN-substitutes on its own for float output, so passing it
+                # unconditionally is harmless there.
+                nul = np.array([np.nan], dtype=out_dtype)
+                nulref = _ptr(nul)
+            ll.check(ll.lib.zf_read_img(h, dt.zf_code(out_dtype), 1, n, nulref, None, _ptr(arr)))
         # Baseline in ALL modes so both update-mode write-back and the writeto/to_bytes pristine
         # gate can detect a later edit — including an in-place mutation (`data[:] = x`) that never
         # goes through the data setter and so never sets `_dirty`.
@@ -388,6 +650,8 @@ class ImageHDU(_HDU):
 
     # ── WCS celestial transforms (1-based pixel coords, FITS CRPIX convention) ────────────
     def pix2world(self, x: float, y: float, alt: str = " "):
+        """Convert one-based FITS pixel coordinates to celestial longitude and latitude."""
+
         h = self._select()
         lon = c.c_double()
         lat = c.c_double()
@@ -395,6 +659,8 @@ class ImageHDU(_HDU):
         return lon.value, lat.value
 
     def world2pix(self, lon: float, lat: float, alt: str = " "):
+        """Convert celestial longitude and latitude to one-based FITS pixel coordinates."""
+
         h = self._select()
         px = c.c_double()
         py = c.c_double()
@@ -403,6 +669,11 @@ class ImageHDU(_HDU):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def _write_to(self, handle, primary: bool):
+        # Materialize the header BEFORE creating the destination HDU: a lazy header read
+        # _select()s the source HDU, and when an attached HDU is serialized to its OWN handle
+        # (flush's structural reconcile) that would snap the current HDU back to the source
+        # mid-write, landing the user keys in the source's header instead of the new one.
+        _ = self.header
         data = self.data  # lazily materialize attached pixels so a copied HDU keeps its data
         if data is None:
             ll.check(ll.lib.zf_create_img(handle, 8, 0, None))
@@ -425,7 +696,10 @@ class ImageHDU(_HDU):
         bitpix = dt.dtype_to_bitpix(data.dtype)
         axes = list(reversed(data.shape))  # C-order shape -> FITS axes
         ll.check(ll.lib.zf_create_img(handle, bitpix, len(axes), _carr(axes)))
-        self._apply_user_keys(handle)
+        # A float image cannot carry BLANK (its null is NaN; validate/fitsverify flag the card).
+        # Reached when writing back a BLANK-promoted read — astropy strands the stale card with
+        # a warning; drop it instead so our own output verifies clean.
+        self._apply_user_keys(handle, skip=(lambda up: up == "BLANK") if bitpix < 0 else None)
         n = int(data.size)
         if n:
             ll.check(ll.lib.zf_write_img(handle, dt.zf_code(data.dtype), 1, n, None, None, _ptr(data)))
@@ -435,8 +709,16 @@ class ImageHDU(_HDU):
         data unit in place (same geometry only). Uses the HDU's own BSCALE/BZERO so scaled/unsigned
         images round-trip through the library's inverse scaling."""
         data = self._data
-        if data is None:
+        if data is _UNSET:
             return
+        if data is None:
+            _bitpix, axes = self._img_param()
+            if not axes:
+                return  # already empty on disk; nothing to clear
+            raise NotImplementedError(
+                "clearing image data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
+            )
         fp = _ndarray_fp(data)
         if fp == self._data_fingerprint:
             return
@@ -460,21 +742,33 @@ class ImageHDU(_HDU):
             ll.check(ll.lib.zf_write_img(h, dt.zf_code(native.dtype), 1, n, None, scref, _ptr(native)))
         self._data_fingerprint = fp
 
-    def _apply_user_keys(self, handle):
+    def _apply_user_keys(self, handle, skip=None):
         for kw, value, comment in self.header.cards():
             up = kw.upper()
             if up in _STRUCTURAL or up.startswith("NAXIS"):
+                continue
+            if skip is not None and skip(up):
+                continue
+            # A scanned header's CHECKSUM/DATASUM describe the ORIGINAL bytes; copying them onto
+            # a reconstructed HDU yields cards that no longer verify. Drop them (as astropy strips
+            # them on modification) — correct values are regenerated by zf_write_chksum only when
+            # writeto(checksum=True) is requested. Mirrors the TS _applyUserKeys behavior.
+            if up in ("CHECKSUM", "DATASUM"):
                 continue
             # Commentary and HIERARCH/spaced/>8-char keys can't be written as standard 8-char
             # keywords; reconstruct their 80-byte card and write it verbatim so COMMENT/HISTORY
             # provenance and HIERARCH keywords survive the reconstruction (non-pristine) path.
             if up in ("COMMENT", "HISTORY", ""):
-                ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, value)))
+                # Wrap so a >72-char commentary card (e.g. built via Header._from_cards) spans
+                # multiple records instead of truncating; set-time cards are already ≤72.
+                for chunk in _wrap_commentary(value):
+                    ll.check(ll.lib.zf_write_record(handle, _commentary_card(kw, chunk)))
                 continue
+            value = _coerce_kw_value(value)  # before the HIERARCH branch: numpy scalars normalize too
             if " " in kw or len(kw) > 8:
-                ll.check(ll.lib.zf_write_record(handle, _hierarch_card(kw, value, comment)))
+                for card in _hierarch_cards(kw, value, comment):
+                    ll.check(ll.lib.zf_write_record(handle, card))
                 continue
-            value = _coerce_kw_value(value)
             kb = _enc(kw)
             cb = _enc(comment) if comment else None
             cl = len(cb) if cb else 0
@@ -484,7 +778,10 @@ class ImageHDU(_HDU):
                 ll.check(ll.lib.zf_write_key_lng(handle, kb, len(kb), value, cb, cl))
             elif isinstance(value, float):
                 ll.check(ll.lib.zf_write_key_dbl(handle, kb, len(kb), value, cb, cl))
-            elif value is not None:
+            elif value is None:
+                # Undefined-value card: reconstruct it instead of silently dropping it.
+                ll.check(ll.lib.zf_write_key_undef(handle, kb, len(kb), cb, cl))
+            else:
                 vb = _enc(str(value))
                 if len(vb) <= 68:
                     ll.check(ll.lib.zf_write_key_str(handle, kb, len(kb), vb, len(vb), cb, cl))
@@ -497,6 +794,8 @@ class ImageHDU(_HDU):
 
 
 class PrimaryHDU(ImageHDU):
+    """The primary image HDU at the start of a FITS file."""
+
     _kind_name = "PrimaryHDU"
 
 
@@ -505,11 +804,23 @@ class CompImageHDU(ImageHDU):
 
     _kind_name = "CompImageHDU"
 
-    def __init__(self, data=None, header=None, name=None, compression="RICE_1", tile=None, quantize=None):
+    def __init__(self, data=None, header=None, name=None, compression="RICE_1", tile=None, quantize=None,
+                 quantize_level=None, hcomp_scale=0.0, hcomp_smooth=False):
         super().__init__(data=data, header=header, name=name)
         self._comp = compression
         self._tile = tile
         self._quantize = quantize
+        # CFITSIO quantization level (fits_set_quantize_level / fpack -q semantics) for float
+        # data with a quantizing method ("NO_DITHER"/"SUBTRACTIVE_DITHER_1"/"_2"): > 0 sets the
+        # per-tile step to sigma/level (sigma = MAD background noise), 0 the CFITSIO default
+        # (sigma/4), < 0 the absolute step |level|. None leaves the library default.
+        self._quantize_level = None if quantize_level is None else float(quantize_level)
+        # HCOMPRESS_1 lossy knobs (astropy-compatible names; CFITSIO fits_set_hcomp_scale/
+        # fits_set_hcomp_smooth semantics): scale 0 = lossless, > 0 = noise-adaptive
+        # (per-tile round(scale x background sigma)), < 0 = |scale| absolute; smooth records
+        # the ZNAME2='SMOOTH' decode-side smoothing request.
+        self._hcomp_scale = float(hcomp_scale)
+        self._hcomp_smooth = bool(hcomp_smooth)
 
     def _write_to(self, handle, primary: bool):
         if self.data is None:  # lazily materializes attached data (so a copy keeps its pixels)
@@ -518,6 +829,7 @@ class CompImageHDU(ImageHDU):
         bitpix = dt.dtype_to_bitpix(data.dtype)
         axes = list(reversed(data.shape))
         comp, tile_spec, quant = self._comp, self._tile, self._quantize
+        hscale, hsmooth = self._hcomp_scale, self._hcomp_smooth
         if self._hdulist is not None:
             # A scanned compressed image: reuse its own ZCMPTYPE/ZTILEn/ZQUANTIZ so re-emitting does
             # not silently change the codec (or fail outright for a float image that was GZIP-stored
@@ -532,9 +844,29 @@ class CompImageHDU(ImageHDU):
                 i += 1
             if tiles:
                 tile_spec = tiles  # ZTILEn and axes are both fastest-axis-first
+            # Likewise reuse the recorded HCOMPRESS lossy request (ZNAMEn='SCALE'/'SMOOTH'):
+            # re-emitting a lossy file must not silently recompress it as lossless (or drop the
+            # readers' smoothing request).
+            if comp.strip().upper() == "HCOMPRESS_1":
+                i = 1
+                while hdr.get(f"ZNAME{i}") is not None:
+                    zname = str(hdr.get(f"ZNAME{i}")).strip().upper()
+                    zval = hdr.get(f"ZVAL{i}")
+                    try:  # a nonstandard (e.g. string-valued) ZVALn falls back to the defaults
+                        if zname == "SCALE" and zval is not None:
+                            hscale = float(zval)
+                        elif zname == "SMOOTH" and zval is not None:
+                            hsmooth = bool(int(float(zval)))
+                    except (TypeError, ValueError):
+                        pass
+                    i += 1
         tile = _carr(tile_spec) if tile_spec else None
         q = _enc(quant) if quant else None
-        ll.check(ll.lib.zf_write_compressed(handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1, _ptr(data), int(data.size)))
+        qlevel = self._quantize_level
+        ll.check(ll.lib.zf_write_compressed3(
+            handle, dt.zf_code(data.dtype), bitpix, len(axes), _carr(axes), tile, _enc(comp), q, 1,
+            0.0 if qlevel is None else qlevel, 0 if qlevel is None else 1,
+            hscale, int(hsmooth), _ptr(data), int(data.size)))
         # Preserve EXTNAME (the general image path writes it via _apply_user_keys, which this
         # override does not call because the scanned header carries the compression machinery).
         nm = self.name
@@ -550,9 +882,16 @@ class _TableHDU(_HDU):
     _nrows: int = 0
     _col_fingerprints = None  # per-column baselines for update-mode in-place write-back
 
+    def __init__(self, data=None, header: Header | None = None, name: str | None = None):
+        super().__init__(data=_validated_table_data(data), header=header, name=name)
+
     @property
     def data(self):
-        if self._hdulist is not None and self._data is None:
+        """The lazily loaded table as a NumPy structured array, or ``None``."""
+
+        if self._data is _UNSET:
+            if self._hdulist is None:
+                return None
             self._data = self._read_table()
         return self._data
 
@@ -562,25 +901,46 @@ class _TableHDU(_HDU):
         # `writeto`/`to_bytes` reconstruct from this via _emit_columns; an in-place update-mode
         # flush of a row-count change fails loud (see _flush_data). If the table was never read,
         # there is no per-column baseline, so treat every column as changed on the next flush.
-        self._data = None if value is None else np.asarray(value)
+        self._data = _validated_table_data(value)
         if self._data is not None and self._col_fingerprints is None:
             self._col_fingerprints = {}
         self._mark_dirty()
 
     def _data_changed(self) -> bool:
-        if self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
+        if self._data is _UNSET or self._data is None or self._col_fingerprints is None or self._data.dtype.names is None:
             return False
         return any(_col_fp(self._data[n]) != self._col_fingerprints.get(n) for n in self._data.dtype.names)
 
     def _flush_data(self):
-        """Write back in-place edits to a materialized table's cell values (update mode). Only
-        changed columns are rewritten; changing the row count or editing a VLA/scaled column in
-        place is not supported (use writeto() to a new file, which reconstructs)."""
-        if self._data is None or self._col_fingerprints is None:
+        """Write back in-place edits to a materialized table's cell values (update mode). Changed
+        columns are matched to the file by name (never by position), so a reordered recarray still
+        writes each column to its own cells. Changing the row count or column set, or editing a
+        VLA/scaled column in place, is not supported (use writeto() to a new file, which reconstructs)."""
+        if self._data is _UNSET:
+            return
+        if self._data is None:
+            h0 = self._select()
+            t0 = _VOID()
+            ll.check(ll.lib.zf_table_open(h0, c.byref(t0)))
+            try:
+                nrows0 = c.c_longlong()
+                ll.check(ll.lib.zf_table_nrows(t0, c.byref(nrows0)))
+                ncols0 = c.c_int()
+                ll.check(ll.lib.zf_table_ncols(t0, c.byref(ncols0)))
+                if nrows0.value == 0 and ncols0.value == 0:
+                    return  # already empty on disk; nothing to clear
+            finally:
+                ll.lib.zf_table_close(t0)
+            raise NotImplementedError(
+                "clearing table data cannot be written back to the open file in update mode; "
+                "restore hdu.data or save with writeto() to a new file"
+            )
+        if self._col_fingerprints is None:
             return
         rec = self._data
-        if rec.dtype.names is None:
-            return
+        rec_names = rec.dtype.names
+        if rec_names is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
@@ -588,7 +948,22 @@ class _TableHDU(_HDU):
             nrows_ = c.c_longlong()
             ll.check(ll.lib.zf_table_nrows(t, c.byref(nrows_)))
             nrows = int(nrows_.value)
-            for i, name in enumerate(rec.dtype.names):
+            ncols_ = c.c_int()
+            ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
+            # `or f"col{j+1}"` matches _read_table's synthetic name for a column lacking TTYPE, so a
+            # legal unnamed-column table doesn't trip the column-set guard on a clean no-op close.
+            file_cols = [self._col_name(t, j) or f"col{j + 1}" for j in range(ncols_.value)]
+            _assert_unique_column_names(file_cols)
+            col_index = {nm: j for j, nm in enumerate(file_cols)}
+            # Address file columns by NAME, not by the recarray's positional order (a reassigned
+            # recarray may reorder its columns). A changed column set — renamed/added/dropped — can't
+            # be applied in place without rewriting the file, so fail loud (leaving the file intact)
+            # and steer to writeto(), mirroring the row-count guard below.
+            if len(rec_names) != len(file_cols) or set(rec_names) != set(file_cols):
+                raise NotImplementedError(
+                    "in-place table update cannot change the column set; use writeto() to a new file"
+                )
+            for name in rec_names:
                 new_fp = _col_fp(rec[name])
                 if new_fp == self._col_fingerprints.get(name):
                     continue  # column unchanged
@@ -596,8 +971,9 @@ class _TableHDU(_HDU):
                     raise NotImplementedError(
                         "in-place table update cannot change the row count; use writeto() to a new file"
                     )
+                j = col_index[name]
                 info = ll.ZfColInfo()
-                ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
+                ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
                 if info.is_vla:
                     raise NotImplementedError(
                         "in-place update of a variable-length-array column is not supported; use writeto()"
@@ -607,13 +983,15 @@ class _TableHDU(_HDU):
                         "in-place update of a scaled/unsigned (TSCAL/TZERO) column is not supported; use writeto()"
                     )
                 fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
-                _TableHDU._write_column(t, i, Column(name, fmt, array=rec[name]), nrows)
+                _TableHDU._write_column(t, j, Column(name, fmt, array=rec[name]), nrows)
                 self._col_fingerprints[name] = new_fp
         finally:
             ll.lib.zf_table_close(t)
 
     @property
     def columns(self):
+        """Return the table's column names or detached :class:`Column` specifications."""
+
         return self._read_columns_meta() if self._hdulist is not None else self._columns
 
     def _read_columns_meta(self):
@@ -659,6 +1037,7 @@ class _TableHDU(_HDU):
                 fields.append((name, field_dtype))
                 readers.append(reader)
 
+            _assert_unique_column_names([name for name, _ in fields])
             rec = np.empty(max(nrows, 0), dtype=np.dtype(fields))
             for (name, _), reader in zip(fields, readers):
                 rec[name] = reader()
@@ -699,25 +1078,35 @@ class _TableHDU(_HDU):
                 read_code = dt.zf_code(elem_dtype)
 
             def read_vla():
+                # Measure the whole column once, then transfer every cell into one flat buffer.
+                # Offsets count transfer scalar slots (complex cells use two float slots per
+                # logical element), so they can be used directly as numpy slice boundaries.
+                offsets = np.empty(nrows + 1, dtype=np.uint64)
+                total_ = c.c_uint64()
+                ll.check(ll.lib.zf_read_col_vla_layout(
+                    t, col, 1, nrows,
+                    offsets.ctypes.data_as(c.POINTER(c.c_uint64)), offsets.size,
+                    c.byref(total_),
+                ))
+                total = int(total_.value)
+                transfer_dtype = float_dtype if is_complex else elem_dtype
+                if total > np.iinfo(np.intp).max // max(transfer_dtype.itemsize, 1):
+                    raise ll.FitsOverflowError(412, f"VLA column requires {total} transfer slots")
+                flat = np.empty(total, dtype=transfer_dtype)
+                if total:
+                    ll.check(ll.lib.zf_read_col_vla_packed(
+                        t, read_code, col, 1, nrows, _ptr(flat), total,
+                    ))
                 out = np.empty(nrows, dtype=object)
                 for r in range(nrows):
-                    ln = c.c_longlong()
-                    off = c.c_longlong()
-                    ll.check(ll.lib.zf_read_descript(t, col, r + 1, c.byref(ln), c.byref(off)))
-                    count = int(ln.value)
-                    if count < 0:
-                        raise ll.FitsError(412, f"corrupt VLA descriptor: negative length {count}")
-                    got = c.c_longlong()
+                    start = int(offsets[r])
+                    stop = int(offsets[r + 1])
+                    cell = flat[start:stop]
                     if is_complex:
-                        cap = count * 2  # ABI returns 2 float slots per complex element
-                        cell_f = np.empty(max(cap, 1), dtype=float_dtype)
-                        if count:
-                            ll.check(ll.lib.zf_read_col_vla(t, read_code, col, r + 1, cap, _ptr(cell_f), c.byref(got)))
-                        out[r] = cell_f[: int(got.value)].view(cdtype)
+                        if cell.size % 2:
+                            raise ll.FitsError(264, "corrupt complex VLA layout has an odd scalar count")
+                        out[r] = cell.view(cdtype)
                     else:
-                        cell = np.empty(count, dtype=elem_dtype)
-                        if count:
-                            ll.check(ll.lib.zf_read_col_vla(t, read_code, col, r + 1, count, _ptr(cell), c.byref(got)))
                         out[r] = cell
                 return out
 
@@ -776,23 +1165,64 @@ class _TableHDU(_HDU):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def _emit_columns(self):
-        """(columns, nrows) to serialize: the builder columns for a detached HDU, or columns
-        reconstructed from the live table for an attached one (so a copied table keeps its rows)."""
-        if self._columns or self._hdulist is None:
+        """(columns, nrows) to serialize: the builder columns when present, columns synthesized
+        from an assigned record array for a detached HDU, or columns reconstructed from the live
+        table for an attached one (so a copied table keeps its rows)."""
+        if self._columns:
+            _assert_unique_column_names([col.name for col in self._columns])
             return list(self._columns), self._nrows
         data = self.data
-        if data is None or data.dtype.names is None:
+        if data is None:
             return [], 0
+        data_names = data.dtype.names
+        data_fields = data.dtype.fields
+        if data_names is None or data_fields is None:  # unreachable post-validation; defense in depth
+            raise ll.FitsTypeError(410, "table data must be a structured/record array")
         nrows = len(data)
+        if self._hdulist is None:
+            # A detached HDU carrying a record array: synthesize every TFORM from the dtype
+            # (there is no file column to reuse; unsigned/subarray/string fields all map).
+            if self._table_type == ll.ASCII_TBL:
+                raise NotImplementedError(
+                    "cannot synthesize ASCII-table formats from a record array; "
+                    "build the table with AsciiTableHDU.from_columns(...)"
+                )
+            cols = [
+                Column(n, _binary_tform_for(None, data_fields[n][0]), array=data[n])
+                for n in data_names
+            ]
+            return cols, nrows
         h = self._select()
         t = _VOID()
         ll.check(ll.lib.zf_table_open(h, c.byref(t)))
         try:
-            cols = []
-            for i, name in enumerate(data.dtype.names):
+            ncols_ = c.c_int()
+            ll.check(ll.lib.zf_table_ncols(t, c.byref(ncols_)))
+            # Map file columns by unique effective NAME so a reassigned recarray keeps each field's
+            # true format even when reordered; a positional pairing would hand a field the wrong
+            # column's TFORM and silently truncate it. A new/retyped field synthesizes its format
+            # from the numpy dtype (see _binary_tform_for / _tform_from_dtype).
+            file_names = [self._col_name(t, j) or f"col{j + 1}" for j in range(ncols_.value)]
+            _assert_unique_column_names(file_names)
+            file_info = {}
+            for j in range(ncols_.value):
                 info = ll.ZfColInfo()
-                ll.check(ll.lib.zf_table_col_info(t, i, c.byref(info)))
-                fmt = _ascii_tform_of(info) if self._table_type == ll.ASCII_TBL else _tform_of(info)
+                ll.check(ll.lib.zf_table_col_info(t, j, c.byref(info)))
+                # `or f"col{j+1}"` matches _read_table's name for a column lacking TTYPE, so an
+                # unnamed column reuses its file format instead of collapsing under the "" key.
+                file_info[file_names[j]] = info
+            cols = []
+            for name in data_names:
+                info = file_info.get(name)
+                if self._table_type == ll.ASCII_TBL:
+                    if info is None:
+                        raise NotImplementedError(
+                            "writeto() cannot add or rename an ASCII-table column from a reassigned "
+                            "recarray; rebuild the table with AsciiTableHDU.from_columns(...)"
+                        )
+                    fmt = _ascii_tform_of(info)
+                else:
+                    fmt = _binary_tform_for(info, data_fields[name][0])
                 cols.append(Column(name, fmt, array=data[name]))
             return cols, nrows
         finally:
@@ -867,14 +1297,39 @@ class _TableHDU(_HDU):
         if is_complex:
             raise NotImplementedError("writing complex VLA columns is not supported")
         arr = col.array
+        offsets = np.empty(nrows + 1, dtype=np.uint64)
+        offsets[0] = 0
+        total = 0
+        for r in range(nrows):
+            size = int(np.asarray(arr[r]).size)
+            if size < 0 or total > ((1 << 64) - 1) - size:
+                raise ll.FitsOverflowError(412, "VLA column element count overflows uint64")
+            total += size
+            offsets[r + 1] = total
+        if total > np.iinfo(np.intp).max // max(elem_dtype.itemsize, 1):
+            raise ll.FitsOverflowError(412, f"VLA column requires {total} transfer slots")
+        flat = np.empty(total, dtype=elem_dtype)
         for r in range(nrows):
             cell = _native(np.asarray(arr[r]).astype(elem_dtype, copy=False)).reshape(-1)
-            ll.check(ll.lib.zf_write_col_vla(t, dt.zf_code(elem_dtype), i, r + 1, _ptr(cell), int(cell.size)))
+            start = int(offsets[r])
+            stop = int(offsets[r + 1])
+            if cell.size != stop - start:
+                raise ll.FitsTableError(308, "VLA cell size changed while packing the column")
+            flat[start:stop] = cell
+        ll.check(ll.lib.zf_write_col_vla_packed(
+            t, dt.zf_code(elem_dtype), i, 1, nrows,
+            offsets.ctypes.data_as(c.POINTER(c.c_uint64)), offsets.size,
+            _ptr(flat), total,
+        ))
 
     @classmethod
     def from_columns(cls, columns: Sequence[Column], nrows: int | None = None, name: str | None = None):
+        """Build a detached table HDU from :class:`Column` specifications."""
+
+        columns = list(columns)
+        _assert_unique_column_names([col.name for col in columns])
         hdu = cls(name=name)
-        hdu._columns = list(columns)
+        hdu._columns = columns
         present = [len(col.array) for col in columns if col.array is not None]
         if present and len(set(present)) > 1:
             raise ValueError(f"columns have differing lengths {sorted(set(present))}; all must match")
@@ -888,11 +1343,15 @@ class _TableHDU(_HDU):
 
 
 class BinTableHDU(_TableHDU):
+    """A FITS binary-table HDU with NumPy structured-array data."""
+
     _table_type = ll.BINARY_TBL
     _kind_name = "BinTableHDU"
 
 
 class AsciiTableHDU(_TableHDU):
+    """A FITS ASCII-table HDU with NumPy structured-array data."""
+
     _table_type = ll.ASCII_TBL
     _kind_name = "AsciiTableHDU"
 
@@ -952,6 +1411,8 @@ class HDUList(list):
 
     # ── access ────────────────────────────────────────────────────────────────────────────
     def __getitem__(self, key):
+        """Select an HDU by integer/slice or by case-insensitive extension name."""
+
         if isinstance(key, str):
             for hdu in self:
                 if hdu.name.upper() == key.upper():
@@ -960,6 +1421,8 @@ class HDUList(list):
         return super().__getitem__(key)
 
     def info(self):
+        """Return a compact, one-line-per-HDU summary."""
+
         rows = []
         for i, hdu in enumerate(self):
             rows.append(f"{i:>3}  {hdu.name:<12}  {type(hdu).__name__}")
@@ -967,36 +1430,133 @@ class HDUList(list):
 
     # ── lifecycle ─────────────────────────────────────────────────────────────────────────
     def flush(self):
+        """Persist pending changes to an attached writable FITS file."""
+
         if self._handle is None:
             return
         if self._mode != ll.READONLY:
-            # 1) Serialize any newly-appended (detached) HDUs to the open file, in order — so an
-            #    open+append+close (or +flush) actually writes them, not just writeto().
-            for i in range(self._scanned_count, len(self)):
-                hdu = self[i]
-                if hdu._hdulist is None:
-                    hdu._write_to(self._handle, primary=(i == 0))
-                    hdu._hdulist = self
-                    hdu._index = i + 1
-                    if isinstance(hdu, ImageHDU) and hdu._data is not None:
-                        # Baseline so the next flush (and pristine check) treats the just-appended
-                        # pixels as unchanged rather than re-writing them.
-                        hdu._data_fingerprint = _ndarray_fp(hdu._data)
-            if len(self) > self._scanned_count:
-                self._scanned_count = len(self)
+            # 1) Reconcile the file's HDU layout with the in-memory list — appends, inserts,
+            #    deletions, and reorders — so an open+edit+close persists structure, not just
+            #    writeto().
+            self._reconcile()
             # 2) Write back in-place edits to attached image/table data.
             for hdu in self:
                 if hdu._hdulist is not self:
                     continue
                 if isinstance(hdu, CompImageHDU):
-                    # In-place recompression isn't supported; fail loud rather than silently drop.
-                    if hdu._data_changed():
+                    # In-place recompression isn't supported; fail loud rather than silently
+                    # drop. An explicit clear (data = None) is a recompression too.
+                    if hdu._data_changed() or hdu._data is None:
                         raise NotImplementedError(
                             "in-place update of a compressed image is not supported; use writeto() to a new file"
                         )
                 elif isinstance(hdu, (ImageHDU, _TableHDU)):
                     hdu._flush_data()
         ll.check(ll.lib.zf_flush(self._handle))
+
+    def _attached_at(self, hdu, i: int) -> bool:
+        """Whether list position ``i`` still holds the HDU attached to this file's slot ``i + 1``."""
+        return isinstance(hdu, _HDU) and hdu._hdulist is self and hdu._index == i + 1
+
+    def _hdu_count(self) -> int:
+        count = c.c_long()
+        ll.check(ll.lib.zf_hdu_count(self._handle, c.byref(count)))
+        return count.value
+
+    def _reconcile(self):
+        """Make the open file's HDU layout match the in-memory list (update/append mode):
+        persist appends, inserts, deletions, and reorders. A shifted-but-attached HDU is byte-
+        copied (zf_copy_hdu) so its user keywords, VLA heap, compression bytes, and checksums
+        survive exactly; a detached or foreign HDU is serialized via _write_to. The order is
+        load-bearing: copies are APPENDED first (while the source indices are still valid for
+        lazy reads), the displaced originals are deleted after, and bookkeeping is rebound last."""
+        # Longest leading run of HDUs still in their scanned slots; everything after is rebuilt.
+        prefix = 0
+        for i, hdu in enumerate(self):
+            if not self._attached_at(hdu, i):
+                break
+            prefix += 1
+        if prefix == len(self) and prefix == self._scanned_count:
+            return  # layout already matches the file
+        # ── pre-flight guards: every rejection fires BEFORE any file mutation. The type check
+        # runs first (over the whole list) so a stray object at position 0 reports what it is,
+        # not a misleading "primary must remain first". ──
+        for hdu in self:
+            if not isinstance(hdu, _HDU):
+                raise TypeError(f"HDUList contains a non-HDU object: {hdu!r}")
+        if prefix == 0:
+            raise NotImplementedError(
+                "the primary HDU of an open file must remain first; use writeto() to a new file"
+            )
+        if len({id(hdu) for hdu in self}) != len(self):
+            raise ValueError(
+                "the same HDU object appears at more than one position in the HDUList; "
+                "flush cannot bind one object to two slots — insert a copy instead"
+            )
+        for hdu in self:
+            if isinstance(hdu, CompImageHDU) and hdu._hdulist is self and hdu._data_changed():
+                raise NotImplementedError(
+                    "in-place update of a compressed image is not supported; use writeto() to a new file"
+                )
+        disk_count = self._hdu_count()  # authoritative on-disk count (drives cleanup + deletes)
+        # ── append phase: the originals are still at their scanned indices, so lazy header/data
+        # reads (and _emit_columns' source-table access) stay valid throughout ──
+        serialized = set()
+        try:
+            for i in range(prefix, len(self)):
+                hdu = self[i]
+                if hdu._hdulist is self and hdu._index is not None and hdu._index >= 2:
+                    # Exact byte copy of the HDU's on-disk form. In update mode header edits were
+                    # already persisted to the source slot, so the copy carries them; pending
+                    # in-place DATA edits are intentionally not carried — step 2 of flush writes
+                    # them back at the new index (fingerprints are left untouched below).
+                    ll.check(ll.lib.zf_copy_hdu(self._handle, hdu._index))
+                else:
+                    # Detached, attached to another HDUList, or the primary duplicated into the
+                    # tail (zf_copy_hdu refuses source 1: the copy must parse as an extension).
+                    hdu._write_to(self._handle, primary=False)
+                    serialized.add(i)
+        except BaseException:
+            # Roll back the partial tail so the file is left byte-identical. Count-driven so a
+            # fully-created HDU whose column/data write failed halfway is removed too. A cleanup
+            # failure is swallowed: the original error matters more, and the file then merely
+            # carries extra trailing HDUs (valid FITS, duplicates — never missing data). Only
+            # Exception is swallowed — a KeyboardInterrupt during cleanup still propagates
+            # (unlike the TS port, whose catch is necessarily catch-all).
+            try:
+                while self._hdu_count() > disk_count:
+                    ll.check(ll.lib.zf_delete_hdu(self._handle, disk_count + 1))
+            except Exception:
+                pass
+            raise
+        # ── delete phase: drop the displaced originals; the appended tail shifts into place.
+        # (Never hold a zf_table_open handle across this loop: zf_delete_hdu frees the *Hdu a
+        # table handle wraps.) A failure here leaves duplicates, never missing HDUs.
+        for _ in range(disk_count - prefix):
+            ll.check(ll.lib.zf_delete_hdu(self._handle, prefix + 1))
+        # ── rebind bookkeeping to the new layout ──
+        for i in range(prefix, len(self)):
+            hdu = self[i]
+            hdu._hdulist = self
+            hdu._index = i + 1
+            if i in serialized:
+                # _write_to serialized the CURRENT in-memory data: baseline it so step 2 doesn't
+                # re-write it (or, for a foreign table with a pending VLA/scaled-column edit,
+                # spuriously raise). Byte-copied HDUs keep their old baseline on purpose — the
+                # copy carried the ORIGINAL bytes, so a pending in-place edit must still be
+                # detected and written back at the new index.
+                if isinstance(hdu, ImageHDU) and hdu._data is not _UNSET and hdu._data is not None:
+                    hdu._data_fingerprint = _ndarray_fp(hdu._data)
+                elif isinstance(hdu, _TableHDU) and hdu._data is not _UNSET and hdu._data is not None and hdu._data.dtype.names:
+                    hdu._col_fingerprints = {n: _col_fp(hdu._data[n]) for n in hdu._data.dtype.names}
+            if hdu._header is not None and hdu._header._persist is None:
+                # A header materialized while detached (or under a read-only list) has no persist
+                # hook; future edits must reach THIS file's handle like any attached header's do.
+                hdu._header._persist = hdu._write_key
+                hdu._header._delete = hdu._delete_key
+                hdu._header._resync = hdu._resync_commentary
+                hdu._header._dirty_cb = hdu._mark_dirty
+        self._scanned_count = len(self)
 
     def _is_pristine_attached(self) -> bool:
         """True when this list is exactly what was scanned from an open file — every HDU still
@@ -1005,10 +1565,7 @@ class HDUList(list):
             return False
         if any(hdu._data_changed() for hdu in self):  # in-place edits don't set _dirty
             return False
-        return all(
-            isinstance(h, _HDU) and h._hdulist is self and h._index == i + 1
-            for i, h in enumerate(self)
-        )
+        return all(self._attached_at(h, i) for i, h in enumerate(self))
 
     def _source_bytes(self) -> bytes:
         self.flush()  # persist pending header/data edits so the raw bytes are current
@@ -1020,6 +1577,8 @@ class HDUList(list):
         return buf.raw[: got.value]
 
     def close(self):
+        """Flush writable changes and release the underlying FITS handle."""
+
         if self._handle is None:
             return
         # Persist pending edits before closing (astropy flushes on close in update mode); always
@@ -1032,9 +1591,13 @@ class HDUList(list):
             self._handle = None
 
     def __enter__(self):
+        """Return this open HDU list for use as a context manager."""
+
         return self
 
     def __exit__(self, *exc):
+        """Close the file handle when leaving a context-manager block."""
+
         self.close()
         return False
 
@@ -1046,6 +1609,8 @@ class HDUList(list):
 
     # ── writing ───────────────────────────────────────────────────────────────────────────
     def writeto(self, path, overwrite: bool = False, checksum: bool = False):
+        """Write the HDU sequence atomically to ``path``."""
+
         path = os.fspath(path)
         if os.path.exists(path) and not overwrite:
             raise OSError(f"file exists: {path} (use overwrite=True)")
@@ -1146,11 +1711,15 @@ def from_bytes(data: bytes, mode: str = "readonly") -> HDUList:
 
 
 def getheader(path: str, ext: int = 0) -> Header:
+    """Read and return the header for extension ``ext``."""
+
     with open(path) as hdul:
         return hdul[ext].header
 
 
 def getdata(path: str, ext: int = 0, header: bool = False):
+    """Read extension data, optionally returning ``(data, header)``."""
+
     with open(path) as hdul:
         hdu = hdul[ext]
         # astropy convention: an empty primary (ext 0) falls through to the first HDU with data.
@@ -1166,11 +1735,15 @@ def getdata(path: str, ext: int = 0, header: bool = False):
 
 
 def getval(path: str, keyword: str, ext: int = 0):
+    """Read one header keyword value from extension ``ext``."""
+
     with open(path) as hdul:
         return hdul[ext].header[keyword]
 
 
 def writeto(path: str, data, header: Header | None = None, overwrite: bool = False, checksum: bool = False):
+    """Write ``data`` and an optional header as a primary HDU."""
+
     HDUList([PrimaryHDU(data=data, header=header)]).writeto(path, overwrite=overwrite, checksum=checksum)
 
 
@@ -1186,6 +1759,8 @@ class Finding:
         self.message = message
 
     def __repr__(self):
+        """Return a compact diagnostic representation of this validation finding."""
+
         kw = f" {self.keyword}" if self.keyword else ""
         return f"<{self.severity} HDU {self.hdu}{kw}: {self.message}>"
 

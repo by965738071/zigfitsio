@@ -604,7 +604,8 @@ fn roundTripCompressed(
 test "e2e: headers — CONTINUE long string, HIERARCH, COMMENT/HISTORY round-trip" {
     const alloc = testing.allocator;
     const long = "The quick brown fox jumps over the lazy dog, then keeps right on running " ++
-        "across a very wide field for a good long while under a clear blue sky."; // > 68 chars
+        "across a very wide field for a good long while under a clear 'blue' sky, " ++
+        "it's said."; // > 68 chars; quotes exercise ''-escaping across the CONTINUE split
     var mem = fits.MemoryDevice.init(alloc);
     defer mem.deinit();
     {

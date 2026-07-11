@@ -145,6 +145,375 @@ test "binary table create, write columns, read back" {
     try testing.expectEqualStrings("gamma", std.mem.trimEnd(u8, name_out[16..24], " \x00"));
 }
 
+test "read-only ASCII-table writes return READONLY_FILE without mutation" {
+    var source: ?*Handle = null;
+    defer if (source) |handle| capi.zf_close(handle);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "COUNT", "LABEL" };
+    const tform = [_]?[*:0]const u8{ "I6", "A8" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(src, 1, 2, 2, &ttype, &tform, null, "ASCII"));
+    {
+        var table: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(src, &table));
+        defer capi.zf_table_close(table);
+        const th = table.?;
+        var counts = [_]i32{ 11, 22 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col(th, I32, 0, 1, 2, null, &counts));
+        var labels = "alpha\x00\x00\x00beta\x00\x00\x00\x00".*;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_str(th, 1, 1, 2, 8, 8, &labels));
+    }
+    try testing.expectEqual(@as(c_int, 0), capi.zf_flush(src));
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const serialized = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(serialized);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, serialized.ptr, serialized.len, &got));
+    try testing.expectEqual(serialized.len, got);
+    capi.zf_close(source);
+    source = null;
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(serialized.ptr, serialized.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(ro, 2));
+
+    const before = try testing.allocator.alloc(u8, serialized.len);
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, serialized.len);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(ro, &table));
+    defer capi.zf_table_close(table);
+    const th = table.?;
+    var count = [_]i32{99};
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col(th, I32, 0, 1, 1, null, &count));
+    var label = "changed\x00".*;
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_str(th, 1, 1, 1, 8, 8, &label));
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, after.ptr, after.len, &got));
+    try testing.expectEqual(after.len, got);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "packed VLA ABI matches legacy P/Q/complex transfers and rejects invalid buffers" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "P", "Q", "C" };
+    const tform = [_]?[*:0]const u8{ "1PJ", "1QJ", "1PC" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(hh, 0, 4, 3, &ttype, &tform, null, "VLA", 1024));
+
+    var t: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+    defer capi.zf_table_close(t);
+    const th = t.?;
+
+    // Seed P/Q cells through the legacy row-at-a-time ABI, including empty cells.
+    var dummy_i32 = [_]i32{0};
+    var p0 = [_]i32{ 1, 2, 3 };
+    var p2 = [_]i32{4};
+    var p3 = [_]i32{ 5, 6 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 1, &p0, p0.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 2, &dummy_i32, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 3, &p2, p2.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 4, &p3, p3.len));
+
+    var q0 = [_]i32{100};
+    var q1 = [_]i32{ 200, 300 };
+    var q3 = [_]i32{400};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 1, &q0, q0.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 2, &q1, q1.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 3, &dummy_i32, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 4, &q3, q3.len));
+
+    // A complex descriptor's logical length is two here, but its packed layout has four f32
+    // scalar slots (real/imaginary pairs).
+    var complex = [_]f32{ 1.25, -2.5, 3.75, 4.5 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, F32, 2, 1, &complex, complex.len));
+
+    var p_offsets: [5]u64 = undefined;
+    var p_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, p_offsets.len, &p_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 3, 3, 4, 6 }, &p_offsets);
+    try testing.expectEqual(@as(u64, 6), p_total);
+    var p_packed: [6]i32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, &p_packed, p_packed.len));
+    try testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 5, 6 }, &p_packed);
+
+    var q_offsets: [5]u64 = undefined;
+    var q_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 1, 1, 4, &q_offsets, q_offsets.len, &q_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 1, 3, 3, 4 }, &q_offsets);
+    var q_packed: [4]i32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 1, 1, 4, &q_packed, q_total));
+    try testing.expectEqualSlices(i32, &.{ 100, 200, 300, 400 }, &q_packed);
+
+    var c_offsets: [2]u64 = undefined;
+    var c_total: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 2, 1, 1, &c_offsets, c_offsets.len, &c_total));
+    try testing.expectEqualSlices(u64, &.{ 0, 4 }, &c_offsets);
+    var c_packed: [4]f32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, F32, 2, 1, 1, &c_packed, c_total));
+    try testing.expectEqualSlices(f32, &complex, &c_packed);
+
+    // Packed write, then prove the legacy cell reader observes identical row boundaries/data.
+    const replacement_offsets = [_]u64{ 0, 2, 2, 5, 6 };
+    var replacement = [_]i32{ 9, 8, 7, 6, 5, 4 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+        th,
+        I32,
+        0,
+        1,
+        4,
+        &replacement_offsets,
+        replacement_offsets.len,
+        &replacement,
+        replacement.len,
+    ));
+    var legacy_out: [3]i32 = undefined;
+    var legacy_n: c_longlong = -1;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 1, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 2), legacy_n);
+    try testing.expectEqualSlices(i32, &.{ 9, 8 }, legacy_out[0..2]);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 2, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 0), legacy_n);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 3, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 3), legacy_n);
+    try testing.expectEqualSlices(i32, &.{ 7, 6, 5 }, &legacy_out);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla(th, I32, 0, 4, legacy_out.len, &legacy_out, &legacy_n));
+    try testing.expectEqual(@as(c_longlong, 1), legacy_n);
+    try testing.expectEqual(@as(i32, 4), legacy_out[0]);
+
+    // Zero-row ranges still have the canonical one-entry layout and accept null payloads.
+    var empty_layout = [_]u64{99};
+    var empty_total: u64 = 99;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 5, 0, &empty_layout, 1, &empty_total));
+    try testing.expectEqualSlices(u64, &.{0}, &empty_layout);
+    try testing.expectEqual(@as(u64, 0), empty_total);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 5, 0, null, 0));
+
+    // ABI-side validation must return statuses rather than trapping on bad casts/pointers.
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_layout(th, 0, 1, 4, null, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, 5, null));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_read_col_vla_layout(th, 0, 1, 4, &p_offsets, 4, &p_total));
+    try testing.expectEqual(@as(c_int, 307), capi.zf_read_col_vla_layout(th, 0, 0, 4, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 307), capi.zf_read_col_vla_layout(th, 0, 1, -1, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 219), capi.zf_read_col_vla_layout(th, 70000, 1, 4, &p_offsets, 5, &p_total));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, null, 1));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_read_col_vla_packed(th, I32, 0, 1, 4, &p_packed, 5));
+    try testing.expectEqual(@as(c_int, 410), capi.zf_read_col_vla_packed(th, 999, 0, 1, 4, &p_packed, 6));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, null, 5, &replacement, 6));
+    try testing.expectEqual(@as(c_int, 308), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &replacement_offsets, 4, &replacement, 6));
+    try testing.expectEqual(@as(c_int, 104), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &replacement_offsets, 5, null, 6));
+
+    // A malformed offset vector is rejected before mutation; compare the complete FITS image.
+    var data_size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(hh, &data_size));
+    const before = try testing.allocator.alloc(u8, @intCast(data_size));
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, @intCast(data_size));
+    defer testing.allocator.free(after);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(hh, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+    const bad_offsets = [_]u64{ 0, 2, 1, 5, 6 };
+    try testing.expectEqual(@as(c_int, 308), capi.zf_write_col_vla_packed(th, I32, 0, 1, 4, &bad_offsets, bad_offsets.len, &replacement, replacement.len));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(hh, 0, after.ptr, after.len, &got));
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "read-only VLA writes reject before lazy heap reconstruction" {
+    // Build a minimal VLA table, export its bytes, then forge its sole descriptor so a heap scan
+    // would fail with BadDescriptor. The write APIs must return READONLY_FILE before attempting
+    // that scan, leaving both the lazy manager and the complete file image untouched.
+    var source: ?*Handle = null;
+    defer if (source) |handle| capi.zf_close(handle);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &source));
+    const src = source.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(src, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{"P"};
+    const tform = [_]?[*:0]const u8{"1PJ"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(src, 0, 1, 1, &ttype, &tform, null, "RO", 16));
+    const descriptor_off: usize = @intCast(src.fits.current().data_off);
+
+    var size: u64 = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_data_size(src, &size));
+    const forged = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(forged);
+    var got: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(src, 0, forged.ptr, forged.len, &got));
+    try testing.expectEqual(forged.len, got);
+    capi.zf_close(source);
+    source = null;
+
+    // P descriptor: one J element at a heap-relative offset beyond the reserved 16-byte heap.
+    std.mem.writeInt(i32, forged[descriptor_off..][0..4], 1, .big);
+    std.mem.writeInt(i32, forged[descriptor_off + 4 ..][0..4], 1024, .big);
+
+    var opened: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_open_memory(forged.ptr, forged.len, 0, null, &opened));
+    defer capi.zf_close(opened);
+    const ro = opened.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(ro, 2));
+
+    const before = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(before);
+    const after = try testing.allocator.alloc(u8, forged.len);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, before.ptr, before.len, &got));
+    try testing.expectEqual(before.len, got);
+
+    var table: ?*abi.TableHandle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(ro, &table));
+    defer capi.zf_table_close(table);
+    const th = table.?;
+    try testing.expect(th.mgr == null);
+
+    var value = [_]i32{42};
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla(th, I32, 0, 1, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    const offsets = [_]u64{ 0, 1 };
+    try testing.expectEqual(@as(c_int, 112), capi.zf_write_col_vla_packed(th, I32, 0, 1, 1, &offsets, offsets.len, &value, value.len));
+    try testing.expect(th.mgr == null);
+
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_bytes(ro, 0, after.ptr, after.len, &got));
+    try testing.expectEqual(after.len, got);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "lazy VLA manager preserves every live column when rewriting a populated heap" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const ttype = [_]?[*:0]const u8{ "A", "B" };
+    const tform = [_]?[*:0]const u8{ "1PJ", "1QJ" };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl_heap(hh, 0, 2, 2, &ttype, &tform, null, "LIVE", 256));
+
+    // Populate four distinct live heap extents, then close the table view. Reopening creates a
+    // fresh CAPI handle whose lazy HeapManager must reconstruct occupancy from the descriptors.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const th = t.?;
+        var a0 = [_]i32{ 11, 12 };
+        var a1 = [_]i32{ 13, 14 };
+        var b0 = [_]i32{ 21, 22 };
+        var b1 = [_]i32{ 23, 24 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 1, &a0, a0.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 0, 2, &a1, a1.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 1, &b0, b0.len));
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(th, I32, 1, 2, &b1, b1.len));
+    }
+
+    // Reopen and grow B[0] through the packed API. An empty-assuming manager would allocate at
+    // heap offset zero and overwrite A; reconstruction must place it after all live extents.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const no_rows = [_]u64{0};
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+            t.?,
+            I32,
+            1,
+            3,
+            0,
+            &no_rows,
+            no_rows.len,
+            null,
+            0,
+        ));
+        try testing.expect(t.?.mgr == null); // a no-op must not scan/reconstruct the live heap
+
+        const offsets = [_]u64{ 0, 3 };
+        var replacement = [_]i32{ 91, 92, 93 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla_packed(
+            t.?,
+            I32,
+            1,
+            1,
+            1,
+            &offsets,
+            offsets.len,
+            &replacement,
+            replacement.len,
+        ));
+    }
+
+    // Reopen once more and grow A[1] through the legacy cell API, exercising its independent
+    // lazy-manager call site against an already-populated, non-contiguous heap.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        var replacement = [_]i32{ 71, 72, 73 };
+        try testing.expectEqual(@as(c_int, 0), capi.zf_write_col_vla(t.?, I32, 0, 2, &replacement, replacement.len));
+    }
+
+    // Both rewritten cells and both untouched cells must remain distinct and byte-correct.
+    {
+        var t: ?*abi.TableHandle = null;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_table_open(hh, &t));
+        defer capi.zf_table_close(t);
+        const th = t.?;
+
+        var offsets: [3]u64 = undefined;
+        var total: u64 = 0;
+        var a: [5]i32 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 0, 1, 2, &offsets, offsets.len, &total));
+        try testing.expectEqualSlices(u64, &.{ 0, 2, 5 }, &offsets);
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 0, 1, 2, &a, total));
+        try testing.expectEqualSlices(i32, &.{ 11, 12, 71, 72, 73 }, &a);
+
+        var b: [5]i32 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_layout(th, 1, 1, 2, &offsets, offsets.len, &total));
+        try testing.expectEqualSlices(u64, &.{ 0, 3, 5 }, &offsets);
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_col_vla_packed(th, I32, 1, 1, 2, &b, total));
+        try testing.expectEqualSlices(i32, &.{ 91, 92, 93, 23, 24 }, &b);
+
+        // The four live J payloads must not alias after either rewrite.
+        const cells = [_]struct { col: c_int, row: c_longlong }{
+            .{ .col = 0, .row = 1 },
+            .{ .col = 0, .row = 2 },
+            .{ .col = 1, .row = 1 },
+            .{ .col = 1, .row = 2 },
+        };
+        var lens: [cells.len]c_longlong = undefined;
+        var offs: [cells.len]c_longlong = undefined;
+        for (cells, 0..) |cell, i| {
+            try testing.expectEqual(@as(c_int, 0), capi.zf_read_descript(th, cell.col, cell.row, &lens[i], &offs[i]));
+            try testing.expect(lens[i] > 0 and offs[i] >= 0);
+        }
+        for (0..cells.len) |i| {
+            const i_start: u64 = @intCast(offs[i]);
+            const i_end = i_start + @as(u64, @intCast(lens[i])) * @sizeOf(i32);
+            for (i + 1..cells.len) |j| {
+                const j_start: u64 = @intCast(offs[j]);
+                const j_end = j_start + @as(u64, @intCast(lens[j])) * @sizeOf(i32);
+                try testing.expect(i_end <= j_start or j_end <= i_start);
+            }
+        }
+    }
+}
+
 test "table view survives owner close without use-after-free; bad indices error, never trap" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -193,6 +562,84 @@ test "tile-compressed image round-trips through zf_read_img" {
     var out: [256]i32 = undefined;
     try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, I32, 1, 256, null, null, &out));
     try testing.expectEqualSlices(i32, &ramp, &out);
+}
+
+test "zf_write_compressed2: lossy HCOMPRESS knobs cross the ABI (arg order, ZVAL cards, bounds)" {
+    // A misordered/mistyped hcomp_scale or hcomp_smooth argument would either error, record the
+    // wrong ZVAL1/ZVAL2, produce a lossless (identical) decode, or blow the error bound — every
+    // failure mode below trips. (`zf_write_compressed` delegating with (0, false) is covered by
+    // the RICE round-trip above.)
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null)); // primary
+
+    // Curved surface (nonzero curvature ⇒ scale-16 quantization visibly changes pixels).
+    var curved: [256]i32 = undefined;
+    for (0..16) |r| {
+        for (0..16) |c| curved[r * 16 + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const axes = [_]c_long{ 16, 16 };
+    const tile = [_]c_long{ 16, 16 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_compressed2(hh, I32, 32, 2, &axes, &tile, "HCOMPRESS_1", null, 1, -16.0, 1, &curved, 256));
+
+    // The recorded request cards: ZVAL1 = -16.0 (float), ZVAL2 = 1 (smooth).
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(hh, 2));
+    var zval1: f64 = 0;
+    const k1 = "ZVAL1";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, k1, k1.len, &zval1));
+    try testing.expectEqual(@as(f64, -16.0), zval1);
+    // `zf_read_key_lng` takes a `*c_longlong`; on Windows (LLP64) `c_long` is 32-bit, so a
+    // `*c_long` here is a genuine pointer-type mismatch that fails to compile. Match the ABI type.
+    var zval2: c_longlong = 0;
+    const k2 = "ZVAL2";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, k2, k2.len, &zval2));
+    try testing.expectEqual(@as(c_longlong, 1), zval2);
+
+    // Transparent decode: genuinely lossy, but within the scale-16 quantization bound.
+    var out: [256]i32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, I32, 1, 256, null, null, &out));
+    var maxerr: i64 = 0;
+    for (curved, out) |o, g| {
+        const e: i64 = @intCast(@abs(@as(i64, o) - @as(i64, g)));
+        if (e > maxerr) maxerr = e;
+    }
+    try testing.expect(maxerr > 0 and maxerr <= 64 * 16);
+
+    // Knob misuse crosses the ABI as an error status, not an abort: RICE + hcomp_scale.
+    try testing.expect(capi.zf_write_compressed2(hh, I32, 32, 2, &axes, &tile, "RICE_1", null, 1, -4.0, 0, &curved, 256) != 0);
+}
+
+test "zf_write_compressed3: quantized-float write crosses the ABI (level plumbed, gates fail loud)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null)); // primary
+
+    // A positive noisy field; absolute step 0.25 so the round-trip bound is deterministic.
+    var pix: [256]f32 = undefined;
+    var state: u32 = 999;
+    for (&pix, 0..) |*v, i| {
+        state = state *% 1664525 +% 1013904223;
+        v.* = 10.0 + @as(f32, @floatFromInt(i % 16)) + @as(f32, @floatFromInt(state >> 24)) / 64.0;
+    }
+    const axes = [_]c_long{ 16, 16 };
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_compressed3(hh, F32, -32, 2, &axes, null, "HCOMPRESS_1", "SUBTRACTIVE_DITHER_1", 1, -0.25, 1, 0.0, 0, &pix, 256));
+
+    // Transparent decode: |err| bounded by the absolute step / 2.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_select(hh, 2));
+    var out: [256]f32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, F32, 1, 256, null, null, &out));
+    for (pix, out) |o, g| try testing.expect(@abs(o - g) <= 0.125 + 1e-5);
+
+    // A set quantize_level on a non-quantizing write is an error status, never silent.
+    var ints: [256]i32 = undefined;
+    for (&ints, 0..) |*v, i| v.* = @intCast(i);
+    try testing.expect(capi.zf_write_compressed3(hh, I32, 32, 2, &axes, null, "RICE_1", null, 1, 4.0, 1, 0.0, 0, &ints, 256) != 0);
+    // has_quantize_level = 0 leaves the level unset: the same integer write succeeds.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_compressed3(hh, I32, 32, 2, &axes, null, "RICE_1", null, 1, 0.0, 0, 0.0, 0, &ints, 256));
 }
 
 test "checksum write + verify, and validation pass" {
@@ -317,6 +764,160 @@ test "error introspection: last_status/errmsg agree; zf_free releases a longstr 
     capi.zf_free(out_ptr, out_len);
 }
 
+test "spaced keyword names are rejected with status 207 on the write path (BUGHUNT 62)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // BadKeywordName maps to CFITSIO 207 (BAD_KEYCHAR) across the whole write ABI.
+    const bad = "AB CD";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_lng(hh, bad, bad.len, 5, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
+    const longval = "x" ** 100;
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_longstr(hh, bad, bad.len, longval, longval.len, null, 0));
+
+    const good = "GOODKEY";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, good, good.len, 7, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_rename_key(hh, good, good.len, bad, bad.len));
+    var v: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_lng(hh, good, good.len, &v));
+    try testing.expectEqual(@as(c_longlong, 7), v); // untouched by the failed rename
+}
+
+test "non-finite float keyword values are rejected with status 207 on the write path (BUGHUNT 25/27)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // BadValueSyntax maps to CFITSIO 207, mirroring the read path's rejection of nan/inf tokens.
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const name = "KNAN";
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, nan, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_last_status());
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, inf, null, 0));
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, -inf, null, 0));
+
+    // The failed writes left nothing behind: the keyword is absent...
+    var v: f64 = 0;
+    try testing.expect(capi.zf_read_key_dbl(hh, name, name.len, &v) != 0);
+    // ...and a finite value still writes fine afterwards.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, name, name.len, 1.5, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, name, name.len, &v));
+    try testing.expectEqual(@as(f64, 1.5), v);
+
+    // Updating an existing key with NaN fails and keeps the old value.
+    try testing.expectEqual(@as(c_int, 207), capi.zf_write_key_dbl(hh, name, name.len, nan, null, 0));
+    v = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_dbl(hh, name, name.len, &v));
+    try testing.expectEqual(@as(f64, 1.5), v);
+}
+
+test "BLANK integer nulls substitute a caller-supplied NaN nulval, before scaling (BUGHUNT 28)" {
+    // Pins the exact ABI contract the Python/TS bindings rely on: `nulval` is dereferenced as
+    // the OUTPUT dtype, and a stored value equal to the header BLANK becomes the sentinel
+    // instead of being scaled through BSCALE/BZERO.
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+
+    const axes = [_]c_long{4};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 16, 1, &axes));
+    const kb = "BLANK";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, kb, kb.len, -32768, null, 0));
+    const sb = "BSCALE";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, sb, sb.len, 2.0, null, 0));
+    const zb = "BZERO";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_dbl(hh, zb, zb.len, 100.0, null, 0));
+
+    // Store the raw shorts verbatim (identity scaling override), incl. the sentinel at index 1.
+    const pixels = [_]i16{ 1, -32768, 3, 4 };
+    const identity: abi.ZfScaling = .{};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_img(hh, I16, 1, 4, null, &identity, &pixels));
+
+    const nan = std.math.nan(f64);
+    var out: [4]f64 = undefined;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_img(hh, F64, 1, 4, &nan, null, &out));
+    try testing.expectEqual(@as(f64, 102.0), out[0]); // 2*1 + 100
+    try testing.expect(std.math.isNan(out[1])); // the sentinel, NOT 2*(-32768) + 100
+    try testing.expectEqual(@as(f64, 106.0), out[2]);
+    try testing.expectEqual(@as(f64, 108.0), out[3]);
+}
+
+fn putRecord(hh: *Handle, text: []const u8) !void {
+    var card: [80]u8 = [_]u8{' '} ** 80;
+    @memcpy(card[0..text.len], text);
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_record(hh, &card));
+}
+
+fn countContinueCards(hh: *Handle) !usize {
+    var n: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n));
+    var found: usize = 0;
+    var i: c_long = 0;
+    while (i < n) : (i += 1) {
+        var got: [80]u8 = undefined;
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_card(hh, i, &got));
+        if (std.mem.eql(u8, got[0..8], "CONTINUE")) found += 1;
+    }
+    return found;
+}
+
+test "zf_write_key_longstr replace does not orphan the old CONTINUE run (BUGHUNT 24)" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    const name = "LONGSTR";
+    const longval = "x" ** 150; // base + 2 CONTINUE cards
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, longval, longval.len, null, 0));
+    try testing.expect(try countContinueCards(hh) >= 2);
+    var n_before: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_before));
+
+    // Replacing with a short value must remove the whole old run, not just the base card.
+    const short = "short";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_longstr(hh, name, name.len, short, short.len, null, 0));
+    try testing.expectEqual(@as(usize, 0), try countContinueCards(hh));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_before - 2, n_after); // 3 cards → 1
+
+    var out_ptr: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_read_key_longstr(hh, name, name.len, &out_ptr, &out_len));
+    defer capi.zf_free(out_ptr, out_len);
+    try testing.expectEqualStrings(short, out_ptr.?[0..out_len]);
+}
+
+test "zf_delete_key removes a HIERARCH+CONTINUE run inserted via zf_write_record" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+    var n_base: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_base));
+
+    try putRecord(hh, "HIERARCH ESO LONG STR = 'aaaa&'");
+    try putRecord(hh, "CONTINUE  'bbbb&'");
+    try putRecord(hh, "CONTINUE  'cccc'");
+
+    const q = "ESO LONG STR"; // HIERARCH names resolve through matchName
+    try testing.expectEqual(@as(c_int, 0), capi.zf_delete_key(hh, q, q.len));
+    try testing.expectEqual(@as(usize, 0), try countContinueCards(hh));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_base, n_after); // header back to its baseline
+}
+
 test "header scalar reads: lng, log, str, and key_comment" {
     var h: ?*Handle = null;
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
@@ -353,6 +954,56 @@ test "header scalar reads: lng, log, str, and key_comment" {
     var clen2: usize = 99;
     try testing.expectEqual(@as(c_int, 0), capi.zf_key_comment(hh, skey, skey.len, &cbuf, cbuf.len, &clen2));
     try testing.expectEqual(@as(usize, 0), clen2);
+}
+
+test "zf_write_key_undef writes an undefined card and updates in place" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null));
+
+    // Create: undefined value with a comment.
+    const ukey = "UNDEF";
+    const cmt = "no value";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_undef(hh, ukey, ukey.len, cmt, cmt.len));
+    try testing.expectEqual(@as(c_int, 1), capi.zf_key_exists(hh, ukey, ukey.len));
+    var iv: c_longlong = 0;
+    try testing.expectEqual(@as(c_int, 204), capi.zf_read_key_lng(hh, ukey, ukey.len, &iv)); // VALUE_UNDEFINED
+    var cbuf: [80]u8 = undefined;
+    var clen: usize = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_comment(hh, ukey, ukey.len, &cbuf, cbuf.len, &clen));
+    try testing.expectEqualStrings(cmt, cbuf[0..clen]);
+
+    // The card bytes are astropy's compact undefined form: blank value field, then `/ comment`.
+    var count: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &count));
+    var found = false;
+    var got: [80]u8 = undefined;
+    var i: c_long = 0;
+    while (i < count) : (i += 1) {
+        try testing.expectEqual(@as(c_int, 0), capi.zf_read_card(hh, i, &got));
+        if (std.mem.startsWith(u8, &got, "UNDEF   ")) {
+            try testing.expectEqualStrings("UNDEF   =  / no value", std.mem.trimEnd(u8, &got, " "));
+            found = true;
+        }
+    }
+    try testing.expect(found);
+
+    // Overwriting an existing valued key updates in place: card count unchanged, value blank,
+    // and a null comment preserves the old one (same contract as the other zf_write_key_*).
+    const kkey = "MYINT";
+    const kcmt = "kept";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, kkey, kkey.len, 42, kcmt, kcmt.len));
+    var n_before: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_before));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_undef(hh, kkey, kkey.len, null, 0));
+    var n_after: c_long = 0;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_card_count(hh, &n_after));
+    try testing.expectEqual(n_before, n_after);
+    try testing.expectEqual(@as(c_int, 204), capi.zf_read_key_lng(hh, kkey, kkey.len, &iv));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_key_comment(hh, kkey, kkey.len, &cbuf, cbuf.len, &clen));
+    try testing.expectEqualStrings(kcmt, cbuf[0..clen]);
 }
 
 test "rename_key and insert_record" {
@@ -795,4 +1446,78 @@ test "ZfOpenOpts.max_naxis_product rejects an oversized image before allocation"
     // A within-limit image (3x3 = 9 <= 10) is accepted.
     const small_axes = [_]c_long{ 3, 3 };
     try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 16, 2, &small_axes));
+}
+
+test "zf_img_param rejects hostile Z* geometry keywords with an error, never a trap" {
+    var h: ?*Handle = null;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_memory(null, &h));
+    defer capi.zf_close(h);
+    const hh = h.?;
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_img(hh, 8, 0, null)); // primary
+
+    // A binary table posing as a tile-compressed image: ZIMAGE = T with hostile Z* geometry.
+    const ttype = [_]?[*:0]const u8{"COMPRESSED_DATA"};
+    const tform = [_]?[*:0]const u8{"1J"};
+    try testing.expectEqual(@as(c_int, 0), capi.zf_create_tbl(hh, 0, 1, 1, &ttype, &tform, null, "COMP"));
+    const zim = "ZIMAGE";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_log(hh, zim, zim.len, 1, null, 0));
+
+    var bitpix: c_int = 0;
+    var naxis: c_int = 0;
+    var got: [9]c_long = undefined;
+    var filled: c_int = 0;
+
+    // ZBITPIX far outside i32: the c_int out-param cannot hold it — error, not a trap
+    // (nor ReleaseFast truncation).
+    const zbp = "ZBITPIX";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 1 << 40, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 211), capi.zf_last_status()); // BAD_BITPIX
+
+    // In-range but illegal BITPIX value.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 7, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 211), capi.zf_last_status()); // BAD_BITPIX
+
+    // Legal ZBITPIX from here on; hostile axes next.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zbp, zbp.len, 16, null, 0));
+    const zn = "ZNAXIS";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 1, null, 0));
+
+    // Negative ZNAXISn: error on every platform (mirrors the decompression path's BadTiling).
+    const zn1 = "ZNAXIS1";
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn1, zn1.len, -5, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+
+    // ZNAXIS present but out of range: error like the decompression path, not a silent
+    // zero-axis report.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, -1, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 5000, null, 0));
+    try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+    try testing.expectEqual(@as(c_int, 413), capi.zf_last_status()); // DATA_COMPRESSION_ERR
+
+    // ZNAXIS = 0 stays legal (zero-dimensional): success with zero axes reported.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 0, null, 0));
+    try testing.expectEqual(@as(c_int, 0), capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled));
+    try testing.expectEqual(@as(c_int, 0), naxis);
+    try testing.expectEqual(@as(c_int, 0), filled);
+
+    // Restore a valid ZNAXIS for the wide-axis case below.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn, zn.len, 1, null, 0));
+
+    // ZNAXISn above 2^31: reported faithfully where c_long is 64-bit, an error where it is
+    // 32-bit (Windows LLP64, wasm32) — the ABI cannot represent the value there.
+    try testing.expectEqual(@as(c_int, 0), capi.zf_write_key_lng(hh, zn1, zn1.len, 1 << 40, null, 0));
+    if (@sizeOf(c_long) == 8) {
+        try testing.expectEqual(@as(c_int, 0), capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled));
+        try testing.expectEqual(@as(c_int, 16), bitpix);
+        try testing.expectEqual(@as(c_int, 1), naxis);
+        try testing.expectEqual(@as(c_long, 1 << 40), got[0]);
+    } else {
+        try testing.expect(capi.zf_img_param(hh, &bitpix, &naxis, &got, 9, &filled) != 0);
+        try testing.expectEqual(@as(c_int, 213), capi.zf_last_status()); // BAD_NAXES
+    }
 }

@@ -57,12 +57,15 @@ pub const Card = struct {
 
     /// Build a value card `NAME    = <value> / comment` into 80 space-padded bytes.
     ///
-    /// The name is normalized (`Name.parse` errors on a bad alphabet); the value indicator
-    /// `= ` is placed in bytes 9–10; `v` is rendered into the value field by `value.zig`
-    /// (fixed-format for numbers and logicals), followed by `/ comment` when `comment` is
-    /// non-null. A value or comment too long for the 70-byte field yields
-    /// `error.CardOverflow`; the result is re-parsed so its `kind` reflects the `FR-HDR-6`
-    /// rule (e.g. a commentary name stays commentary even with the indicator present).
+    /// The name is normalized (`Name.parseStrict` errors on a bad alphabet or on blanks
+    /// that are not trailing padding); the value indicator `= ` is placed in bytes 9–10;
+    /// `v` is rendered into the value field by `value.zig` (fixed-format for numbers and
+    /// logicals), followed by `/ comment` when `comment` is non-null. A non-finite real
+    /// (NaN/Inf) yields `error.BadValueSyntax` — the FITS real grammar cannot express it
+    /// (`value.requireFinite`). A value or comment
+    /// too long for the 70-byte field yields `error.CardOverflow`; the result is re-parsed
+    /// so its `kind` reflects the `FR-HDR-6` rule (e.g. a commentary name stays commentary
+    /// even with the indicator present).
     pub fn buildValue(name_field: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
         const name = try Name.parse(name_field);
         var raw: [80]u8 = @splat(' ');
@@ -240,4 +243,30 @@ test "buildValue: oversized comment overflows the card" {
 
 test "buildValue: bad keyword name is rejected" {
     try testing.expectError(error.BadKeywordName, Card.buildValue("BAD.NAME", .{ .int = 1 }, null));
+}
+
+test "buildValue: embedded or leading blanks in the name are rejected (BUGHUNT 62)" {
+    try testing.expectError(error.BadKeywordName, Card.buildValue("AB CD", .{ .int = 1 }, null));
+    try testing.expectError(error.BadKeywordName, Card.buildValue(" XKEY", .{ .int = 1 }, null));
+}
+
+test "buildValue: non-finite reals are rejected on the write path (BUGHUNT 25/27)" {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    try testing.expectError(error.BadValueSyntax, Card.buildValue("KNAN", .{ .float = nan }, null));
+    try testing.expectError(error.BadValueSyntax, Card.buildValue("KINF", .{ .float = inf }, null));
+    try testing.expectError(error.BadValueSyntax, Card.buildValue("KNINF", .{ .float = -inf }, null));
+    try testing.expectError(error.BadValueSyntax, Card.buildValue("KCPX", .{ .complex_float = .{ 1.0, nan } }, null));
+    try testing.expectError(error.BadValueSyntax, Card.buildValue("KCPX", .{ .complex_float = .{ inf, 1.0 } }, null));
+    // Finite reals still build.
+    const c = try Card.buildValue("GAIN", .{ .float = 1.5 }, null);
+    try testing.expectEqual(Card.Kind.value, c.kind);
+}
+
+test "Card.parse stays lenient about blanks in an on-disk name field (read contract)" {
+    // Third-party files with malformed spaced names must still load; only the
+    // build/edit path is strict.
+    const raw = card80("AB CD   =                    1");
+    const c = try Card.parse(&raw);
+    try testing.expectEqualStrings("AB CD", c.name.text());
 }

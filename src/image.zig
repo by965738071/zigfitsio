@@ -347,7 +347,7 @@ pub const ImageView = struct {
         if (buf.len != total) return error.BadDimensions;
 
         const stride0 = if (stride_opt) |st| st[0] else 1;
-        const row_len = counts[0];
+        const row_len: usize = @intCast(counts[0]); // slice length: fits `usize` on every target
         // The innermost axis span (contiguous on disk); `transferRowTyped` streams it through the
         // fixed scratch buffer in `CHUNK_ELEMS`-sized blocks, so the span is unbounded here.
         const span = upper[0] - lower[0] + 1; // contiguous element count covering the strided row

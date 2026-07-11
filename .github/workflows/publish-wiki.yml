@@ -1,0 +1,217 @@
+name: Publish release API Wiki
+
+# Both registry workflows are independently bound to their exact filenames by OIDC trusted
+# publishing.  Wait for their completed runs here instead of moving those jobs into a new
+# orchestrator (which would change their identity at PyPI/npm).
+on:
+  workflow_run:
+    workflows:
+      - Python wheels & release
+      - TypeScript bindings & npm release
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to republish (vX.Y.Z)"
+        type: string
+        required: true
+      force_downgrade:
+        description: "Allow an older release to replace the current Wiki"
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+# A completion event arrives for each upstream workflow. Serialize the whole coordinator; the
+# second ready run is harmless because artifact validation and Wiki installation are idempotent.
+concurrency:
+  group: api-wiki-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: verify complete release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+      waiting: ${{ steps.gate.outputs.waiting }}
+      reason: ${{ steps.gate.outputs.reason }}
+      repository: ${{ steps.gate.outputs.repository }}
+      tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      sha: ${{ steps.gate.outputs.sha }}
+      python_run_id: ${{ steps.gate.outputs.python_run_id }}
+    steps:
+      # workflow_run executes the workflow definition from the default branch. Keep every script
+      # in this privileged workflow on that trusted branch; release-tag output is data only.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Require both publisher workflows, tag ref, SHA, and GitHub Release
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/wiki/release_gate.py
+      - name: Gate summary
+        env:
+          READY: ${{ steps.gate.outputs.ready }}
+          REASON: ${{ steps.gate.outputs.reason }}
+          TAG: ${{ steps.gate.outputs.tag }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          PYTHON_RUN_ID: ${{ steps.gate.outputs.python_run_id }}
+        run: |
+          {
+            echo "### API Wiki release gate"
+            echo
+            echo "- ready: \`${READY:-false}\`"
+            echo "- reason: \`${REASON:-unknown}\`"
+            if [ -n "${TAG:-}" ]; then echo "- tag: \`$TAG\`"; fi
+            if [ -n "${SHA:-}" ]; then echo "- commit: \`$SHA\`"; fi
+            if [ -n "${PYTHON_RUN_ID:-}" ]; then echo "- Python artifact run: \`$PYTHON_RUN_ID\`"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: publish GitHub Wiki
+    needs: gate
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Use only trusted default-branch code with the write token. The generated tag content
+      # arrives as data from the exact gate-verified Python run and is never executed here.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: api-wiki-preview-${{ needs.gate.outputs.sha }}
+          path: ${{ runner.temp }}/wiki-artifact/wiki
+          github-token: ${{ github.token }}
+          repository: ${{ needs.gate.outputs.repository }}
+          run-id: ${{ needs.gate.outputs.python_run_id }}
+      - name: Clone Wiki with the short-lived repository token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          if ! git clone "https://github.com/${REPOSITORY}.wiki.git" "$RUNNER_TEMP/wiki-repo"; then
+            echo "::error::Wiki clone failed. Create the initial Home page in the GitHub UI before the first automated release."
+            exit 1
+          fi
+      - name: Install only automation-managed pages
+        id: install
+        env:
+          ALLOW_DOWNGRADE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_downgrade || false }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.gate.outputs.version }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+        run: |
+          set -euo pipefail
+          args=(
+            --bundle "$RUNNER_TEMP/wiki-artifact/wiki"
+            --wiki "$RUNNER_TEMP/wiki-repo"
+            --expected-tag "$RELEASE_TAG"
+            --expected-version "$RELEASE_VERSION"
+            --expected-sha "$RELEASE_SHA"
+            --expected-repository "$REPOSITORY"
+          )
+          if [ "$ALLOW_DOWNGRADE" = "true" ]; then args+=(--allow-downgrade); fi
+          python3 tools/wiki/publish_bundle.py "${args[@]}"
+      - name: Package the validated API bundle reproducibly
+        env:
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 \
+            --numeric-owner -C "$RUNNER_TEMP/wiki-artifact/wiki" -cf - . | gzip -n > \
+            "$RUNNER_TEMP/wiki-artifact/zigfitsio-api-${RELEASE_TAG}.tar.gz"
+      - name: Revalidate the tag, workflows, and release immediately before mutation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          python3 tools/wiki/release_gate.py --poll-attempts 1 --poll-seconds 0 \
+            --expected-tag "$RELEASE_TAG" --expected-sha "$RELEASE_SHA" --require-ready
+      - name: Commit and push when content changed
+        id: push
+        working-directory: ${{ runner.temp }}/wiki-repo
+        env:
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "docs: publish API Wiki for ${RELEASE_TAG}" \
+            -m "Generated from ${RELEASE_SHA}."
+          # Never force-push. A concurrent manual edit is rebased once, then pushed normally.
+          if ! git push origin HEAD; then
+            git pull --rebase origin "$(git branch --show-current)"
+            git push origin HEAD
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Attach immutable API bundle to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+        run: |
+          set -euo pipefail
+          asset="zigfitsio-api-${RELEASE_TAG}.tar.gz"
+          source="$RUNNER_TEMP/wiki-artifact/$asset"
+          asset_id="$(
+            gh api "repos/${REPOSITORY}/releases/tags/${RELEASE_TAG}" |
+              jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id' |
+              head -n1
+          )"
+          if [ -n "$asset_id" ]; then
+            existing="$RUNNER_TEMP/existing-$asset"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${REPOSITORY}/releases/assets/${asset_id}" > "$existing"
+            if ! cmp -s "$source" "$existing"; then
+              echo "::error::Existing release asset $asset differs; refusing to overwrite it."
+              exit 1
+            fi
+            echo "Release asset $asset already exists with identical bytes."
+          else
+            gh release upload "$RELEASE_TAG" "$source" --repo "$REPOSITORY"
+          fi
+      - name: Publication summary
+        env:
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+          CHANGED: ${{ steps.push.outputs.changed }}
+          SKIPPED: ${{ steps.install.outputs.skipped }}
+        run: |
+          {
+            echo "### API Wiki publication"
+            echo
+            echo "- release: \`$RELEASE_TAG\`"
+            echo "- source commit: \`$RELEASE_SHA\`"
+            echo "- Wiki changed: \`${CHANGED:-false}\`"
+            echo "- stale release skipped: \`${SKIPPED:-false}\`"
+            echo "- Wiki: https://github.com/${REPOSITORY}/wiki"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -164,6 +164,7 @@ pub const AsciiType = enum {
     exp_single, // Ew.d
     exp_double, // Dw.d
 
+    /// Map an ASCII-table `TFORM` letter to its field type, or return `null`.
     pub fn fromChar(c: u8) ?AsciiType {
         return switch (std.ascii.toUpper(c)) {
             'A' => .char,
@@ -175,6 +176,7 @@ pub const AsciiType = enum {
         };
     }
 
+    /// Return the ASCII-table `TFORM` letter for this field type.
     pub fn toChar(self: AsciiType) u8 {
         return switch (self) {
             .char => 'A',
@@ -242,10 +244,12 @@ pub const Tdisp = struct {
     /// Exponent digit count (the `Ee` suffix), 0 if unspecified.
     exp_digits: u8 = 0,
 
+    /// Return the parsed `TDISP` format code without unused buffer bytes.
     pub fn codeText(self: *const Tdisp) []const u8 {
         return self.code[0..self.code_len];
     }
 
+    /// Parse a FITS `TDISP` display format, including width, precision, and exponent digits.
     pub fn parse(s_in: []const u8) TableError!Tdisp {
         const s = std.mem.trim(u8, s_in, " ");
         if (s.len < 2) return error.BadTform;

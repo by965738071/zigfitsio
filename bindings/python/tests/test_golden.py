@@ -19,6 +19,36 @@ def test_golden_tile_codecs_decode_to_ramp(golden_dir, codec):
         np.testing.assert_array_equal(data.astype(np.int64), ramp)
 
 
+@pytest.mark.parametrize("name", ["lossy16", "lossy32", "smooth"])
+def test_golden_lossy_hcompress_matches_funpack(golden_dir, name):
+    """Lossy HCOMPRESS tiles (incl. the ZVAL2=1 hsmooth request) decode exactly like funpack."""
+    fz = os.path.join(str(golden_dir), "compress", f"tile_hcompress_{name}.fits")
+    exp = os.path.join(str(golden_dir), "compress", f"tile_hcompress_{name}_expected.fits")
+    if not (os.path.exists(fz) and os.path.exists(exp)):
+        pytest.skip(f"missing tile_hcompress_{name}")
+    with zf.open(fz) as hdul:
+        data = hdul[1].data
+    with zf.open(exp) as hdul:
+        want = hdul[0].data
+    np.testing.assert_array_equal(data.astype(np.int64), want.astype(np.int64))
+
+
+@pytest.mark.parametrize("name", ["hcompress_fdith", "hcompress_fq0", "rice_fdith"])
+def test_golden_quantized_float_matches_funpack(golden_dir, name):
+    """Quantized-float tiles (SUBTRACTIVE_DITHER_1 / NO_DITHER, q=4) dequantize exactly like funpack."""
+    fz = os.path.join(str(golden_dir), "compress", f"tile_{name}.fits")
+    exp = os.path.join(str(golden_dir), "compress", f"tile_{name}_expected.fits")
+    if not (os.path.exists(fz) and os.path.exists(exp)):
+        pytest.skip(f"missing tile_{name}")
+    with zf.open(fz) as hdul:
+        data = hdul[1].data
+    with zf.open(exp) as hdul:
+        want = hdul[0].data
+    assert data.dtype == np.float32 and want.dtype == np.float32
+    # Bit-pattern equality: the dequantization must be funpack-identical, not merely close.
+    np.testing.assert_array_equal(data.view(np.uint32), want.view(np.uint32))
+
+
 def test_golden_image_i16(golden_dir):
     path = os.path.join(str(golden_dir), "images", "img_i16.fits")
     if not os.path.exists(path):
@@ -58,3 +88,45 @@ def test_golden_ascii_table(golden_dir):
     with zf.open(path) as hdul:
         rec = hdul[1].data
         assert list(rec["ID"]) == [100, 200, 300]
+
+
+def test_golden_image_i16_blank(golden_dir):
+    path = os.path.join(str(golden_dir), "images", "img_i16_blank.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing img_i16_blank")
+    with zf.open(path) as hdul:
+        d = hdul[0].data.ravel()
+        assert d.dtype == np.dtype("f4")  # astropy width for BITPIX 16 + BLANK
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], np.array(rest, dtype="f4") - 8)
+
+
+def test_golden_image_i16_blank_scaled(golden_dir):
+    """Null substitution happens on the RAW stored value, BEFORE BSCALE/BZERO scaling."""
+    path = os.path.join(str(golden_dir), "images", "img_i16_blank_scaled.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing img_i16_blank_scaled")
+    with zf.open(path) as hdul:
+        d = hdul[0].data.ravel()
+        assert d.dtype.kind == "f"
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()  # NaN, NOT 2*(-32768)+100
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], 2.0 * (np.array(rest) - 8) + 100.0)
+
+
+def test_golden_tile_rice_i16_blank(golden_dir):
+    """fpack keeps the source's plain BLANK keyword in the compressed header (no ZBLANK);
+    the decode must still yield NaN-masked floats, like funpack/astropy."""
+    path = os.path.join(str(golden_dir), "compress", "tile_rice_i16_blank.fits")
+    if not os.path.exists(path):
+        pytest.skip("missing tile_rice_i16_blank")
+    with zf.open(path) as hdul:
+        d = hdul[1].data.ravel()
+        assert d.dtype.kind == "f"
+        blanks = [3, 17, 31]
+        assert np.isnan(d[blanks]).all()
+        rest = [i for i in range(32) if i not in blanks]
+        np.testing.assert_array_equal(d[rest], np.array(rest, dtype="f8") - 8)

@@ -603,12 +603,13 @@ Every task must satisfy all of these before it is `done`:
   tile; out-of-range ⇒ `DataConstraintViolated`.
 
 ### CMP-6 — HCOMPRESS_1 codec
-- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` · **Size:** XL · **Status:** done (lossless round-trip + CFITSIO golden decode inbound & `funpack` outbound; lossy `hsmooth` still N/A)
+- **Milestone:** M3 · **Module:** `src/compress/hcompress.zig` (+ `imgstats.zig`) · **Size:** XL · **Status:** done — INCLUDING lossy: decode `hsmooth` (`ZVAL2` SMOOTH) is bit-exact vs `funpack` on committed lossy/smoothed goldens, and lossy write supports CFITSIO's absolute + noise-adaptive scale (`hcomp_scale`) with `funpack`/Astropy agreeing on the output
 - **Depends on:** CMP-3a, X-FIXTURES
 - **Req:** FR-CMP-3 · **Design:** §17.3 · **Spec:** §10.4.4, Table 39
 - **Goal:** H-transform + quantization + quadtree coding, 2-D tiles only, `SCALE` from `ZVAL1`.
 - **Acceptance:** lossless (`SCALE=0`) round-trip is exact **and decode of a committed CFITSIO-written
-  HCOMPRESS_1 tile matches** (X-FIXTURES — same inbound bar as CMP-4/CMP-5); non-2-D ⇒
+  HCOMPRESS_1 tile matches** (X-FIXTURES — same inbound bar as CMP-4/CMP-5); lossy decode (plain and
+  `SMOOTH=1`) reproduces the committed funpack-authored expected pixels exactly; non-2-D ⇒
   `DataConstraintViolated`.
 
 ### CMP-7 — Subtractive dithering & random generator

@@ -223,7 +223,9 @@ pub const AsciiTable = struct {
     /// `TSCALn`/`TZEROn` are inverted before formatting. A `null` value writes the column's
     /// `TNULLn` string (or blanks if none). The formatted text must fit the field width, else
     /// `error.Overflow`. `error.WrongValueType` for a character column — use `writeCellStr`.
+    /// `error.NotWritable` on a read-only handle or device.
     pub fn writeCell(self: *AsciiTable, comptime T: type, col: ColumnRef, row: u64, value: ?T) Error!void {
+        try self.requireWritable();
         const c = try self.columnPtr(col);
         return self.writeCellValue(T, c, row, value, .scalar);
     }
@@ -241,7 +243,9 @@ pub const AsciiTable = struct {
     /// Write a contiguous run of numeric cells (symmetric with `readColumn`; bulk conversion).
     /// A `null` element writes the column's `TNULLn` (or blanks). `error.RowOutOfRange` if the
     /// run extends past `NAXIS2`; `error.Overflow` if any value overflows the field width.
+    /// `error.NotWritable` on a read-only handle or device.
     pub fn writeColumn(self: *AsciiTable, comptime T: type, col: ColumnRef, first_row: u64, values: []const ?T) Error!void {
+        try self.requireWritable();
         const c = try self.columnPtr(col);
         const end = try limits.add(first_row, values.len);
         if (end > self.naxis2) return error.RowOutOfRange;
@@ -266,8 +270,9 @@ pub const AsciiTable = struct {
     /// Write one character (`Aw`) cell at `row` from `value`, left-justified and space-padded
     /// to the field width. A `null` value writes the column's `TNULLn` (or blanks).
     /// `error.WrongValueType` for a non-character column; `error.Overflow` if the text exceeds
-    /// the field width.
+    /// the field width. `error.NotWritable` on a read-only handle or device.
     pub fn writeCellStr(self: *AsciiTable, col: ColumnRef, row: u64, value: ?[]const u8) Error!void {
+        try self.requireWritable();
         const c = try self.columnPtr(col);
         if (c.tform.type != .char) return error.WrongValueType;
         const w: u64 = c.tform.width;
@@ -287,6 +292,10 @@ pub const AsciiTable = struct {
     }
 
     // ── internals ──────────────────────────────────────────────────────────────────────────
+
+    fn requireWritable(self: *const AsciiTable) errors.IoError!void {
+        if (self.fits.mode == .read_only or !self.fits.dev.isWritable()) return error.NotWritable;
+    }
 
     /// Resolve a `ColumnRef` to a column pointer (`error.NoSuchColumn`/`error.AmbiguousColumn`).
     fn columnPtr(self: *AsciiTable, col: ColumnRef) errors.TableError!*AsciiColumn {
@@ -741,6 +750,44 @@ test "round-trip I/F/E/D numeric columns through appendHdu, then reopen" {
         try testing.expectEqual(@as(i64, 20), (try t.readCell(i64, .{ .index = 0 }, 1)).?);
         try testing.expectEqual(@as(f64, 100.0), (try t.readCell(f64, .{ .index = 2 }, 2)).?);
     }
+}
+
+test "read-only handle rejects every ASCII-table write without mutation" {
+    const alloc = testing.allocator;
+    var mem = MemoryDevice.init(alloc);
+    defer mem.deinit();
+
+    const cols = [_]TCol{
+        .{ .tbcol = 1, .tform = "I6", .ttype = "COUNT" },
+        .{ .tbcol = 7, .tform = "A8", .ttype = "LABEL" },
+    };
+    {
+        var f = try Fits.create(alloc, mem.device(), .{});
+        defer f.deinit();
+        const hdu = try appendAsciiTable(&f, alloc, &cols, 14, 2);
+        var t = try AsciiTable.of(&f, hdu);
+        defer t.deinit(alloc);
+        try t.writeColumn(i64, .{ .index = 0 }, 0, &[_]?i64{ 11, 22 });
+        try t.writeCellStr(.{ .index = 1 }, 0, "alpha");
+        try t.writeCellStr(.{ .index = 1 }, 1, "beta");
+        try f.flush();
+    }
+
+    const before = try alloc.dupe(u8, mem.bytes());
+    defer alloc.free(before);
+
+    var f = try Fits.open(alloc, mem.device(), .read_only, .{});
+    defer f.deinit();
+    try testing.expect(f.dev.isWritable()); // prove rejection comes from the logical handle mode
+    const hdu = try f.select(2);
+    var t = try AsciiTable.of(&f, hdu);
+    defer t.deinit(alloc);
+
+    try testing.expectError(error.NotWritable, t.writeCell(i64, .{ .index = 0 }, 0, 99));
+    try testing.expectError(error.NotWritable, t.writeColumn(i64, .{ .index = 0 }, 0, &[_]?i64{ 99, 100 }));
+    try testing.expectError(error.NotWritable, t.writeColumn(i64, .{ .index = 0 }, 0, &[_]?i64{}));
+    try testing.expectError(error.NotWritable, t.writeCellStr(.{ .index = 1 }, 0, "changed"));
+    try testing.expectEqualSlices(u8, before, mem.bytes());
 }
 
 test "round-trip Aw character cells (string read/write)" {

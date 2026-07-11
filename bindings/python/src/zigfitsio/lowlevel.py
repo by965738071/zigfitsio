@@ -12,6 +12,28 @@ import ctypes as _c
 
 from ._loader import load_library
 
+__all__ = [
+    # Loaded C ABI handle.
+    "lib",
+    # ctypes aliases used to construct calls to ``lib.zf_*``.
+    "VOID", "INT", "LONG", "LL", "SZ", "FLT", "DBL", "U32", "U64", "I64", "CHARP",
+    "PSZ", "PVOID", "PINT", "PLONG", "PLL", "PDBL", "PU64", "PCHARP",
+    # Datatype, mode, HDU, and table constants.
+    "ZF_UINT8", "ZF_INT8", "ZF_INT16", "ZF_UINT16", "ZF_INT32", "ZF_UINT32",
+    "ZF_INT64", "ZF_UINT64", "ZF_FLOAT32", "ZF_FLOAT64", "ZF_BOOL", "ZF_BIT",
+    "ZF_STRING", "ZF_COMPLEX64", "ZF_COMPLEX128",
+    "READONLY", "READWRITE", "CREATE",
+    "HDU_PRIMARY", "HDU_IMAGE", "HDU_ASCII_TABLE", "HDU_BINARY_TABLE", "HDU_RANDOM_GROUPS",
+    "BINARY_TBL", "ASCII_TBL",
+    # C-compatible structures.
+    "ZfOpenOpts", "ZfScaling", "ZfColInfo",
+    # Exceptions and helpers.
+    "FitsError", "FitsIOError", "FitsMemoryError", "FitsHeaderError", "KeywordNotFound",
+    "FitsStructError", "FitsTableError", "FitsTypeError", "FitsOverflowError",
+    "FitsCompressError", "FitsWcsError",
+    "last_error_message", "check", "version",
+]
+
 lib = load_library()
 
 # ── ctypes shorthands ────────────────────────────────────────────────────────────────────────
@@ -20,6 +42,7 @@ INT = _c.c_int
 LONG = _c.c_long
 LL = _c.c_longlong
 SZ = _c.c_size_t
+FLT = _c.c_float
 DBL = _c.c_double
 U32 = _c.c_uint32
 U64 = _c.c_uint64
@@ -70,6 +93,8 @@ ASCII_TBL = 1
 
 # ── C structs (must match bindings/c/zigfitsio.h) ────────────────────────────────────────────
 class ZfOpenOpts(_c.Structure):
+    """Resource limits and close-time behavior accepted by the C ABI open functions."""
+
     _fields_ = [
         ("checksum_on_close", INT),
         ("max_header_blocks", U32),
@@ -85,6 +110,8 @@ class ZfOpenOpts(_c.Structure):
 
 
 class ZfScaling(_c.Structure):
+    """Image scaling values passed to low-level image reads and writes."""
+
     _fields_ = [
         ("bscale", DBL),
         ("bzero", DBL),
@@ -95,6 +122,8 @@ class ZfScaling(_c.Structure):
 
 
 class ZfColInfo(_c.Structure):
+    """Metadata returned for a binary or ASCII table column."""
+
     _fields_ = [
         ("typecode", INT),
         ("repeat", I64),
@@ -119,15 +148,15 @@ class FitsError(Exception):
 
 
 class FitsIOError(FitsError):
-    pass
+    """An error while opening, reading, writing, or flushing FITS storage."""
 
 
 class FitsMemoryError(FitsError, MemoryError):
-    pass
+    """The FITS library could not allocate the requested memory."""
 
 
 class FitsHeaderError(FitsError):
-    pass
+    """A FITS header or keyword is invalid."""
 
 
 class KeywordNotFound(FitsHeaderError, KeyError):
@@ -135,27 +164,27 @@ class KeywordNotFound(FitsHeaderError, KeyError):
 
 
 class FitsStructError(FitsError):
-    pass
+    """The FITS file has an invalid HDU or data-unit structure."""
 
 
 class FitsTableError(FitsError):
-    pass
+    """A FITS table operation or column definition is invalid."""
 
 
 class FitsTypeError(FitsError, TypeError):
-    pass
+    """A requested FITS or host-language datatype is unsupported."""
 
 
 class FitsOverflowError(FitsError):
-    pass
+    """A value or allocation size exceeds the supported range."""
 
 
 class FitsCompressError(FitsError):
-    pass
+    """A tile-compression or decompression operation failed."""
 
 
 class FitsWcsError(FitsError):
-    pass
+    """A world-coordinate-system transform or definition is invalid."""
 
 
 # CFITSIO status code → exception class (nearest mapping; default FitsError).
@@ -264,6 +293,7 @@ _PROTOS = [
     ("zf_write_key_log", INT, [VOID, CHARP, SZ, INT, CHARP, SZ]),
     ("zf_write_key_str", INT, [VOID, CHARP, SZ, CHARP, SZ, CHARP, SZ]),
     ("zf_write_key_longstr", INT, [VOID, CHARP, SZ, CHARP, SZ, CHARP, SZ]),
+    ("zf_write_key_undef", INT, [VOID, CHARP, SZ, CHARP, SZ]),
     ("zf_delete_key", INT, [VOID, CHARP, SZ]),
     ("zf_rename_key", INT, [VOID, CHARP, SZ, CHARP, SZ]),
     ("zf_write_record", INT, [VOID, CHARP]),
@@ -295,6 +325,9 @@ _PROTOS = [
     ("zf_read_descript", INT, [VOID, INT, LL, PLL, PLL]),
     ("zf_read_col_vla", INT, [VOID, INT, INT, LL, LL, VOID, PLL]),
     ("zf_write_col_vla", INT, [VOID, INT, INT, LL, VOID, LL]),
+    ("zf_read_col_vla_layout", INT, [VOID, INT, LL, LL, PU64, SZ, PU64]),
+    ("zf_read_col_vla_packed", INT, [VOID, INT, INT, LL, LL, VOID, U64]),
+    ("zf_write_col_vla_packed", INT, [VOID, INT, INT, LL, LL, PU64, SZ, VOID, U64]),
     # integrity
     ("zf_write_chksum", INT, [VOID]),
     ("zf_update_chksum_all", INT, [VOID]),
@@ -310,6 +343,8 @@ _PROTOS = [
     ("zf_wcs_world2pix", INT, [VOID, INT, DBL, DBL, PDBL, PDBL]),
     # compression
     ("zf_write_compressed", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, VOID, LL]),
+    ("zf_write_compressed2", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, VOID, LL]),
+    ("zf_write_compressed3", INT, [VOID, INT, INT, INT, PLONG, PLONG, CHARP, CHARP, LL, FLT, INT, FLT, INT, VOID, LL]),
 ]
 
 

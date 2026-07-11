@@ -156,6 +156,7 @@ int  zf_write_key_dbl(ZfFits* h, const uint8_t* name, size_t name_len, double va
 int  zf_write_key_log(ZfFits* h, const uint8_t* name, size_t name_len, int value, const uint8_t* comment, size_t comment_len);
 int  zf_write_key_str(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, const uint8_t* comment, size_t comment_len);
 int  zf_write_key_longstr(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, const uint8_t* comment, size_t comment_len);
+int  zf_write_key_undef(ZfFits* h, const uint8_t* name, size_t name_len, const uint8_t* comment, size_t comment_len);
 int  zf_delete_key(ZfFits* h, const uint8_t* name, size_t name_len);
 int  zf_rename_key(ZfFits* h, const uint8_t* old, size_t old_len, const uint8_t* neu, size_t neu_len);
 int  zf_write_record(ZfFits* h, const uint8_t* card80);
@@ -195,6 +196,20 @@ int  zf_delete_col(ZfTable* t, int col);
 int  zf_read_descript(ZfTable* t, int col, long long row, long long* out_len, long long* out_off);
 int  zf_read_col_vla(ZfTable* t, int dtype, int col, long long row, long long cap, void* array, long long* out_nelem);
 int  zf_write_col_vla(ZfTable* t, int dtype, int col, long long row, const void* array, long long nelem);
+/* Measure a row range for packed VLA transfer. `offsets` receives `nrows + 1` scalar-slot
+ * offsets, beginning at zero; `out_nslots` receives the terminal offset. Complex values use
+ * two scalar slots (real, imaginary) per logical element. Rows are 1-based and columns 0-based. */
+int  zf_read_col_vla_layout(ZfTable* t, int col, long long firstrow, long long nrows,
+                            uint64_t* offsets, size_t offsets_cap, uint64_t* out_nslots);
+/* Read a row range contiguously into `array`. `cap` is measured in transfer scalar slots and
+ * must match the layout's terminal offset. A NULL `array` is valid only when `cap == 0`. */
+int  zf_read_col_vla_packed(ZfTable* t, int dtype, int col, long long firstrow,
+                            long long nrows, void* array, uint64_t cap);
+/* Write a row range from one contiguous scalar-slot buffer. `offsets` must contain exactly
+ * `nrows + 1` monotonic entries beginning at zero and ending at `nelem`. */
+int  zf_write_col_vla_packed(ZfTable* t, int dtype, int col, long long firstrow,
+                             long long nrows, const uint64_t* offsets, size_t offsets_len,
+                             const void* array, uint64_t nelem);
 
 /* ── Data integrity ──────────────────────────────────────────────────────────────────────── */
 int  zf_write_chksum(ZfFits* h);
@@ -218,6 +233,28 @@ int  zf_wcs_world2pix(ZfFits* h, int alt, double lon, double lat, double* out_px
 int  zf_write_compressed(ZfFits* h, int dtype, int bitpix, int naxis, const long* axes,
                          const long* tile, const char* codec, const char* quantize,
                          long long zdither0, const void* pixels, long long nelem);
+
+/* zf_write_compressed plus the HCOMPRESS_1 lossy knobs (CFITSIO fits_set_hcomp_scale /
+ * fits_set_hcomp_smooth semantics): hcomp_scale 0 = lossless, > 0 = noise-adaptive
+ * (per-tile scale = round(request x background sigma)), < 0 = |value| absolute scale;
+ * hcomp_smooth != 0 records the ZNAME2='SMOOTH' decode-side smoothing request. Setting either
+ * knob with a non-HCOMPRESS codec is an error (never silently ignored). */
+int  zf_write_compressed2(ZfFits* h, int dtype, int bitpix, int naxis, const long* axes,
+                          const long* tile, const char* codec, const char* quantize,
+                          long long zdither0, float hcomp_scale, int hcomp_smooth,
+                          const void* pixels, long long nelem);
+
+/* zf_write_compressed2 plus the CFITSIO quantization level (fits_set_quantize_level /
+ * fpack -q semantics) for float images with a quantizing method ("NO_DITHER",
+ * "SUBTRACTIVE_DITHER_1", "SUBTRACTIVE_DITHER_2"): quantize_level > 0 sets the per-tile step
+ * to sigma/level (sigma = MAD background noise), 0 the CFITSIO default (sigma/4), < 0 the
+ * absolute step |level|. Pass has_quantize_level = 0 to leave the level unset (library
+ * default). A set level with a non-quantizing write is an error (never silently ignored). */
+int  zf_write_compressed3(ZfFits* h, int dtype, int bitpix, int naxis, const long* axes,
+                          const long* tile, const char* codec, const char* quantize,
+                          long long zdither0, float quantize_level, int has_quantize_level,
+                          float hcomp_scale, int hcomp_smooth,
+                          const void* pixels, long long nelem);
 
 #ifdef __cplusplus
 }

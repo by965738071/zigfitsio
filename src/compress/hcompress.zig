@@ -14,7 +14,10 @@
 //!   2. **Quantization** (`digitize`/`undigitize`) — for `scale > 1` every coefficient is
 //!      divided by `scale` (lossy); `scale <= 1` (and the acceptance target `scale == 0`) is a
 //!      no-op, i.e. **lossless** with exact integer pixel recovery. (FITS Table 39: `ZNAME1 =
-//!      'SCALE'`, `ZVAL1` default `0.0` ⇒ lossless.)
+//!      'SCALE'`, `ZVAL1` default `0.0` ⇒ lossless.) On decode, lossy streams may additionally
+//!      request **smoothing** (`hsmooth`, `ZNAME2 = 'SMOOTH'`/`ZVAL2` ⇒ `DecodeOpts.smooth`):
+//!      coefficients are nudged toward interpolated values within the ±scale/2 quantization
+//!      uncertainty, reducing the blocky artifacts of plain inversion — CFITSIO-identical.
 //!
 //!   3. **Quadtree nibble coding** (`encode`/`decode`) — coefficients are split into sign +
 //!      magnitude; each magnitude bit plane is coded MSB-first by a recursive quadtree using the
@@ -39,11 +42,13 @@
 //!     `sumall` field either way, so the container is unchanged.
 //!   * `output_nnybble`/`input_nnybble` (CFITSIO's hand-unrolled bulk-nibble I/O) are expressed
 //!     here as plain loops over `outputNybble`/`inputNybble`, which are bit-for-bit equivalent.
-//! BYTE-EXACT parity against CFITSIO 4.6.4 is a SEPARATE blocked external-toolchain golden-corpus
-//! task (no C toolchain here); this implementation is verified by lossless self round-trip
-//! (`htrans`∘`hinv` identity, and `compress`∘`decompress` over constant/gradient/checkerboard/
-//! random/negative/non-power-of-two/edge tiles, plus the `write_bdirect` path), and by a bounded
-//! lossy (`scale > 1`) error check.
+//! BYTE-EXACT parity against CFITSIO 4.6.4 is verified: the committed golden corpus
+//! (`test/golden/compress/tile_hcompress*.fits`, incl. lossy and SMOOTH variants with
+//! funpack-authored expected pixels) pins the decode paths bit-for-bit, and the `interop` CI job
+//! proves `funpack` reads this encoder's output back exactly. Additionally verified by lossless
+//! self round-trip (`htrans`∘`hinv` identity, and `compress`∘`decompress` over constant/gradient/
+//! checkerboard/random/negative/non-power-of-two/edge tiles, plus the `write_bdirect` path), and
+//! by bounded lossy (`scale > 1`, with and without smoothing) error checks.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -198,11 +203,21 @@ pub fn compress(alloc: Allocator, data: []const i32, nx: usize, ny: usize, scale
     return out.toOwnedSlice(alloc);
 }
 
+/// Decode-side options for `decompress`.
+pub const DecodeOpts = struct {
+    /// Apply CFITSIO `hsmooth` coefficient smoothing during the inverse transform. This is the
+    /// file-level `ZNAME2 = 'SMOOTH'` / `ZVAL2` request (FITS 4.0 Table 39) — it is NOT part of
+    /// the compressed stream itself. A no-op when the stream's embedded `scale <= 1` (lossless),
+    /// exactly as in CFITSIO.
+    smooth: bool = false,
+};
+
 /// Decompress an HCOMPRESS_1 stream produced by `compress` (or any standard-layout encoder).
 /// Reads `nx`, `ny`, `scale`, `sumall` and the per-quadrant plane counts, inverts the quadtree
-/// coder, the quantization and the H-transform, and returns the recovered pixels. A bad magic,
-/// truncated body, or out-of-range value is `error.CorruptTile`. Caller owns `Decoded.data`.
-pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize) HcompressError!Decoded {
+/// coder, the quantization and the H-transform (smoothing per `opts`), and returns the recovered
+/// pixels. A bad magic, truncated body, or out-of-range value is `error.CorruptTile`. Caller owns
+/// `Decoded.data`.
+pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize, opts: DecodeOpts) HcompressError!Decoded {
     if (src.len < 2 or src[0] != code_magic[0] or src[1] != code_magic[1]) return error.CorruptTile;
     var dec = Decoder{ .data = src, .nextchar = 2 };
 
@@ -256,10 +271,11 @@ pub fn decompress(alloc: Allocator, src: []const u8, nelem: usize) HcompressErro
         }
     }
 
-    // Restore the DC term, undo quantization, invert the transform.
+    // Restore the DC term, undo quantization, invert the transform (smoothing, if requested,
+    // happens inside `hinv` per resolution level, on the already-rescaled coefficients).
     a[0] = sumall;
     try undigitize(a, scale);
-    try hinv(alloc, a, nx, ny);
+    try hinv(alloc, a, nx, ny, opts.smooth, scale);
 
     const out = try alloc.alloc(i32, n);
     errdefer alloc.free(out);
@@ -359,12 +375,14 @@ fn htrans(alloc: Allocator, a: []i64, nx: usize, ny: usize) Allocator.Error!void
     }
 }
 
-// Inverse integer H-transform (CFITSIO `hinv`, no smoothing). Exact inverse of `htrans`.
+// Inverse integer H-transform (CFITSIO `hinv`/`hinv64`). Exact inverse of `htrans` when
+// `smooth == false`; with `smooth` set it additionally applies `hsmooth` at every resolution
+// level (after the unshuffles, before the 2x2 recombination — CFITSIO's exact hook point).
 // The recombination sums are evaluated in i128 (a 4-way sum of i64 values cannot overflow i128)
 // and narrowed back with a checked cast: for a valid tile every value fits i64 so the result is
 // identical, while a crafted tile with out-of-range sumall/coefficients yields error.CorruptTile
 // instead of an i64 integer-overflow panic.
-fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) HcompressError!void {
+fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize, smooth: bool, scale: i32) HcompressError!void {
     const log2n = ceilLog2(@max(nx, ny));
     if (log2n == 0) return;
     const tmp = try alloc.alloc(i64, (@max(nx, ny) + 1) / 2);
@@ -393,7 +411,8 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) HcompressError!void {
     var nytop: usize = 1;
     var nxf: usize = nx;
     var nyf: usize = ny;
-    var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+    // Shift amount must be `Log2Int(usize)` (u5 on wasm32, u6 on 64-bit); let `@intCast` infer it.
+    var c: usize = @as(usize, 1) << @intCast(log2n);
 
     var k: usize = log2n;
     while (k > 0) {
@@ -412,6 +431,9 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) HcompressError!void {
         while (ui < nxtop) : (ui += 1) unshuffle(a, ny * ui, nytop, 1, tmp);
         var uj: usize = 0;
         while (uj < nytop) : (uj += 1) unshuffle(a, uj, nxtop, ny, tmp);
+
+        // Smooth by interpolating coefficients if requested (CFITSIO: `if (smooth) hsmooth(...)`).
+        if (smooth) try hsmooth(a, nxtop, nytop, ny, scale);
 
         const oddx = (nxtop & 1) == 1;
         const oddy = (nytop & 1) == 1;
@@ -481,6 +503,121 @@ fn hinv(alloc: Allocator, a: []i64, nx: usize, ny: usize) HcompressError!void {
         prnd0 = prnd0 >> 1;
         nrnd1 = nrnd0;
         nrnd0 = prnd0 - 1;
+    }
+}
+
+// Smooth the H-transform coefficients toward interpolated values (CFITSIO `hsmooth`/`hsmooth64`,
+// R. White 1992). Called once per resolution level from `hinv` on the current `nxtop × nytop`
+// coefficient block (row stride `ny`), AFTER `undigitize` has rescaled the coefficients, so the
+// working units are the true coefficient units. Each of the three passes (hx, hy, hc) nudges a
+// difference coefficient toward the slope/curvature interpolated from the neighboring zones'
+// mean values, subject to monotonicity constraints, and clamps the change to ±scale/2 — the
+// quantization uncertainty `digitize` introduced — so smoothing never contradicts the encoded
+// data. Edge coefficients are never adjusted (loops start at 2 / end 2 short, exactly as in C;
+// the `x + 2 < bound` forms are the underflow-safe usize equivalents of C's `x < bound-2`).
+// Intermediates are widened to i128 (`coeff << 6` may exceed i64 on adversarial streams); the
+// final adjusted coefficient narrows with a checked cast (error.CorruptTile), matching `hinv`.
+fn hsmooth(a: []i64, nxtop: usize, nytop: usize, ny: usize, scale: i32) HcompressError!void {
+    // Maximum permitted change: since digitize rounded during division, the true coefficient
+    // lies within ±scale/2 of the reconstructed value. scale <= 1 (lossless) is a no-op.
+    const smax: i128 = @as(i128, scale >> 1);
+    if (smax <= 0) return;
+    const ny2 = ny << 1;
+
+    // (1) Adjust the x-difference coefficients hx (rows 2..nxtop-3, every even column).
+    {
+        var i: usize = 2;
+        while (i + 2 < nxtop) : (i += 2) {
+            var s00 = ny * i; // index of a[i,j]
+            var s10 = s00 + ny; // index of a[i+1,j]
+            var j: usize = 0;
+            while (j < nytop) : (j += 2) {
+                // hp/hm are the mean values (h0) of the next/previous x zones.
+                const hm: i128 = a[s00 - ny2];
+                const h0: i128 = a[s00];
+                const hp: i128 = a[s00 + ny2];
+                // diff = 8 * the hx slope that would match h0 in the neighboring zones,
+                // monotonicity-constrained (dmax >= 0, dmin <= 0 by construction).
+                var diff: i128 = hp - hm;
+                const dmax: i128 = @max(@min(hp - h0, h0 - hm), 0) << 2;
+                const dmin: i128 = @min(@max(hp - h0, h0 - hm), 0) << 2;
+                // If monotonicity would force slope 0, leave hx unchanged.
+                if (dmin < dmax) {
+                    diff = @max(@min(diff, dmax), dmin);
+                    // Change in slope, divide-by-8 with care rounding negatives, clamp ±smax.
+                    var s: i128 = diff - (@as(i128, a[s10]) << 3);
+                    s = if (s >= 0) s >> 3 else (s + 7) >> 3;
+                    s = @max(@min(s, smax), -smax);
+                    a[s10] = std.math.cast(i64, @as(i128, a[s10]) + s) orelse return error.CorruptTile;
+                }
+                s00 += 2;
+                s10 += 2;
+            }
+        }
+    }
+    // (2) Adjust the y-difference coefficients hy (every even row, columns 2..nytop-3).
+    {
+        var i: usize = 0;
+        while (i < nxtop) : (i += 2) {
+            var s00 = ny * i + 2;
+            var j: usize = 2;
+            while (j + 2 < nytop) : (j += 2) {
+                const hm: i128 = a[s00 - 2];
+                const h0: i128 = a[s00];
+                const hp: i128 = a[s00 + 2];
+                var diff: i128 = hp - hm;
+                const dmax: i128 = @max(@min(hp - h0, h0 - hm), 0) << 2;
+                const dmin: i128 = @min(@max(hp - h0, h0 - hm), 0) << 2;
+                if (dmin < dmax) {
+                    diff = @max(@min(diff, dmax), dmin);
+                    var s: i128 = diff - (@as(i128, a[s00 + 1]) << 3);
+                    s = if (s >= 0) s >> 3 else (s + 7) >> 3;
+                    s = @max(@min(s, smax), -smax);
+                    a[s00 + 1] = std.math.cast(i64, @as(i128, a[s00 + 1]) + s) orelse return error.CorruptTile;
+                }
+                s00 += 2;
+            }
+        }
+    }
+    // (3) Adjust the curvature coefficients hc (interior zones only, both axes).
+    {
+        var i: usize = 2;
+        while (i + 2 < nxtop) : (i += 2) {
+            var s00 = ny * i + 2;
+            var s10 = s00 + ny;
+            var j: usize = 2;
+            while (j + 2 < nytop) : (j += 2) {
+                // Diagonal-neighbor mean values around this zone:
+                //   hmp | hpp     (y increasing to the right, x downward)
+                //   hmm | hpm
+                const hmm: i128 = a[s00 - ny2 - 2];
+                const hpm: i128 = a[s00 + ny2 - 2];
+                const hmp: i128 = a[s00 - ny2 + 2];
+                const hpp: i128 = a[s00 + ny2 + 2];
+                const h0: i128 = a[s00];
+                // diff = 64 * the hc value that would match h0 in the neighboring zones.
+                var diff: i128 = hpp + hmm - hmp - hpm;
+                // 2x the x,y slopes in this zone, then the monotonicity constraints.
+                const hx2: i128 = @as(i128, a[s10]) << 1;
+                const hy2: i128 = @as(i128, a[s00 + 1]) << 1;
+                var m1: i128 = @min(@max(hpp - h0, 0) - hx2 - hy2, @max(h0 - hpm, 0) + hx2 - hy2);
+                var m2: i128 = @min(@max(h0 - hmp, 0) - hx2 + hy2, @max(hmm - h0, 0) + hx2 + hy2);
+                const dmax: i128 = @min(m1, m2) << 4;
+                m1 = @max(@min(hpp - h0, 0) - hx2 - hy2, @min(h0 - hpm, 0) + hx2 - hy2);
+                m2 = @max(@min(h0 - hmp, 0) - hx2 + hy2, @min(hmm - h0, 0) + hx2 + hy2);
+                const dmin: i128 = @max(m1, m2) << 4;
+                if (dmin < dmax) {
+                    diff = @max(@min(diff, dmax), dmin);
+                    // Change in curvature, divide-by-64 rounding toward zero, clamp ±smax.
+                    var s: i128 = diff - (@as(i128, a[s10 + 1]) << 6);
+                    s = if (s >= 0) s >> 6 else (s + 63) >> 6;
+                    s = @max(@min(s, smax), -smax);
+                    a[s10 + 1] = std.math.cast(i64, @as(i128, a[s10 + 1]) + s) orelse return error.CorruptTile;
+                }
+                s00 += 2;
+                s10 += 2;
+            }
+        }
     }
 }
 
@@ -979,7 +1116,7 @@ const Decoder = struct {
             var ny: usize = 1;
             var nfx = nqx;
             var nfy = nqy;
-            var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+            var c: usize = @as(usize, 1) << @intCast(log2n);
             var k: usize = 1;
             while (k < log2n) : (k += 1) {
                 c >>= 1;
@@ -1007,7 +1144,7 @@ const Decoder = struct {
                 var ny: usize = 1;
                 var nfx = nqx;
                 var nfy = nqy;
-                var c: usize = @as(usize, 1) << @as(u6, @intCast(log2n));
+                var c: usize = @as(usize, 1) << @intCast(log2n);
                 var k: usize = 1;
                 while (k < log2n) : (k += 1) {
                     c >>= 1;
@@ -1044,9 +1181,13 @@ fn readBE(comptime T: type, dec: *Decoder) error{CorruptTile}!T {
 const testing = std.testing;
 
 fn roundTrip(alloc: Allocator, data: []const i32, nx: usize, ny: usize, scale: i32) ![]i32 {
+    return roundTripOpts(alloc, data, nx, ny, scale, .{});
+}
+
+fn roundTripOpts(alloc: Allocator, data: []const i32, nx: usize, ny: usize, scale: i32, opts: DecodeOpts) ![]i32 {
     const enc = try compress(alloc, data, nx, ny, scale);
     defer alloc.free(enc);
-    const dec = try decompress(alloc, enc, nx * ny);
+    const dec = try decompress(alloc, enc, nx * ny, opts);
     try testing.expectEqual(nx, dec.nx);
     try testing.expectEqual(ny, dec.ny);
     return dec.data;
@@ -1081,7 +1222,7 @@ test "htrans/hinv are exact inverses across shapes (incl. odd dims and edges)" {
             o.* = v.*;
         }
         try htrans(alloc, a, nx, ny);
-        try hinv(alloc, a, nx, ny);
+        try hinv(alloc, a, nx, ny, false, 0);
         try testing.expectEqualSlices(i64, orig, a);
     }
 }
@@ -1218,7 +1359,7 @@ test "decompress reports geometry and standard magic from the stream header" {
     defer alloc.free(enc);
     try testing.expectEqual(@as(u8, 0xDD), enc[0]);
     try testing.expectEqual(@as(u8, 0x99), enc[1]);
-    const dec = try decompress(alloc, enc, 17 * 13);
+    const dec = try decompress(alloc, enc, 17 * 13, .{});
     defer alloc.free(dec.data);
     try testing.expectEqual(@as(usize, 17), dec.nx);
     try testing.expectEqual(@as(usize, 13), dec.ny);
@@ -1239,12 +1380,12 @@ test "non-2-D / bad-shape requests error typed" {
 test "corrupt streams error typed" {
     const alloc = testing.allocator;
     // Too short for the magic.
-    try testing.expectError(error.CorruptTile, decompress(alloc, "s", 1));
+    try testing.expectError(error.CorruptTile, decompress(alloc, "s", 1, .{}));
     // Long enough but wrong magic.
     var buf: [header_len]u8 = undefined;
     @memset(&buf, 0);
     @memcpy(buf[0..2], "ZZ");
-    try testing.expectError(error.CorruptTile, decompress(alloc, &buf, 1));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &buf, 1, .{}));
 
     // Valid header but truncated bit stream.
     var data: [8 * 8]i32 = undefined;
@@ -1256,7 +1397,7 @@ test "corrupt streams error typed" {
     const enc = try compress(alloc, &data, 8, 8, 0);
     defer alloc.free(enc);
     // Cut the body off, keeping only the header: the quadtree decode must run out of bits.
-    try testing.expectError(error.CorruptTile, decompress(alloc, enc[0..header_len], 8 * 8));
+    try testing.expectError(error.CorruptTile, decompress(alloc, enc[0..header_len], 8 * 8, .{}));
 
     // Regression: a crafted DC term (sumall) times `scale` overflowed i64 in undigitize and
     // panicked. nx=ny=2, scale=2, sumall=2^62, all-zero quadtrees, EOF nibble ⇒ 2^62*2 = 2^63.
@@ -1269,7 +1410,7 @@ test "corrupt streams error typed" {
         0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
         0x00, // EOF nibble
     };
-    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc, 2 * 2));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_dc, 2 * 2, .{}));
 
     // Regression: with scale=0 (undigitize is a no-op) a crafted DC term at i64-max overflows the
     // hinv recombination (the (a[0]+rounding)&mask narrowing). Must be CorruptTile, not a panic.
@@ -1282,7 +1423,7 @@ test "corrupt streams error typed" {
         0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
         0x00, // EOF nibble
     };
-    try testing.expectError(error.CorruptTile, decompress(alloc, &hinv_overflow, 2 * 2));
+    try testing.expectError(error.CorruptTile, decompress(alloc, &hinv_overflow, 2 * 2, .{}));
 }
 
 test "lossy (scale>1) round-trip stays within tolerance and is bounded" {
@@ -1325,6 +1466,95 @@ test "lossy: scale==0 and scale==1 are both lossless" {
         defer alloc.free(got);
         try testing.expectEqualSlices(i32, &data, got);
     }
+}
+
+test "smooth: no-op for lossless streams (scale 0 and 1), bit-exact" {
+    const alloc = testing.allocator;
+    const nx = 16;
+    const ny = 12;
+    var data: [nx * ny]i32 = undefined;
+    var seed: u64 = 0xC0FFEE0DDBA11;
+    for (&data) |*v| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @rem(@as(i32, @bitCast(@as(u32, @truncate(seed >> 32)))), 20000);
+    }
+    inline for (.{ 0, 1 }) |scale| {
+        const got = try roundTripOpts(alloc, &data, nx, ny, scale, .{ .smooth = true });
+        defer alloc.free(got);
+        try testing.expectEqualSlices(i32, &data, got);
+    }
+}
+
+test "smooth: lossy round-trip is bounded AND differs from the unsmoothed decode" {
+    const alloc = testing.allocator;
+    const nx = 32;
+    const ny = 32;
+    // A curved (quadratic + cross-term) surface: pure ramps leave nothing for hsmooth to
+    // interpolate, so this pattern is what proves the hook actually fires.
+    var data: [nx * ny]i32 = undefined;
+    for (0..nx) |r| {
+        for (0..ny) |c| data[r * ny + c] = @intCast(r * r + 2 * c * c + r * c);
+    }
+    const scale: i32 = 16;
+    const enc = try compress(alloc, &data, nx, ny, scale);
+    defer alloc.free(enc);
+    const plain = try decompress(alloc, enc, nx * ny, .{});
+    defer alloc.free(plain.data);
+    const smoothed = try decompress(alloc, enc, nx * ny, .{ .smooth = true });
+    defer alloc.free(smoothed.data);
+
+    // Smoothing adjusts each coefficient by at most scale/2 — within the quantization
+    // uncertainty — so the pixel-error bound of the unsmoothed decode still applies.
+    var maxerr: i64 = 0;
+    var ndiff: usize = 0;
+    for (data, smoothed.data, plain.data) |o, s, p| {
+        const e: i64 = @intCast(@abs(@as(i64, o) - @as(i64, s)));
+        if (e > maxerr) maxerr = e;
+        if (s != p) ndiff += 1;
+    }
+    try testing.expect(maxerr <= 64 * scale);
+    try testing.expect(ndiff > 0); // non-vacuous: the smoothing pass changed pixels
+}
+
+test "smooth: tiny/odd shapes decode without panic (usize-underflow guard)" {
+    const alloc = testing.allocator;
+    const shapes = [_][2]usize{
+        .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 4, 4 }, .{ 4, 5 },
+        .{ 5, 4 }, .{ 1, 7 }, .{ 7, 1 }, .{ 5, 5 }, .{ 6, 9 },
+    };
+    inline for (shapes) |sh| {
+        const nx = sh[0];
+        const ny = sh[1];
+        var data: [nx * ny]i32 = undefined;
+        for (0..nx) |r| {
+            for (0..ny) |c| data[r * ny + c] = @intCast(r * r * 3 + c * c * 5 + 1);
+        }
+        const got = try roundTripOpts(alloc, &data, nx, ny, 8, .{ .smooth = true });
+        defer alloc.free(got);
+        var maxerr: i64 = 0;
+        for (data, got) |o, g| {
+            const e: i64 = @intCast(@abs(@as(i64, o) - @as(i64, g)));
+            if (e > maxerr) maxerr = e;
+        }
+        try testing.expect(maxerr <= 64 * 8);
+    }
+}
+
+test "smooth: crafted overflow stream fails loud (CorruptTile), no panic" {
+    const alloc = testing.allocator;
+    // Adversarial stream decoded WITH smoothing requested: sumall = i64 max and scale = 4 makes
+    // the rescaling arithmetic overflow i64 (caught by the checked math in undigitize/hinv/
+    // hsmooth — wherever it trips first, the contract is error.CorruptTile, never a panic).
+    const overflow_smooth = [_]u8{
+        0xDD, 0x99, // magic
+        0x00, 0x00, 0x00, 0x02, // nx = 2
+        0x00, 0x00, 0x00, 0x02, // ny = 2
+        0x00, 0x00, 0x00, 0x04, // scale = 4 (smax = 2 → hsmooth active)
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // sumall = i64 max
+        0x00, 0x00, 0x00, // nbitplanes = {0,0,0}
+        0x00, // EOF nibble
+    };
+    try testing.expectError(error.CorruptTile, decompress(alloc, &overflow_smooth, 2 * 2, .{ .smooth = true }));
 }
 
 test "empty/zero magnitudes: all-zero image round-trips and stays tiny" {

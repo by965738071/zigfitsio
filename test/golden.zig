@@ -85,7 +85,7 @@ test "golden: file sha256 matches MANIFEST" {
     const parsed = try std.json.parseFromSlice(Manifest, alloc, mbytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
-    try testing.expect(parsed.value.files.len >= 13); // all goldens accounted for
+    try testing.expect(parsed.value.files.len >= 26); // all goldens accounted for
     for (parsed.value.files) |entry| {
         const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{entry.path});
         defer alloc.free(path);
@@ -135,6 +135,201 @@ test "golden: GZIP_1 tile decodes to ramp (fpack -g1)" {
 test "golden: CMP-6 HCOMPRESS_1 lossless tile decodes to ramp (fpack -h -s 0)" {
     try requireCorpus();
     try expectRampTile(testing.allocator, "compress/tile_hcompress.fits");
+}
+
+// ── CMP-6 lossy: CFITSIO lossy HCOMPRESS tiles must decode EXACTLY like funpack ─────────────
+//
+// Each lossy `.fz` (absolute scale 16 over a curved 32×32 surface, 32×16 tiles) is paired with
+// a committed `*_expected.fits` — funpack's own decode of those bytes, i.e. the authoritative
+// pixels. Lossy HCOMPRESS decode is deterministic integer math, so zigfitsio must reproduce
+// funpack bit-for-bit: `lossy16`/`lossy32` cover the plain (`ZVAL2 = 0`) inverse across both
+// CFITSIO decode variants (int for ZBITPIX 16, LONGLONG for 32), and `smooth` (`ZVAL2 = 1`)
+// proves decode-side hsmooth is CFITSIO-identical — not merely "close". `clip16` (absolute
+// scale 800 over a noisy plateau at the i16 ceiling) pins the clamp of reconstructions that
+// overshoot the ZBITPIX range — CFITSIO clips those to the type range instead of erroring.
+
+const curv_n = 32 * 32;
+
+fn readExpectedPixels(alloc: Allocator, rel: []const u8, out: *[curv_n]i32) !void {
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1); // funpack restores the image as the primary HDU
+    try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+    var v = try fits.ImageView.of(&f, hdu);
+    try v.readAll(i32, out, .{});
+}
+
+fn expectLossyTile(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8) !void {
+    var expected: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, expected_rel, &expected);
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, curv_n), ti.elementCount());
+    var out: [curv_n]i32 = undefined;
+    try ti.readAll(i32, &out);
+    try testing.expectEqualSlices(i32, &expected, &out);
+}
+
+test "golden: CMP-6 lossy HCOMPRESS_1 i16 tile decodes exactly like funpack (fpack -h -s -16)" {
+    try requireCorpus();
+    try expectLossyTile(testing.allocator, "compress/tile_hcompress_lossy16.fits", "compress/tile_hcompress_lossy16_expected.fits");
+}
+
+test "golden: CMP-6 overshooting lossy HCOMPRESS_1 i16 tile clamps to the ZBITPIX range exactly like funpack (fpack -h -s -800)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    try expectLossyTile(alloc, "compress/tile_hcompress_clip16.fits", "compress/tile_hcompress_clip16_expected.fits");
+
+    // Non-vacuousness: the source plateau tops out at 32700 (gen_clip_i16), so a 32767 in
+    // funpack's expectation can only be CFITSIO clipping an overshooting reconstruction —
+    // proving this golden actually exercises the clamp path (a strict out-of-range reject
+    // would have failed the whole expectLossyTile read with DataConstraintViolated).
+    var expected: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_clip16_expected.fits", &expected);
+    var clipped: usize = 0;
+    for (expected) |v| {
+        if (v == std.math.maxInt(i16)) clipped += 1;
+    }
+    try testing.expect(clipped > 0);
+}
+
+test "golden: CMP-6 lossy HCOMPRESS_1 i32 tile decodes exactly like funpack (scale -16, SMOOTH=0)" {
+    try requireCorpus();
+    try expectLossyTile(testing.allocator, "compress/tile_hcompress_lossy32.fits", "compress/tile_hcompress_lossy32_expected.fits");
+}
+
+test "golden: CMP-6 smoothed lossy HCOMPRESS_1 tile (ZVAL2=1) decodes exactly like funpack hsmooth" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    try expectLossyTile(alloc, "compress/tile_hcompress_smooth.fits", "compress/tile_hcompress_smooth_expected.fits");
+
+    // Non-vacuousness: the smooth file differs from the SMOOTH=0 file only in ZVAL2 (identical
+    // compressed streams), so their funpack decodes differing proves the smoothing pass — in
+    // funpack AND (via the exact-match asserts above) in zigfitsio — actually changed pixels.
+    var plain: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_lossy32_expected.fits", &plain);
+    var smoothed: [curv_n]i32 = undefined;
+    try readExpectedPixels(alloc, "compress/tile_hcompress_smooth_expected.fits", &smoothed);
+    try testing.expect(!std.mem.eql(i32, &plain, &smoothed));
+}
+
+// ── Quantized-float tiles: CFITSIO-quantized f32 goldens decode EXACTLY like funpack ───────
+//
+// Each `.fz` holds the 32×32 f32 noise+gradient field quantized by CFITSIO (q = 4) — HCOMPRESS
+// under SUBTRACTIVE_DITHER_1 (ZDITHER0 = 1) and NO_DITHER, and RICE under SUBTRACTIVE_DITHER_1 —
+// paired with funpack's own dequantized decode. Dequantization is deterministic arithmetic over
+// the shared 10000-entry Park–Miller table, so zigfitsio must reproduce funpack to the exact
+// f32 bit pattern: these goldens pin the inbound quantized-float path (dither offsets, per-tile
+// ZSCALE/ZZERO, and the `(stored − r + 0.5)·ZSCALE + ZZERO` reconstruction) permanently.
+
+const noise_n = 32 * 32;
+
+fn expectQuantizedTile(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8, quantiz: []const u8) !void {
+    // funpack's decode: the authoritative dequantized pixels (primary HDU, BITPIX -32).
+    var expected: [noise_n]f32 = undefined;
+    {
+        const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{expected_rel});
+        defer alloc.free(path);
+        var f = try fits.openFile(alloc, path, .read_only, .{});
+        defer f.deinit();
+        const hdu = try f.select(1);
+        try testing.expectEqual(@as(i64, -32), try hdu.header.getValue(i64, "BITPIX"));
+        try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+        var v = try fits.ImageView.of(&f, hdu);
+        try v.readAll(f32, &expected, .{ .scaling = .{ .mode = .raw } });
+    }
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    const zq = try hdu.header.getString(alloc, "ZQUANTIZ");
+    defer alloc.free(zq);
+    try testing.expectEqualStrings(quantiz, std.mem.trim(u8, zq, " "));
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, noise_n), ti.elementCount());
+    var out: [noise_n]f32 = undefined;
+    try ti.readAll(f32, &out);
+    // Bit-pattern equality (stricter than `==`): the dequantization must be funpack-identical.
+    for (expected, out, 0..) |e, g, i| {
+        testing.expectEqual(@as(u32, @bitCast(e)), @as(u32, @bitCast(g))) catch |err| {
+            std.debug.print("pixel {d}: expected {e}, got {e}\n", .{ i, e, g });
+            return err;
+        };
+    }
+}
+
+test "golden: CMP-6 quantized-float HCOMPRESS_1 dithered tile decodes exactly like funpack (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_hcompress_fdith.fits", "compress/tile_hcompress_fdith_expected.fits", "SUBTRACTIVE_DITHER_1");
+}
+
+test "golden: CMP-6 quantized-float HCOMPRESS_1 undithered tile decodes exactly like funpack (fpack -q0 4)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_hcompress_fq0.fits", "compress/tile_hcompress_fq0_expected.fits", "NO_DITHER");
+}
+
+test "golden: CMP-4 quantized-float RICE_1 dithered tile decodes exactly like funpack (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTile(testing.allocator, "compress/tile_rice_fdith.fits", "compress/tile_rice_fdith_expected.fits", "SUBTRACTIVE_DITHER_1");
+}
+
+// The f64 variant of `expectQuantizedTile`: the quantized-DOUBLE (ZBITPIX = -64) decode must
+// reproduce funpack's full-double dequantization to the exact f64 bit pattern. Pins the
+// double-precision read path permanently (hunt 2026-07-06 item 41: an f32 funnel in
+// `dither.unquantize` corrupted every pixel of every quantized double file; the fix also
+// matches CFITSIO/astropy's FMA-contracted `* ZSCALE + ZZERO` via `@mulAdd`).
+fn expectQuantizedTileF64(alloc: Allocator, fz_rel: []const u8, expected_rel: []const u8, quantiz: []const u8) !void {
+    const npix = noise_n;
+    var expected: [npix]f64 = undefined;
+    {
+        const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{expected_rel});
+        defer alloc.free(path);
+        var f = try fits.openFile(alloc, path, .read_only, .{});
+        defer f.deinit();
+        const hdu = try f.select(1);
+        try testing.expectEqual(@as(i64, -64), try hdu.header.getValue(i64, "BITPIX"));
+        try testing.expectEqualSlices(u64, &.{ 32, 32 }, hdu.axes);
+        var v = try fits.ImageView.of(&f, hdu);
+        try v.readAll(f64, &expected, .{ .scaling = .{ .mode = .raw } });
+    }
+
+    const path = try std.fmt.allocPrint(alloc, golden_dir ++ "/{s}", .{fz_rel});
+    defer alloc.free(path);
+    var f = try fits.openFile(alloc, path, .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    const zq = try hdu.header.getString(alloc, "ZQUANTIZ");
+    defer alloc.free(zq);
+    try testing.expectEqualStrings(quantiz, std.mem.trim(u8, zq, " "));
+    try testing.expectEqual(@as(i64, -64), try hdu.header.getValue(i64, "ZBITPIX"));
+    try testing.expectEqual(@as(i64, 4), try hdu.header.getValue(i64, "ZVAL2"));
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+    try testing.expectEqual(@as(u64, npix), ti.elementCount());
+    var out: [npix]f64 = undefined;
+    try ti.readAll(f64, &out);
+    for (expected, out, 0..) |e, g, i| {
+        testing.expectEqual(@as(u64, @bitCast(e)), @as(u64, @bitCast(g))) catch |err| {
+            std.debug.print("pixel {d}: expected {e}, got {e}\n", .{ i, e, g });
+            return err;
+        };
+    }
+}
+
+test "golden: CMP-4 quantized-double RICE_1 dithered tile decodes exactly like funpack at full f64 width (SUBTRACTIVE_DITHER_1, ZDITHER0=1)" {
+    try requireCorpus();
+    try expectQuantizedTileF64(testing.allocator, "compress/tile_rice_ddith.fits", "compress/tile_rice_ddith_expected.fits", "SUBTRACTIVE_DITHER_1");
 }
 
 // CMP-5: a genuine CFITSIO `fpack -p` PLIO tile decodes to the exact ramp. This golden caught a
@@ -187,6 +382,78 @@ test "golden: inbound i16 image (value[i] = i - 8)" {
     for (out, 0..) |got, i| {
         try testing.expectEqual(@as(i16, @intCast(@as(i64, @intCast(i)) - 8)), got);
     }
+}
+
+test "golden: inbound i16 image with BLANK null (raw passthrough + NaN sentinel)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/images/img_i16_blank.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1);
+    try testing.expectEqual(@as(i64, -32768), try hdu.header.getValue(i64, "BLANK"));
+    var v = try fits.ImageView.of(&f, hdu);
+
+    // Integer read with no sentinel: the raw BLANK value passes through unchanged.
+    var raw: [32]i16 = undefined;
+    try v.readAll(i16, &raw, .{});
+    try testing.expectEqual(@as(i16, -32768), raw[3]);
+
+    // Float read with a NaN sentinel: blanked pixels are NaN, others value[i] = i - 8.
+    var out: [32]f64 = undefined;
+    try v.readAll(f64, &out, .{ .null_sentinel = std.math.nan(f64) });
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got));
+        } else {
+            try testing.expectEqual(@as(f64, @floatFromInt(@as(i64, @intCast(i)) - 8)), got);
+        }
+    }
+}
+
+test "golden: inbound i16 BLANK + BSCALE/BZERO — null substitution precedes scaling" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/images/img_i16_blank_scaled.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(1);
+    var v = try fits.ImageView.of(&f, hdu);
+    var out: [32]f64 = undefined;
+    try v.readAll(f64, &out, .{ .null_sentinel = std.math.nan(f64) });
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got)); // the sentinel, NOT 2*(-32768)+100
+        } else {
+            try testing.expectEqual(2.0 * @as(f64, @floatFromInt(@as(i64, @intCast(i)) - 8)) + 100.0, got);
+        }
+    }
+}
+
+test "golden: RICE tile with a plain BLANK keyword null (fpack does not rename it to ZBLANK)" {
+    try requireCorpus();
+    const alloc = testing.allocator;
+    var f = try fits.openFile(alloc, golden_dir ++ "/compress/tile_rice_i16_blank.fits", .read_only, .{});
+    defer f.deinit();
+    const hdu = try f.select(2); // empty primary + tile-compressed BINTABLE
+    var ti = try fits.TiledImage.of(&f, hdu);
+    defer ti.deinit(alloc);
+
+    // fpack keeps the source image's BLANK spelling in the compressed header (no ZBLANK
+    // keyword or column); CFITSIO reads ZBLANK with a BLANK fallback, and funpack/astropy
+    // both decode NaN here. A float output must substitute NaN at the blanked indices.
+    var out: [32]f32 = undefined;
+    try ti.readAll(f32, &out);
+    for (out, 0..) |got, i| {
+        if (i == 3 or i == 17 or i == 31) {
+            try testing.expect(std.math.isNan(got));
+        } else {
+            try testing.expectEqual(@as(f32, @floatFromInt(@as(i64, @intCast(i)) - 8)), got);
+        }
+    }
+
+    // Integer output: the raw sentinel passes through unchanged (mirrors the uncompressed layer).
+    var iout: [32]i16 = undefined;
+    try ti.readAll(i16, &iout);
+    try testing.expectEqual(@as(i16, -32768), iout[3]);
 }
 
 test "golden: inbound f32 image with IEEE-NaN null pixel" {

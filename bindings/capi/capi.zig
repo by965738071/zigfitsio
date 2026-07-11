@@ -62,6 +62,32 @@ pub export fn zf_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |p| gpa.free(p[0..len]);
 }
 
+// ── Foreign scratch allocator ────────────────────────────────────────────────────────────────
+// A caller that shares no address space with the shim — the WebAssembly binding, which must
+// stage every string/buffer/out-parameter *inside* the module's own linear memory — needs to
+// allocate through this allocator (picking arbitrary offsets would clobber the shim heap). Both
+// are no-ops for a native ctypes/koffi caller, which passes real pointers directly, but they are
+// exported unconditionally so the ABI surface is identical across targets.
+
+/// Allocate `len` bytes of 16-byte-aligned scratch (enough for every ABI struct and any
+/// `f64`/`i64` buffer). The block carries a length header so `zf_wfree` needs only the pointer.
+/// Returns null on out-of-memory (or `len == 0`).
+pub export fn zf_walloc(len: usize) ?[*]u8 {
+    const total = std.mem.alignForward(usize, len + 16, 16);
+    const slice = gpa.alignedAlloc(u8, .@"16", total) catch return null;
+    std.mem.writeInt(u64, slice.ptr[0..8], total, .little);
+    return slice.ptr + 16;
+}
+
+/// Free a block returned by `zf_walloc`. Safe to call with null.
+pub export fn zf_wfree(ptr: ?[*]u8) void {
+    const p = ptr orelse return;
+    const base = p - 16;
+    const total: usize = @intCast(std.mem.readInt(u64, base[0..8], .little));
+    const aligned: [*]align(16) u8 = @alignCast(base);
+    gpa.free(aligned[0..total]);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // Lifecycle
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -274,23 +300,33 @@ pub export fn zf_img_param(h_opt: ?*Handle, bitpix_out: *c_int, naxis_out: *c_in
     const cap: usize = if (axes_cap > 0) @intCast(axes_cap) else 0;
     const compressed = hdu.kind == .binary_table and (hdu.header.getValue(bool, "ZIMAGE") catch false);
     if (compressed) {
-        bitpix_out.* = @intCast(hdu.header.getValue(i64, "ZBITPIX") catch hdu.bitpix);
-        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0;
-        const nax: usize = if (zn > 0 and zn <= 999) @intCast(zn) else 0;
+        // Z* values come straight from an untrusted header (only the real decompression open
+        // validates them), so narrow with checked casts — an error status, never a trap.
+        const zbp = hdu.header.getValue(i64, "ZBITPIX") catch hdu.bitpix;
+        bitpix_out.* = switch (zbp) {
+            8, 16, 32, 64, -32, -64 => @intCast(zbp),
+            else => return abi.fail(&h.diag, error.BadBitpix),
+        };
+        const zn = hdu.header.getValue(i64, "ZNAXIS") catch 0; // missing → zero axes, like ZBITPIX's fallback
+        if (zn < 0 or zn > 999) return abi.fail(&h.diag, error.BadTiling);
+        const nax: usize = @intCast(zn);
         naxis_out.* = @intCast(nax);
         const n = @min(nax, cap);
         var name_buf: [16]u8 = undefined;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const kw = std.fmt.bufPrint(&name_buf, "ZNAXIS{d}", .{i + 1}) catch unreachable;
-            axes[i] = @intCast(hdu.header.getValue(i64, kw) catch 0);
+            const v = hdu.header.getValue(i64, kw) catch 0;
+            if (v < 0) return abi.fail(&h.diag, error.BadTiling);
+            axes[i] = std.math.cast(c_long, v) orelse return abi.fail(&h.diag, error.BadDimensions);
         }
         filled.* = @intCast(n);
     } else {
         bitpix_out.* = @intCast(hdu.bitpix);
         naxis_out.* = @intCast(hdu.naxis);
         const n = @min(@as(usize, hdu.naxis), cap);
-        for (0..n) |i| axes[i] = @intCast(hdu.axes[i]);
+        // A parse-valid axis can still exceed a 32-bit `c_long` (LLP64 Windows, wasm32).
+        for (0..n) |i| axes[i] = std.math.cast(c_long, hdu.axes[i]) orelse return abi.fail(&h.diag, error.BadDimensions);
         filled.* = @intCast(n);
     }
     return 0;
@@ -651,6 +687,12 @@ pub export fn zf_write_key_longstr(h_opt: ?*Handle, name_ptr: [*]const u8, name_
     return 0;
 }
 
+/// Create or update a keyword with an undefined (blank) value field (FITS 4.0 §4.1.2.3).
+pub export fn zf_write_key_undef(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize, comment_ptr: ?[*]const u8, comment_len: usize) c_int {
+    const h = h_opt orelse return abi.failNull();
+    return writeKey(h, name_ptr[0..name_len], .undefined, commentOf(comment_ptr, comment_len));
+}
+
 /// Delete the first card named `name`.
 pub export fn zf_delete_key(h_opt: ?*Handle, name_ptr: [*]const u8, name_len: usize) c_int {
     const h = h_opt orelse return abi.failNull();
@@ -669,7 +711,9 @@ pub export fn zf_rename_key(h_opt: ?*Handle, old_ptr: [*]const u8, old_len: usiz
     return 0;
 }
 
-/// Insert a raw 80-byte card before END.
+/// Insert a raw 80-byte card before END. Like CFITSIO's `ffprec`, the value field is NOT
+/// validated (only printable-ASCII and the keyword name are) — callers building raw cards
+/// must guard their own values (e.g. the bindings reject non-finite reals before this call).
 pub export fn zf_write_record(h_opt: ?*Handle, card80: [*]const u8) c_int {
     const h = h_opt orelse return abi.failNull();
     const hdu = h.cur() catch |e| return abi.fail(&h.diag, e);
@@ -1210,16 +1254,217 @@ fn vlaWrite(ty: ZfType, tbl: *fits.BinTable, mgr: *fits.heap.HeapManager, col: u
     };
 }
 
-/// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. Uses a heap manager
-/// created lazily for the table (assumes the heap starts empty / PCOUNT was reserved).
+/// Write a VLA cell (1-based `row`) from `nelem` elements of `array`. The heap manager is
+/// created lazily and reconstructs its high-water mark from every live VLA descriptor in the
+/// table, so opening and rewriting an already-populated heap cannot overlap another cell.
 pub export fn zf_write_col_vla(t_opt: ?*TableHandle, dtype: c_int, col: c_int, row: c_longlong, array: *const anyopaque, nelem: c_longlong) c_int {
     const t = liveTable(t_opt) orelse return abi.failNull();
     const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
     if (col < 0 or row < 1 or nelem < 0) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    // Match the core write predicate before lazily reconstructing the heap. A read-only write is
+    // guaranteed to fail, so it must not scan or allocate based on untrusted live descriptors.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
     if (t.mgr == null) {
         t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
     }
     vlaWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(row - 1), array, @intCast(nelem)) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+fn alignedMutSlice(comptime T: type, ptr: *anyopaque, len: usize) fits.Error![]T {
+    if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.WrongValueType;
+    return @as([*]T, @ptrCast(@alignCast(ptr)))[0..len];
+}
+
+fn alignedConstSlice(comptime T: type, ptr: *const anyopaque, len: usize) fits.Error![]const T {
+    if (@intFromPtr(ptr) % @alignOf(T) != 0) return error.WrongValueType;
+    return @as([*]const T, @ptrCast(@alignCast(ptr)))[0..len];
+}
+
+fn vlaPackedReadT(
+    comptime T: type,
+    tbl: *fits.BinTable,
+    col: u16,
+    first_row: u64,
+    nrows: u64,
+    array: ?*anyopaque,
+    cap: usize,
+) fits.Error!void {
+    var empty: [0]T = .{};
+    const out: []T = if (cap == 0)
+        empty[0..]
+    else
+        try alignedMutSlice(T, array orelse return error.CellOutOfRange, cap);
+    try fits.heap.readVlaColumnInto(T, tbl, .{ .index = col }, first_row, nrows, out);
+}
+
+fn vlaPackedRead(
+    ty: ZfType,
+    tbl: *fits.BinTable,
+    col: u16,
+    first_row: u64,
+    nrows: u64,
+    array: ?*anyopaque,
+    cap: usize,
+) fits.Error!void {
+    return switch (ty) {
+        .uint8 => vlaPackedReadT(u8, tbl, col, first_row, nrows, array, cap),
+        .int8 => vlaPackedReadT(i8, tbl, col, first_row, nrows, array, cap),
+        .int16 => vlaPackedReadT(i16, tbl, col, first_row, nrows, array, cap),
+        .uint16 => vlaPackedReadT(u16, tbl, col, first_row, nrows, array, cap),
+        .int32 => vlaPackedReadT(i32, tbl, col, first_row, nrows, array, cap),
+        .uint32 => vlaPackedReadT(u32, tbl, col, first_row, nrows, array, cap),
+        .int64 => vlaPackedReadT(i64, tbl, col, first_row, nrows, array, cap),
+        .uint64 => vlaPackedReadT(u64, tbl, col, first_row, nrows, array, cap),
+        .float32 => vlaPackedReadT(f32, tbl, col, first_row, nrows, array, cap),
+        .float64 => vlaPackedReadT(f64, tbl, col, first_row, nrows, array, cap),
+        else => error.WrongValueType,
+    };
+}
+
+fn vlaPackedWriteT(
+    comptime T: type,
+    tbl: *fits.BinTable,
+    mgr: *fits.heap.HeapManager,
+    col: u16,
+    first_row: u64,
+    offsets: []const u64,
+    array: ?*const anyopaque,
+    nelem: usize,
+) fits.Error!void {
+    const in: []const T = if (nelem == 0)
+        &.{}
+    else
+        try alignedConstSlice(T, array orelse return error.CellOutOfRange, nelem);
+    try fits.heap.writeVlaColumn(T, gpa, tbl, mgr, .{ .index = col }, first_row, offsets, in);
+}
+
+fn vlaPackedWrite(
+    ty: ZfType,
+    tbl: *fits.BinTable,
+    mgr: *fits.heap.HeapManager,
+    col: u16,
+    first_row: u64,
+    offsets: []const u64,
+    array: ?*const anyopaque,
+    nelem: usize,
+) fits.Error!void {
+    return switch (ty) {
+        .uint8 => vlaPackedWriteT(u8, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int8 => vlaPackedWriteT(i8, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int16 => vlaPackedWriteT(i16, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint16 => vlaPackedWriteT(u16, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int32 => vlaPackedWriteT(i32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint32 => vlaPackedWriteT(u32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .int64 => vlaPackedWriteT(i64, tbl, mgr, col, first_row, offsets, array, nelem),
+        .uint64 => vlaPackedWriteT(u64, tbl, mgr, col, first_row, offsets, array, nelem),
+        .float32 => vlaPackedWriteT(f32, tbl, mgr, col, first_row, offsets, array, nelem),
+        .float64 => vlaPackedWriteT(f64, tbl, mgr, col, first_row, offsets, array, nelem),
+        else => error.WrongValueType,
+    };
+}
+
+/// Measure a VLA row range for packed transfer. Rows are 1-based at the ABI; `offsets`
+/// receives `nrows + 1` scalar-slot offsets beginning at zero.
+pub export fn zf_read_col_vla_layout(
+    t_opt: ?*TableHandle,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    offsets_opt: ?*anyopaque,
+    offsets_cap: usize,
+    out_nslots_opt: ?*anyopaque,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+
+    const offsets_raw = offsets_opt orelse return abi.failNull();
+    const out_raw = out_nslots_opt orelse return abi.failNull();
+    if (@intFromPtr(offsets_raw) % @alignOf(u64) != 0 or @intFromPtr(out_raw) % @alignOf(u64) != 0) {
+        return abi.fail(&t.owner.diag, error.WrongValueType);
+    }
+
+    const nr: u64 = @intCast(nrows);
+    const needed_u64 = std.math.add(u64, nr, 1) catch return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const needed = std.math.cast(usize, needed_u64) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    if (offsets_cap < needed) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+
+    const offsets_ptr: [*]u64 = @ptrCast(@alignCast(offsets_raw));
+    const out_nslots: *u64 = @ptrCast(@alignCast(out_raw));
+    const total = fits.heap.vlaColumnLayout(tbl, .{ .index = @intCast(col) }, @intCast(firstrow - 1), offsets_ptr[0..needed]) catch |e| return abi.fail(&t.owner.diag, e);
+    out_nslots.* = total;
+    return 0;
+}
+
+/// Read a VLA row range into one contiguous scalar-slot buffer. `cap` must exactly match the
+/// measured layout. A null `array` is valid only for a zero-slot transfer.
+pub export fn zf_read_col_vla_packed(
+    t_opt: ?*TableHandle,
+    dtype: c_int,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    array: ?*anyopaque,
+    cap: u64,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+    if (cap != 0 and array == null) return abi.failNull();
+    const n: usize = std.math.cast(usize, cap) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    vlaPackedRead(@enumFromInt(dtype), tbl, @intCast(col), @intCast(firstrow - 1), @intCast(nrows), array, n) catch |e| return abi.fail(&t.owner.diag, e);
+    return 0;
+}
+
+/// Write a VLA row range from one contiguous scalar-slot buffer. The offset vector must have
+/// exactly `nrows + 1` entries and terminate at `nelem`.
+pub export fn zf_write_col_vla_packed(
+    t_opt: ?*TableHandle,
+    dtype: c_int,
+    col: c_int,
+    firstrow: c_longlong,
+    nrows: c_longlong,
+    offsets_opt: ?*const anyopaque,
+    offsets_len: usize,
+    array: ?*const anyopaque,
+    nelem: u64,
+) c_int {
+    const t = liveTable(t_opt) orelse return abi.failNull();
+    const tbl = requireBinary(t) catch |e| return abi.fail(&t.owner.diag, e);
+    if (col < 0 or col > std.math.maxInt(u16)) return abi.fail(&t.owner.diag, error.NoSuchColumn);
+    if (firstrow < 1 or nrows < 0) return abi.fail(&t.owner.diag, error.RowOutOfRange);
+    const offsets_raw = offsets_opt orelse return abi.failNull();
+    if (nelem != 0 and array == null) return abi.failNull();
+    if (@intFromPtr(offsets_raw) % @alignOf(u64) != 0) return abi.fail(&t.owner.diag, error.WrongValueType);
+
+    const nr: u64 = @intCast(nrows);
+    const needed_u64 = std.math.add(u64, nr, 1) catch return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const needed = std.math.cast(usize, needed_u64) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    if (offsets_len != needed) return abi.fail(&t.owner.diag, error.CellOutOfRange);
+    const n: usize = std.math.cast(usize, nelem) orelse return abi.fail(&t.owner.diag, error.LimitExceeded);
+    const offsets_ptr: [*]const u64 = @ptrCast(@alignCast(offsets_raw));
+
+    // Preserve ABI pointer/range validation precedence, then reject the guaranteed failure before
+    // either the temporary zero-row manager or full live-heap reconstruction can do any work.
+    if (tbl.fits.mode == .read_only or !tbl.fits.dev.isWritable()) return abi.fail(&t.owner.diag, error.NotWritable);
+
+    // Preserve the core's full dtype/column/range/offset validation for a zero-row write without
+    // reconstructing and sorting a populated heap merely to perform a no-op. No allocation can
+    // reach this temporary zero-capacity manager because the validated range contains no cells.
+    if (nr == 0 and t.mgr == null) {
+        var empty_mgr = fits.heap.HeapManager.init(0);
+        defer empty_mgr.deinit(gpa);
+        vlaPackedWrite(@enumFromInt(dtype), tbl, &empty_mgr, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
+        return 0;
+    }
+
+    if (t.mgr == null) {
+        t.mgr = fits.heap.HeapManager.initForTable(tbl) catch |e| return abi.fail(&t.owner.diag, e);
+    }
+    vlaPackedWrite(@enumFromInt(dtype), tbl, &t.mgr.?, @intCast(col), @intCast(firstrow - 1), offsets_ptr[0..needed], array, n) catch |e| return abi.fail(&t.owner.diag, e);
     return 0;
 }
 
@@ -1395,10 +1640,8 @@ fn writeCompressedDispatch(ty: ZfType, h: *Handle, spec: fits.CompressSpec, ptr:
     };
 }
 
-/// Append a tile-compressed image HDU. `codec`/`quantize` are NUL-terminated names
-/// (`"GZIP_1"`, `"RICE_1"`, `"SUBTRACTIVE_DITHER_1"`, ...). `tile` (or null) overrides the
-/// default row-strip tiling.
-pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+// Shared body of `zf_write_compressed`/`zf_write_compressed2`/`zf_write_compressed3`.
+fn writeCompressedImpl(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, quantize_level: ?f32, hcomp_scale: f32, hcomp_smooth: bool, pixels: *const anyopaque, nelem: c_longlong) c_int {
     const h = h_opt orelse return abi.failNull();
     if (nelem < 0 or naxis <= 0) return abi.fail(&h.diag, error.BadDimensions);
     var axbuf: [999]u64 = undefined;
@@ -1409,6 +1652,9 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
         .bitpix = @intCast(bitpix),
         .axes = axbuf[0..nax],
         .zdither0 = @intCast(zdither0),
+        .quantize_level = quantize_level,
+        .hcomp_scale = hcomp_scale,
+        .hcomp_smooth = hcomp_smooth,
     };
     // `Codec`/`Quantize` are not re-exported at the package root; reach their `fromName` through
     // the `CompressSpec` field types so the shim needs no extra exports.
@@ -1420,4 +1666,34 @@ pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, 
     if (quantize) |q| spec.quantize = @TypeOf(spec.quantize).fromName(std.mem.span(q));
     writeCompressedDispatch(@enumFromInt(dtype), h, spec, pixels, @intCast(nelem)) catch |e| return abi.fail(&h.diag, e);
     return 0;
+}
+
+/// Append a tile-compressed image HDU. `codec`/`quantize` are NUL-terminated names
+/// (`"GZIP_1"`, `"RICE_1"`, `"SUBTRACTIVE_DITHER_1"`, ...). `tile` (or null) overrides the
+/// default row-strip tiling.
+pub export fn zf_write_compressed(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    return writeCompressedImpl(h_opt, dtype, bitpix, naxis, axes, tile, codec, quantize, zdither0, null, 0, false, pixels, nelem);
+}
+
+/// `zf_write_compressed` plus the HCOMPRESS_1 lossy knobs (CFITSIO `fits_set_hcomp_scale`/
+/// `fits_set_hcomp_smooth` semantics): `hcomp_scale` 0 = lossless, > 0 = per-tile
+/// `round(scale × background-noise sigma)`, < 0 = `|scale|` absolute; `hcomp_smooth` non-zero
+/// records the `ZNAME2='SMOOTH'` decode-side smoothing request. Setting either knob with a
+/// non-HCOMPRESS codec fails (`DataConstraintViolated`) rather than being silently ignored.
+/// ABI-additive: existing `zf_write_compressed` callers are unaffected.
+pub export fn zf_write_compressed2(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, hcomp_scale: f32, hcomp_smooth: c_int, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    return writeCompressedImpl(h_opt, dtype, bitpix, naxis, axes, tile, codec, quantize, zdither0, null, hcomp_scale, hcomp_smooth != 0, pixels, nelem);
+}
+
+/// `zf_write_compressed2` plus the CFITSIO quantization level (`fits_set_quantize_level` /
+/// `fpack -q` semantics) for float images with a quantizing `quantize` method (`"NO_DITHER"`,
+/// `"SUBTRACTIVE_DITHER_1"`, `"SUBTRACTIVE_DITHER_2"`): `quantize_level` > 0 sets the per-tile
+/// step to `sigma/level` (sigma = MAD background noise), 0 the CFITSIO default (`sigma/4`),
+/// < 0 the absolute step `|level|`. Pass `has_quantize_level = 0` to leave the level unset
+/// (the library default; the pre-existing dithered-GZIP combination then keeps its legacy
+/// scheme). A set level with a non-quantizing write fails (`DataConstraintViolated`) rather
+/// than being silently ignored. ABI-additive: existing callers are unaffected.
+pub export fn zf_write_compressed3(h_opt: ?*Handle, dtype: c_int, bitpix: c_int, naxis: c_int, axes: [*]const c_long, tile: ?[*]const c_long, codec: [*:0]const u8, quantize: ?[*:0]const u8, zdither0: c_longlong, quantize_level: f32, has_quantize_level: c_int, hcomp_scale: f32, hcomp_smooth: c_int, pixels: *const anyopaque, nelem: c_longlong) c_int {
+    const qlevel: ?f32 = if (has_quantize_level != 0) quantize_level else null;
+    return writeCompressedImpl(h_opt, dtype, bitpix, naxis, axes, tile, codec, quantize, zdither0, qlevel, hcomp_scale, hcomp_smooth != 0, pixels, nelem);
 }

@@ -14,10 +14,11 @@ const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Max string characters that fit in one card's value field alongside the continuation `&`:
-/// the 70-column value field holds `'` + 67 chars + `&` + `'`.
+/// Max string columns that fit in one card's value field alongside the continuation `&`:
+/// the 70-column value field holds `'` + 67 columns + `&` + `'`. Counts *escaped* text — a
+/// `''` pair occupies two columns.
 pub const CHUNK: usize = 67;
-/// Max string characters in a final (non-continued) card: `'` + 68 chars + `'`.
+/// Max string columns in a final (non-continued) card: `'` + 68 columns + `'`.
 pub const LAST_CHUNK: usize = 68;
 
 /// The result of `assemble`: the owned reassembled string and the number of cards it spanned
@@ -84,15 +85,26 @@ pub fn split(alloc: Allocator, name: []const u8, str: []const u8, comment: ?[]co
     const FIELD: usize = 70; // value-field width (cols 10..80)
     const ccost: usize = if (comment) |c| 3 + c.len else 0; // " / " + comment, on the final card
 
-    // Single card if the quoted string PLUS any comment fits the value field. Accounting for the
-    // comment here is what was missing: a 61–68 char string with a comment was wrongly forced
-    // down the single-card path and then rejected by Card.buildValue with CardOverflow.
-    if (2 + str.len + ccost <= FIELD) {
+    // Single card if the RENDERED string PLUS any comment fits the value field. Rendered width is
+    // what Card.buildValue actually emits: `''` escapes count two columns and short strings are
+    // blank-padded to the 8-char fixed-format minimum — counting raw characters here undercounted
+    // quote-bearing strings near the boundary into a spurious CardOverflow.
+    const esc_len = value.escapedLen(str);
+    const rendered = esc_len + (if (str.len < value.MIN_STRING_CHARS) value.MIN_STRING_CHARS - str.len else 0);
+    if (2 + rendered + ccost <= FIELD) {
         try list.append(alloc, try Card.buildValue(name, .{ .string = str }, comment));
         return list.toOwnedSlice(alloc);
     }
     // A comment too long to fit even alone on a final card (`'' / comment`) is unrepresentable.
     if (comment != null and 2 + ccost > FIELD) return error.CardOverflow;
+
+    // Chunk the ESCAPED text: `assemble` un-escapes each card independently, so every chunk must
+    // be well-formed on its own — quotes are doubled up front and a cut never lands inside a
+    // `''` pair (the old code wrote raw chunks with no escaping at all, emitting malformed cards
+    // for any continued string containing a quote).
+    const esc = try alloc.alloc(u8, esc_len);
+    defer alloc.free(esc);
+    value.escapeQuotes(str, esc);
 
     // A terminal card that ALSO carries the comment has no continuation `&`, so its data capacity
     // is reduced by the comment cost. The room is reserved up front so the comment is never
@@ -102,11 +114,11 @@ pub fn split(alloc: Allocator, name: []const u8, str: []const u8, comment: ?[]co
     var pos: usize = 0;
     var first = true;
     var comment_done = comment == null;
-    while (pos < str.len) {
-        const remaining = str.len - pos;
+    while (pos < esc.len) {
+        const remaining = esc.len - pos;
         const terminal = remaining <= term_cap; // all remaining data + the comment fit one card
-        const take = if (terminal) remaining else @min(CHUNK, remaining);
-        const chunk = str[pos .. pos + take];
+        const take = if (terminal) remaining else pairSafeTake(esc[pos..], @min(CHUNK, remaining));
+        const chunk = esc[pos .. pos + take];
         pos += take;
         // A `&` marks that more cards follow — either more data or the dedicated comment card.
         try list.append(alloc, try buildChunkCard(name, &first, chunk, !terminal, if (terminal) comment else null));
@@ -124,12 +136,56 @@ pub fn split(alloc: Allocator, name: []const u8, str: []const u8, comment: ?[]co
     return list.toOwnedSlice(alloc);
 }
 
+// Largest cut ≤ `want` that does not land between the two quotes of a `''` escape pair. `esc`
+// is fully escaped and `pos` only ever advances by pair-safe takes, so the slice always starts
+// on a pair boundary and a left-to-right walk decides pair membership unambiguously.
+fn pairSafeTake(esc: []const u8, want: usize) usize {
+    var j: usize = 0;
+    while (j < want) {
+        if (esc[j] == '\'') {
+            if (j + 1 == want) return want - 1; // cut would split the pair — back off one column
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
+    return want;
+}
+
+/// Whether a raw value field holds a *string* whose content ends with the `&` continuation
+/// sentinel (trailing blanks inside the quotes are not significant, FITS 4.0 §4.2.1).
+/// Allocation-free; mirrors `value.parseString`'s `''`-escape and lone-quote-closes rules so it
+/// always agrees with `assemble` about which cards continue. Used by `Header.delete` to remove
+/// a long string's CONTINUE run together with its base card.
+pub fn endsWithSentinel(field: []const u8) bool {
+    var i: usize = 0;
+    while (i < field.len and field[i] == ' ') i += 1;
+    if (i >= field.len or field[i] != '\'') return false; // not a string value
+    i += 1;
+    var last: u8 = 0; // last non-blank content byte seen
+    while (i < field.len) {
+        const c = field[i];
+        if (c == '\'') {
+            if (i + 1 < field.len and field[i + 1] == '\'') {
+                last = '\''; // escaped quote is content
+                i += 2;
+                continue;
+            }
+            return last == '&'; // lone quote closes the string
+        }
+        if (c != ' ') last = c;
+        i += 1;
+    }
+    return false; // unterminated string — never a continuation
+}
+
 // Build one CONTINUE-run card: the first card uses `name = '...`, the rest `CONTINUE  '...`. A
 // trailing `&` (inside the quotes) is added when `continues`; a `/ comment` suffix when given.
+// `chunk` is pre-escaped text (quotes already doubled) written verbatim between the quotes.
 fn buildChunkCard(name: []const u8, first: *bool, chunk: []const u8, continues: bool, comment: ?[]const u8) HeaderError!Card {
     var raw: [80]u8 = @splat(' ');
     if (first.*) {
-        const nm = @import("name.zig").Name.parse(name) catch return error.BadKeywordName;
+        const nm = @import("name.zig").Name.parseStrict(name) catch return error.BadKeywordName;
         @memcpy(raw[0..8], &nm.bytes);
         raw[8] = '=';
         raw[9] = ' ';
@@ -241,4 +297,87 @@ test "split with a comment that overflows a single card falls through to multi-c
     try testing.expectEqualStrings(s, a.?.value);
     const last = cards[cards.len - 1];
     try testing.expectEqualStrings("note", value.parseComment(last.valueField()).?);
+}
+
+test "split escapes embedded quotes and round-trips (BUGHUNT 22/23)" {
+    // The old multi-card path wrote chunks verbatim with no '' escaping, emitting malformed
+    // cards for any continued string containing a quote. Every card must also parse as a
+    // well-formed string on its own, since `assemble` un-escapes per card.
+    const long = "it's a 'quoted' tale: " ++ "pad " ** 30 ++ "the 'end'";
+    const cards = try split(testing.allocator, "STORY", long, "with 'quotes'");
+    defer testing.allocator.free(cards);
+    try testing.expect(cards.len >= 2);
+    for (cards) |c| {
+        const v = try value.parseValue(testing.allocator, c.valueField());
+        defer v.deinit(testing.allocator);
+        try testing.expect(v == .string); // each card individually well-formed
+    }
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
+    try testing.expect(a != null);
+    defer testing.allocator.free(a.?.value);
+    try testing.expectEqualStrings(long, a.?.value);
+    try testing.expectEqualStrings("with 'quotes'", value.parseComment(cards[cards.len - 1].valueField()).?);
+}
+
+test "split never cuts a '' escape pair across cards (offset sweep)" {
+    // Slide a quote across every position of the first two card boundaries; each split must
+    // round-trip exactly and no card may end in a dangling half of a '' pair.
+    var offset: usize = 0;
+    while (offset < 80) : (offset += 1) {
+        var buf: [150]u8 = undefined;
+        for (&buf, 0..) |*b, k| b.* = if (k == offset or k == offset + 1) '\'' else 'x';
+        const cards = try split(testing.allocator, "SWEEP", &buf, null);
+        defer testing.allocator.free(cards);
+        const a = try assemble(testing.allocator, cards, 0, 1 << 20);
+        try testing.expect(a != null);
+        defer testing.allocator.free(a.?.value);
+        try testing.expectEqualStrings(&buf, a.?.value);
+    }
+}
+
+test "single-card threshold counts the escaped width (was spurious CardOverflow)" {
+    // 67 raw chars with two quotes render as 69 escaped + 2 delimiters = 71 > 70: the old
+    // threshold (raw length) chose the single-card path and buildValue then failed with
+    // CardOverflow; the string must split instead.
+    const s = "''" ++ "z" ** 65;
+    const cards = try split(testing.allocator, "EDGE", s, null);
+    defer testing.allocator.free(cards);
+    try testing.expect(cards.len >= 2);
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
+    try testing.expect(a != null);
+    defer testing.allocator.free(a.?.value);
+    try testing.expectEqualStrings(s, a.?.value);
+}
+
+test "short string with a huge comment splits instead of CardOverflow (BUGHUNT 38)" {
+    // "ab" renders as 8 padded chars, so 2+8+3+60 = 73 > 70: the old threshold (raw length,
+    // no padding) chose the single-card path and buildValue rejected it.
+    const comment = "c" ** 60;
+    const cards = try split(testing.allocator, "AB", "ab", comment);
+    defer testing.allocator.free(cards);
+    const a = try assemble(testing.allocator, cards, 0, 1 << 20);
+    if (a) |asm_| {
+        defer testing.allocator.free(asm_.value);
+        try testing.expectEqualStrings("ab", asm_.value);
+    } else {
+        // Emitted as one free-format card; the value must still parse exactly.
+        const v = try value.parseValue(testing.allocator, cards[0].valueField());
+        defer v.deinit(testing.allocator);
+        try testing.expectEqualStrings("ab", v.string);
+    }
+    try testing.expectEqualStrings(comment, value.parseComment(cards[cards.len - 1].valueField()).?);
+}
+
+test "endsWithSentinel mirrors parseString's escape and termination rules" {
+    try testing.expect(endsWithSentinel("'abc&'"));
+    try testing.expect(endsWithSentinel("  'abc&'  / comment"));
+    try testing.expect(endsWithSentinel("'ab''cd&'")); // escaped quote is content
+    try testing.expect(endsWithSentinel("'abc&   '")); // trailing blanks not significant
+    try testing.expect(!endsWithSentinel("'abc'")); // no sentinel
+    try testing.expect(!endsWithSentinel("'ab&''")); // content continues past the escaped quote → unterminated
+    try testing.expect(!endsWithSentinel("'ab&c'")); // sentinel not last
+    try testing.expect(!endsWithSentinel("'abc&")); // unterminated
+    try testing.expect(!endsWithSentinel("42 / not a string"));
+    try testing.expect(!endsWithSentinel(""));
+    try testing.expect(!endsWithSentinel("''")); // empty string
 }

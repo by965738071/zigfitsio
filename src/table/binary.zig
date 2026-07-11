@@ -259,7 +259,9 @@ pub const BinTable = struct {
     // matrix changes size the heap region is physically relocated so it keeps trailing the rows.
     // After any edit the internal column model is re-parsed (`reparse`) so later reads see the
     // new geometry. `THEAP`-offset heaps (a non-default heap gap) are not supported here — the
-    // heap is assumed to immediately follow the row matrix, as in every conforming writer.
+    // heap is assumed to immediately follow the row matrix, as in every conforming writer. An
+    // explicit `THEAP` card holding the default value is kept in sync: every size-changing edit
+    // rewrites it to the new `NAXIS1×NAXIS2` (`updateTheap`).
 
     /// Append `n` empty (zero-filled) rows at the end of the table, growing the data unit by
     /// `n×NAXIS1` and relocating the heap. `NAXIS2` is updated; `NAXIS1`/`TFIELDS` are unchanged.
@@ -294,6 +296,7 @@ pub const BinTable = struct {
         try zeroBytes(self.fits.dev, data_off + ins_off, ins_bytes);
 
         try self.hdu.header.modify("NAXIS2", .{ .int = std.math.cast(i64, new_naxis2) orelse return error.LimitExceeded }, null);
+        try self.updateTheap(self.naxis1, new_naxis2);
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
     }
@@ -324,6 +327,7 @@ pub const BinTable = struct {
         try self.fits.resizeHduData(self.hdu, new_total);
 
         try self.hdu.header.modify("NAXIS2", .{ .int = std.math.cast(i64, new_naxis2) orelse return error.LimitExceeded }, null);
+        try self.updateTheap(self.naxis1, new_naxis2);
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
     }
@@ -386,6 +390,7 @@ pub const BinTable = struct {
         if (ttype) |t| try self.hdu.header.update(self.fits.alloc, kwName(&buf, "TTYPE", at + 1), .{ .string = t }, null);
         try self.hdu.header.modify("TFIELDS", .{ .int = @intCast(tfields + 1) }, null);
         try self.hdu.header.modify("NAXIS1", .{ .int = @intCast(new_naxis1) }, null);
+        try self.updateTheap(new_naxis1, self.naxis2);
 
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
@@ -413,6 +418,7 @@ pub const BinTable = struct {
         try self.renumberColumns(col + 2, tfields, .down);
         try self.hdu.header.modify("TFIELDS", .{ .int = @intCast(tfields - 1) }, null);
         try self.hdu.header.modify("NAXIS1", .{ .int = @intCast(new_naxis1) }, null);
+        try self.updateTheap(new_naxis1, self.naxis2);
 
         try self.fits.rewriteHeaderInPlace(self.hdu);
         try self.reparse();
@@ -451,9 +457,20 @@ pub const BinTable = struct {
     // clean error instead. No heap (`PCOUNT == 0`) or an absent/default `THEAP` is fine.
     fn rejectHeapGap(self: *const BinTable) OpenError!void {
         if (self.hdu.pcount == 0) return;
-        const theap = self.hdu.header.getValue(i64, "THEAP") catch return; // absent ⇒ default position
+        const theap = self.hdu.header.getValue(i64, "THEAP") catch |e| switch (e) {
+            error.KeywordNotFound => return, // absent ⇒ default position
+            else => return error.BadTbcol, // present but unparseable — mirror heapGeometry
+        };
         const default_theap = try limits.mul(self.naxis1, self.naxis2);
         if (theap < 0 or @as(u64, @intCast(theap)) != default_theap) return error.BadTbcol;
+    }
+
+    // An explicit `THEAP` card (== the old default, guaranteed by `rejectHeapGap`) must track the
+    // relocated heap: rewrite it to the new `NAXIS1×NAXIS2` default.
+    fn updateTheap(self: *BinTable, new_naxis1: u64, new_naxis2: u64) OpenError!void {
+        _ = self.hdu.header.getValue(i64, "THEAP") catch return; // absent/unparseable ⇒ leave alone
+        const new_default = try limits.mul(new_naxis1, new_naxis2);
+        try self.hdu.header.modify("THEAP", .{ .int = std.math.cast(i64, new_default) orelse return error.LimitExceeded }, null);
     }
 
     // Grow each row from `old_naxis1` to a wider `new_naxis1`: resize the data unit, slide the

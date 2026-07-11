@@ -150,6 +150,7 @@ pub const Wcs = struct {
         // always serialize via PC/CD, CROTAi is never emitted here (FR-WCS-1).
     }
 
+    /// Release all allocator-owned strings and matrices in this WCS definition.
     pub fn deinit(self: *Wcs, a: Allocator) void {
         for (self.ctype) |s| a.free(s);
         a.free(self.ctype);

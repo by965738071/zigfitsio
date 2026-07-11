@@ -113,6 +113,25 @@ pub const Name = struct {
         return self;
     }
 
+    /// Strict variant of `parse` for the build/edit path (§4.1.2.1): spaces are permitted
+    /// only as trailing padding, so an embedded blank ("AB CD") or a non-left-justified
+    /// name (" XKEY") yields `error.BadKeywordName` instead of a spec-invalid card that
+    /// fitsverify flags as an ERROR. An all-space field remains valid (the blank keyword).
+    /// `parse` itself stays lenient so on-disk cards written by third-party software still
+    /// load; callers writing spaced logical keys route them through the HIERARCH convention.
+    pub fn parseStrict(field: []const u8) HeaderError!Name {
+        const self = try parse(field);
+        var seen_space = false;
+        for (self.bytes) |b| {
+            if (b == ' ') {
+                seen_space = true;
+            } else if (seen_space) {
+                return error.BadKeywordName;
+            }
+        }
+        return self;
+    }
+
     /// The name with trailing padding spaces removed (the human-readable form).
     pub fn text(self: *const Name) []const u8 {
         return std.mem.trimEnd(u8, &self.bytes, " ");
@@ -281,6 +300,29 @@ test "Name.parse rejects illegal characters and oversize fields" {
     try testing.expectError(error.BadKeywordName, Name.parse("A+B")); // '+' illegal
     try testing.expectError(error.BadKeywordName, Name.parse("AB\x01")); // control char
     try testing.expectError(error.BadKeywordName, Name.parse("LONGNAME9")); // 9 > 8 bytes
+}
+
+test "Name.parseStrict allows spaces only as trailing padding (BUGHUNT 62)" {
+    try testing.expectError(error.BadKeywordName, Name.parseStrict("AB CD")); // embedded blank
+    try testing.expectError(error.BadKeywordName, Name.parseStrict(" XKEY")); // not left-justified
+    try testing.expectError(error.BadKeywordName, Name.parseStrict("A B C")); // multiple blanks
+    try testing.expectError(error.BadKeywordName, Name.parseStrict("NAME.X")); // parse rules still apply
+
+    const n = try Name.parseStrict("NAXIS");
+    try testing.expectEqualStrings("NAXIS   ", &n.bytes);
+    const padded = try Name.parseStrict("NAXIS   "); // trailing padding is fine
+    try testing.expectEqualStrings("NAXIS", padded.text());
+    const lower = try Name.parseStrict("naxis"); // lowercase still normalizes, not rejected
+    try testing.expectEqualStrings("NAXIS", lower.text());
+    const blank = try Name.parseStrict("        "); // all-space stays the valid blank keyword
+    try testing.expect(blank.isBlank());
+    const empty = try Name.parseStrict("");
+    try testing.expect(empty.isBlank());
+}
+
+test "Name.parse stays lenient about interior blanks (read contract)" {
+    const n = try Name.parse("AB CD");
+    try testing.expectEqualStrings("AB CD", n.text());
 }
 
 test "Name.eql and eqlText" {

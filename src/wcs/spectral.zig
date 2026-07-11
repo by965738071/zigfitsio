@@ -128,6 +128,7 @@ pub const Spectral = struct {
         return error.BadWcs;
     }
 
+    /// Release the allocator-owned coordinate type and optional unit strings.
     pub fn deinit(self: *Spectral, a: Allocator) void {
         a.free(self.ctype);
         if (self.unit) |u| a.free(u);

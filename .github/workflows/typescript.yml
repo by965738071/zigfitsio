@@ -1,0 +1,276 @@
+name: TypeScript bindings & npm release
+
+# Test the TypeScript bindings (bindings/typescript) on both runtimes — Bun (bun test) and Node
+# (vitest) — across the OS matrix and the supported Node range, plus a TS<->Python interop
+# cross-check. The bindings ship as a SINGLE WebAssembly module (`zig build wasm` ->
+# zigfitsio.wasm); there are no per-platform native packages anymore, so the whole ABI is
+# exercised through the one wasm binary on every runner.
+#
+# Release automation: pushing a tag `vX.Y.Z` builds the wasm and publishes the single `zigfitsio`
+# package to npm via trusted publishing (OIDC, npm >= 11.5). npm trusted publishing is bound to
+# THIS FILENAME (typescript.yml) and the `npm` environment — renaming either breaks publishing
+# until the publisher config on npmjs.com is updated. First-ever publishes must be bootstrapped
+# manually (npm has no pending publishers) — see RELEASING.md.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "bindings/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - "tools/wiki/**"
+      - ".github/workflows/typescript.yml"
+      - ".github/workflows/publish-wiki.yml"
+  workflow_dispatch:
+    inputs:
+      publish_dry_run:
+        description: "Rehearse npm publish (--dry-run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs only; never cancel tag/main/dispatch runs (a cancelled
+# half-published release run is worse than a wasted one).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIG_VERSION: "0.16.0"
+  BUN_VERSION: "1.3.13"
+
+jobs:
+  # package.json must agree with the canonical version in build.zig.zon. Tag runs additionally
+  # require tag == version, mirroring python-wheels.yml.
+  version-check:
+    name: version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+      - run: node bindings/typescript/scripts/check-versions.mjs
+      - name: Tag matches the package version
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          pkg="$(node -p 'require("./bindings/typescript/package.json").version')"
+          tagv="${GITHUB_REF_NAME#v}"
+          if [ "$tagv" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match bindings/typescript/package.json $pkg"
+            exit 1
+          fi
+
+  # The Python workflow runs this check on every PR/main push. Repeat it on tag/dispatch runs so
+  # npm publication is independently gated on all three generated API references.
+  api-docs:
+    name: generated API Wiki bundle (release gate)
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bindings/typescript/package-lock.json
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Test Wiki generators and publication guards
+        run: |
+          python3 -m unittest discover -s tools/wiki -p 'test_*.py' -v
+          python3 -m pip install pytest==8.3.5
+          python3 -m pytest tools/wiki/tests -q
+          npm run test:docs --prefix bindings/typescript
+          zig build wiki-zig-test
+      - name: Generate and validate all public API references
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./bindings/typescript/package.json").version')"
+          tag="v${version}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then tag="$GITHUB_REF_NAME"; fi
+          python3 tools/wiki/generate.py \
+            --out "$RUNNER_TEMP/wiki" --tag "$tag" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+
+  # `zig build wasm` is hard-coded ReleaseSmall and byte-identical on every host, so build the
+  # module once and share it via artifact instead of installing Zig and compiling in all six
+  # test cells — that matrix exercises the JS layer + host engines, not the wasm bytes.
+  build-wasm:
+    name: build wasm (shared)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build wasm
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zigfitsio-wasm
+          path: zig-out/bin/zigfitsio.wasm
+          # Fail here if the build output moved, not later as a confusing loader error.
+          if-no-files-found: error
+          # v4 artifacts are immutable within a run; without this, "Re-run all jobs" dies on
+          # the name conflict (same reason as the wheels artifacts in python-wheels.yml).
+          overwrite: true
+
+  test:
+    name: test ${{ matrix.os }} (node ${{ matrix.node }})
+    needs: build-wasm # every cell consumes the one shared wasm artifact
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15-intel: GitHub's last x86_64 macOS image; sunsets August 2027. The wasm binary
+        # is identical everywhere, so this matrix is really about the JS layer + host WebAssembly
+        # engine across OSes and the Node/Bun runtimes.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+        node: ["24"]
+        include:
+          # Oldest-supported-Node lane: exercises the `engines` floor (the other lanes run current).
+          - os: ubuntu-latest
+            node: "20"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Shared wasm from build-wasm, landed at the loader's dev-fallback path
+      # (<repo>/zig-out/bin/zigfitsio.wasm) so tests exercise the same lookup as a local
+      # `zig build wasm`. No Zig toolchain is present in these cells.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zigfitsio-wasm
+          path: zig-out/bin
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+        working-directory: bindings/typescript
+      - name: Typecheck tests (public generics)
+        run: npm run typecheck:tests
+        working-directory: bindings/typescript
+      - name: Bun lane (bun test)
+        run: bun test tests
+        working-directory: bindings/typescript
+      - name: Node lane (vitest)
+        run: npx vitest run
+        working-directory: bindings/typescript
+
+  # TS writes -> Python reads, Python writes -> TS reads, against one shared library build. Python
+  # still uses the native C-ABI shared library; TS uses the wasm module.
+  interop:
+    name: TS <-> Python interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: zig build capi # native C-ABI shared library (Python ctypes bindings)
+      - run: zig build wasm # wasm module (TypeScript bindings)
+      - run: pip install numpy
+      - run: npm ci && npm run build
+        working-directory: bindings/typescript
+      - name: Cross-checks (both directions, both JS runtimes)
+        working-directory: bindings/typescript
+        env:
+          PYTHONPATH: ${{ github.workspace }}/bindings/python/src
+          ZIGFITSIO_LIBRARY: ${{ github.workspace }}/zig-out/lib/libzigfitsio_capi.so
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/interop"
+          mkdir -p "$dir"
+          bun tests/interop/write_corpus.mjs "$dir"
+          python3 tests/interop/py_interop.py read "$dir"
+          python3 tests/interop/py_interop.py write "$dir"
+          node tests/interop/read_corpus.mjs "$dir"
+          bun tests/interop/read_corpus.mjs "$dir"
+
+  # OIDC/plumbing rehearsal lane: manually dispatched, runs the exact publish step with --dry-run
+  # (no environment gate needed since nothing uploads).
+  publish-rehearsal:
+    name: npm publish rehearsal (--dry-run)
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_dry_run
+    needs: [version-check, api-docs, test, interop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+        working-directory: bindings/typescript
+      - name: Dry-run publish (prepack builds tsc + zigfitsio.wasm)
+        working-directory: bindings/typescript
+        run: npm publish --access public --dry-run
+
+  publish-npm:
+    name: publish to npm
+    # Strictly tag pushes: a workflow_dispatch run pointed at a tag ref must NOT publish here.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version-check, api-docs, test, interop]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/zigfitsio
+    permissions:
+      contents: read # job-level permissions replace the workflow block; checkout still needs this
+      id-token: write # OIDC trusted publishing; no npm token anywhere
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24" # bundles npm >= 11.5 (OIDC trusted publishing + provenance)
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+        working-directory: bindings/typescript
+      # `npm publish` runs the prepack hook, which recompiles TS and builds zigfitsio.wasm (hence
+      # setup-zig above) before packing. Skipped when the exact version already exists so a run
+      # that failed partway (registry 5xx) can be safely re-run.
+      - name: Publish zigfitsio
+        working-directory: bindings/typescript
+        run: |
+          set -euo pipefail
+          ver="$(node -p 'require("./package.json").version')"
+          if npm view "zigfitsio@${ver}" version >/dev/null 2>&1; then
+            echo "zigfitsio@${ver} already published; skipping"
+            exit 0
+          fi
+          npm publish --access public

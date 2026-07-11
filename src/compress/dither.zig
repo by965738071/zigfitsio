@@ -128,10 +128,23 @@ pub fn quantize(value: f32, zscale: f64, zzero: f64, dither_value: f32) i32 {
 /// `null_value` reads back as NaN (§10.2.1). This is the exact inverse of `quantize` to within
 /// half a quantization step (`zscale/2`). Exact-zero handling for `SUBTRACTIVE_DITHER_2` is
 /// layered on by `Dither.unquantizeNext`.
-pub fn unquantize(stored: i32, zscale: f64, zzero: f64, dither_value: f32) f32 {
-    if (stored == null_value) return std.math.nan(f32);
-    const f = (@as(f64, @floatFromInt(stored)) - @as(f64, dither_value) + 0.5) * zscale + zzero;
-    return @floatCast(f);
+///
+/// Computed and returned in f64 so a `ZBITPIX = -64` consumer keeps full double precision
+/// (CFITSIO/astropy dequantize in double; funneling through f32 corrupts every pixel of a
+/// quantized double image). `dither_value` stays f32 — CFITSIO's random table is float, and
+/// bit-for-bit parity requires using the same f32 value.
+///
+/// `@mulAdd` (a true fused multiply-add on every target — Zig falls back to a correctly-rounded
+/// software fma where hardware lacks one) mirrors what CFITSIO's and astropy's C builds do on
+/// FMA hardware: clang/gcc default `-ffp-contract=on` fuses the `* scale + zero` of
+/// `unquantize_i4r8`, so a plain mul-then-add here differs from funpack/astropy by 1 ULP on
+/// ~0.6 % of double pixels. The fused form is also the correctly-rounded (single-rounding)
+/// result and is byte-deterministic across zigfitsio targets. That determinism costs decode
+/// speed where no hardware fma exists (notably wasm32, which lowers this to a per-pixel
+/// software fma) — accepted so every binding decodes the same file to the same bytes.
+pub fn unquantize(stored: i32, zscale: f64, zzero: f64, dither_value: f32) f64 {
+    if (stored == null_value) return std.math.nan(f64);
+    return @mulAdd(f64, @as(f64, @floatFromInt(stored)) - @as(f64, dither_value) + 0.5, zscale, zzero);
 }
 
 /// The per-tile starting index into the random table: `(tile_index + ZDITHER0 - 1) mod
@@ -215,7 +228,7 @@ pub const Dither = struct {
     /// Reconstruct the next pixel, consuming one dither draw. Applies the §10.2.1 specials on top
     /// of `unquantize`: `null_value` → `null_out` (pass NaN, or a `BLANK` substitute); under
     /// `subtractive_2`, `zero_value` → exactly `0.0`.
-    pub fn unquantizeNext(self: *Dither, stored: i32, zscale: f64, zzero: f64, null_out: f32) f32 {
+    pub fn unquantizeNext(self: *Dither, stored: i32, zscale: f64, zzero: f64, null_out: f64) f64 {
         const r = self.current();
         self.advance();
         if (stored == null_value) return null_out;
@@ -319,7 +332,7 @@ test "SUBTRACTIVE_DITHER_2 round-trips, preserving NaN and exact zero (§10.2.1)
             try testing.expect(std.math.isNan(back));
         } else if (f == 0.0) {
             try testing.expectEqual(zero_value, code); // exact-zero preserved losslessly
-            try testing.expectEqual(@as(f32, 0.0), back);
+            try testing.expectEqual(@as(f64, 0.0), back);
         } else {
             try testing.expect(!isReserved(code));
             const tol: f32 = @floatCast(zscale * 0.5 + 1e-4);
@@ -337,7 +350,7 @@ test "SUBTRACTIVE_DITHER_1 does not specially preserve zero" {
     var dec = Dither.init(table, .subtractive_1, 100, 0);
     const code = enc.quantizeNext(0.0, zscale, zzero);
     try testing.expect(code != zero_value); // not the reserved sentinel
-    const back = dec.unquantizeNext(code, zscale, zzero, std.math.nan(f32));
+    const back = dec.unquantizeNext(code, zscale, zzero, std.math.nan(f64));
     try testing.expect(@abs(back - 0.0) <= zscale * 0.5 + 1e-4);
 }
 
@@ -350,7 +363,7 @@ test "NO_DITHER uses plain rounding (dither term cancels)" {
     const f: f32 = 3.49;
     const code = enc.quantizeNext(f, 1.0, 0.0);
     try testing.expectEqual(quantize(f, 1.0, 0.0, 0.5), code);
-    const back = dec.unquantizeNext(code, 1.0, 0.0, std.math.nan(f32));
+    const back = dec.unquantizeNext(code, 1.0, 0.0, std.math.nan(f64));
     try testing.expect(@abs(back - f) <= 0.5 + 1e-4);
 }
 

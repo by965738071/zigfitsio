@@ -1,0 +1,64 @@
+{
+  "name": "zigfitsio",
+  "version": "0.1.5",
+  "description": "TypeScript/JavaScript bindings for zigfitsio — a pure-Zig FITS 4.0 I/O library, shipped as a single WebAssembly module (Bun + Node + browser)",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anhydrous99/zigfitsio.git",
+    "directory": "bindings/typescript"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./lowlevel": {
+      "types": "./dist/lowlevel/index.d.ts",
+      "default": "./dist/lowlevel/index.js"
+    },
+    "./zigfitsio.wasm": "./dist/zigfitsio.wasm",
+    "./package.json": "./package.json"
+  },
+  "browser": {
+    "./dist/loader.js": "./dist/loader.browser.js",
+    "./dist/fsbridge.js": "./dist/fsbridge.browser.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "fits",
+    "astronomy",
+    "astrophysics",
+    "zig",
+    "wasm",
+    "webassembly",
+    "bun"
+  ],
+  "scripts": {
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json && node scripts/build-wasm.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "docs": "node scripts/generate-wiki-docs.mjs",
+    "test": "bun test tests",
+    "test:docs": "node --test ../../tools/wiki/typescript-normalize.test.mjs",
+    "test:node": "vitest run",
+    "typecheck:tests": "tsc -p tsconfig.test.json",
+    "check-versions": "node scripts/check-versions.mjs",
+    "prepack": "node scripts/prepack.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typedoc": "0.28.20",
+    "typedoc-github-wiki-theme": "2.1.0",
+    "typedoc-plugin-markdown": "4.12.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

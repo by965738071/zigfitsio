@@ -499,6 +499,7 @@ pub const TimeCoords = struct {
         try h.appendValue(a, name, .{ .string = w.buffered() }, comment_text);
     }
 
+    /// Release the optional allocator-owned time-unit string.
     pub fn deinit(self: *TimeCoords, a: Allocator) void {
         if (self.timeunit) |u| a.free(u);
     }

@@ -70,7 +70,8 @@ pub fn parseValue(alloc: Allocator, card: *const Card) (HeaderError || errors.Va
 }
 
 /// Build a `HIERARCH` card for hierarchical name `name` (spaced tokens) with value `v` and an
-/// optional comment. `error.CardOverflow` if it does not fit in 80 bytes.
+/// optional comment. `error.CardOverflow` if it does not fit in 80 bytes;
+/// `error.BadValueSyntax` for a non-finite real (`value.requireFinite`).
 pub fn build(name: []const u8, v: value.KeywordValue, comment: ?[]const u8) HeaderError!Card {
     var raw: [80]u8 = @splat(' ');
     @memcpy(raw[0..8], "HIERARCH");
@@ -192,6 +193,16 @@ test "build emits an UPPERCASE 'E' exponent for real values (§4.2.4)" {
 
     const cc = try build("ESO INS GAIN", .{ .complex_float = .{ 1.5e2, -2.5e-3 } }, null);
     try testing.expect(std.mem.indexOf(u8, cc.bytes(), "(1.5E2, -2.5E-3)") != null);
+}
+
+test "build rejects non-finite reals (BUGHUNT 25/27)" {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    try testing.expectError(error.BadValueSyntax, build("ESO DET GAIN", .{ .float = nan }, null));
+    try testing.expectError(error.BadValueSyntax, build("ESO DET GAIN", .{ .float = inf }, null));
+    try testing.expectError(error.BadValueSyntax, build("ESO DET GAIN", .{ .float = -inf }, null));
+    try testing.expectError(error.BadValueSyntax, build("ESO DET GAIN", .{ .complex_float = .{ nan, 2.0 } }, null));
+    try testing.expectError(error.BadValueSyntax, build("ESO DET GAIN", .{ .complex_float = .{ 2.0, -inf } }, null));
 }
 
 test "non-HIERARCH card yields null" {

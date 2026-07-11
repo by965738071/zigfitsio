@@ -1,9 +1,11 @@
 # Caveats & Known Limitations
 
-Honest caveats for the FITS-conformance hardening work delivered on branch
-`finish-fits-conformance`. The library builds clean and passes **459/459 tests**,
-`zig build wasm-check`, `zig build fuzz`, and `zig build bench`, with **zero `@cImport`**
-(pure Zig std, `GC-1`/`GC-2`).
+Honest caveats for the FITS-conformance hardening work (originally delivered on branch
+`finish-fits-conformance`, since merged). The library builds clean and passes **564/564 Zig
+tests** (plus the 25-test C-ABI suite and 117 Python binding tests), `zig build wasm-check`,
+`zig build fuzz` (headers, tables, AND the tile codecs — direct decoder targets plus a
+compressed-HDU byte-mutation target), and `zig build bench`, with **zero `@cImport`** (pure
+Zig std, `GC-1`/`GC-2`).
 
 The cross-tool interoperability previously listed here as *unconfirmed* is now **verified
 against CFITSIO 4.6.4 + Astropy** (§1); the genuinely-remaining limits are stated plainly below.
@@ -33,20 +35,92 @@ branch fixes — **two real interop bugs** that the prior self-round-trip tests 
 
 **What is now verified (committed goldens + the `interop` CI job):**
 
-- `RICE_1`, `GZIP_1`/`GZIP_2`, `PLIO_1`, and lossless `HCOMPRESS_1` decode committed CFITSIO
-  tiles to the exact pixels (inbound) **and** `funpack`/CFITSIO read zigfitsio's compressed
-  output back to the exact pixels (outbound).
+- `RICE_1`, `GZIP_1`/`GZIP_2`, `PLIO_1`, and `HCOMPRESS_1` — **lossless AND lossy, including
+  decode-side smoothing** — decode committed CFITSIO tiles to the exact pixels (inbound) **and**
+  `funpack`/CFITSIO read zigfitsio's compressed output back to the exact pixels (outbound).
+- **`HCOMPRESS_1` lossy is complete and CFITSIO-parity, both directions.** Decode implements
+  `hsmooth` (the `ZNAME2='SMOOTH'`/`ZVAL2` request) and reproduces `funpack` bit-for-bit on the
+  committed lossy goldens (`tile_hcompress_lossy16/lossy32/smooth` + funpack-authored
+  `*_expected` pixel files, with a non-vacuousness gate proving the smooth path changes pixels);
+  Astropy independently decodes the same bytes to the same pixels. Encode supports absolute
+  (`hcomp_scale < 0`) and noise-adaptive (`hcomp_scale > 0`, via the ported
+  `FnNoise5_int`/`quick_select` MAD estimators, bit-exact vs `fits_img_stats_int`) scaling plus
+  the SMOOTH request, records `ZVAL1` (float request)/`ZVAL2` exactly like CFITSIO, and uses
+  CFITSIO's default row-block tiling; `funpack` decodes zigfitsio's lossy output to exactly the
+  pixels zigfitsio itself decodes (`check_funpack.py`). A lossy reconstruction that overshoots
+  the `ZBITPIX` range **clamps to the type range exactly as CFITSIO clips it** (the
+  `tile_hcompress_clip16` golden pins this) — PLIO, whose decode is lossless, still strictly
+  rejects out-of-range values as corrupt.
 - `DATASUM` recomputes to a CFITSIO-authored golden vector (`X-SUM`).
 - WCS TAN `pixel→world` agrees with Astropy reference points within tolerance.
+- **Quantized-float writes through the integer codecs are CFITSIO-parity** (closing the former
+  "HCOMPRESS write is integer-only" limit): float images (BITPIX −32/−64) compress with
+  `HCOMPRESS_1`/`RICE_1` under `NO_DITHER`/`SUBTRACTIVE_DITHER_1`/`_2` via an exact port of
+  CFITSIO 4.6.4 `fits_quantize_float`/`_double` (`src/compress/quantize.zig`: `FnNoise5`
+  MAD-based `sigma/q` steps, absolute steps, the `iqfactor` ZZERO fudge, `NINT` rounding, the
+  §10.2 dither draws, and the raw-float `GZIP_COMPRESSED_DATA` fallback for unquantizable
+  tiles), pinned **bit-exact against the real CFITSIO dylib** on committed reference vectors
+  (`bscale`/`bzero` f64 bits + every stored integer, six cases). `funpack`, Astropy, and
+  fitsverify all read zigfitsio's quantized-float output; funpack/Astropy reproduce zigfitsio's
+  own dequantized decode to the exact f32 bit pattern (`check_funpack.py`). The
+  `CompressSpec.quantize_level` knob follows `fpack -q` semantics (`zf_write_compressed3` /
+  Python `CompImageHDU(quantize_level=…)`). Deliberate fail-loud divergences, conforming files
+  unaffected: HCOMPRESS + `SUBTRACTIVE_DITHER_2` errors (CFITSIO silently coerces to
+  `DITHER_1`); float + integer codec *without* quantization errors (CFITSIO silently truncates
+  floats to ints); PLIO + floats errors up front (its 0..2²⁴ range cannot hold the quantizer's
+  output; CFITSIO fails per tile at runtime); a ±Inf tile is stored losslessly (CFITSIO's
+  quantizer has no Inf guard and stores garbage). The pre-existing dithered-GZIP path keeps
+  its legacy `(max−min)/100000` scheme when `quantize_level` is unset, so existing callers'
+  bytes are unchanged — set `quantize_level` for CFITSIO-parity quantization there.
 
 **Genuinely-remaining limits:**
 
-- **`HCOMPRESS_1` lossy** (`scale > 0`) decode smoothing (`hsmooth`) is still not implemented —
-  the **lossless** (`scale = 0`) path only (the path the goldens exercise).
 - The **byte-exact regeneration drift-guard** in the `interop` CI job assumes CFITSIO exactly
   **4.6.4** (the version the committed bytes were authored with); it runs *informationally* so a
   distro CFITSIO version skew cannot red the build — the *semantic* interop checks (funpack
   decodes to the exact pixels; Astropy opens every file) are the authoritative gate.
+- **`zig build fuzz --fuzz` (engine mode) is broken in the Zig 0.16.0 toolchain itself** —
+  `compiler/test_runner.zig` fails to compile under `-ffuzz` (a `StackTrace` type mismatch,
+  reproduced on an unmodified tree). The *seeded* `zig build fuzz` mode — which CI's
+  `fuzz-smoke` job runs, and which executes every harness (headers, tables, all tile codecs,
+  the compressed-HDU byte-mutation target) over its deterministic corpus — is unaffected.
+  Coverage-guided exploration resumes when the upstream toolchain bug is fixed; nothing in
+  this repo blocks it.
+- **Explicit HCOMPRESS tile shapes are more permissive than CFITSIO's author.** CFITSIO's
+  `imcomp_init_table` rejects HCOMPRESS tiles/images with any dimension under 4 pixels;
+  zigfitsio deliberately accepts them (the repo's own fixtures use 4×3 tiles, and every tested
+  decoder — zigfitsio, CFITSIO/funpack — reads them exactly). The *default* tiling follows
+  CFITSIO's row-block rule, so this only applies to explicit `tile=` choices; note Astropy
+  refuses HCOMPRESS tiles that squeeze to one dimension (e.g. `{N, 1}`).
+
+**Deliberate code-level divergences (conforming files unaffected; documented at the code):**
+
+- **`SMOOTH` is looked up by `ZNAMEn` name, not positionally** (`tiled.zig` decode): differs
+  from CFITSIO only on a hand-crafted header whose `ZNAME2` is mislabeled.
+- **Single `i64` HCOMPRESS decode path** vs CFITSIO's int32/int64 split (`hcompress.zig` module
+  doc): identical results on all valid data; on an adversarial overflow-inducing stream where
+  CFITSIO's int32 variant would silently wrap, zigfitsio errors `CorruptTile` instead.
+- **Quantized-float write gates fail loud where CFITSIO degrades silently** (see the verified
+  section above): HCOMPRESS + `SUBTRACTIVE_DITHER_2`, float + integer codec without
+  quantization, PLIO + floats, and ±Inf tiles (stored losslessly, not quantized to garbage).
+- **The legacy dithered-GZIP scheme (kept when `quantize_level` is unset) quantizes f64 pixels
+  through an f32 cast** and uses its fixed `(max−min)/100000` step — both pre-existing behavior,
+  preserved so existing callers' bytes are unchanged. The CFITSIO-parity path (any explicit
+  `quantize_level`, `NO_DITHER`, or an integer codec) quantizes f64 natively via
+  `fits_quantize_double` semantics. Set `quantize_level` to opt in on GZIP.
+- **Lossless-float compressed writes omit `ZQUANTIZ`** where CFITSIO writes `ZQUANTIZ='NONE'`;
+  both readers treat the absent keyword as "no quantization", so this is cosmetic (kept to
+  avoid churning existing output bytes; the reader also accepts `'NONE'`).
+- **`iqfactor` saturates where CFITSIO's cast is UB** (`quantize.zig`): the ZZERO fudge's
+  `(LONGLONG)` cast of an out-of-i64-range double is undefined behavior in C; zigfitsio uses a
+  saturating cast, diverging only on pathological data where CFITSIO has no defined answer.
+- **Near-zero dequantized pixels are FP-contraction knife edges in CFITSIO's own builds**
+  (discovered authoring the quantized-float goldens; `interop/c/gen_sources.c`): `ZZERO` is an
+  exact multiple of `ZSCALE`, so `s·ZSCALE + ZZERO` cancels catastrophically for values near 0
+  and the last bit depends on the compiler's FMA contraction — an arm64 Homebrew funpack
+  yields a `2⁻⁵³` residual where baseline-x86-64 CFITSIO, Astropy, and zigfitsio all yield
+  exactly `0.0`. Not a zigfitsio divergence per se (CFITSIO disagrees with *itself* across
+  builds); the committed goldens use all-positive fields so every reference build agrees.
 
 ## 2. Delivery status — unmerged branch (point-in-time)
 
@@ -65,19 +139,35 @@ merged, or reset at batch granularity:
 This section is a snapshot of the delivery state and becomes moot once the branch is
 merged.
 
-## 3. Language bindings (Python / C ABI) — scope & known gaps
+## 3. Language bindings (Python / TypeScript / C ABI) — scope & known gaps
 
 The bindings under `bindings/` are **additive**: a `zf_*` C-ABI shim (`bindings/capi/`, built by
-`zig build capi`) over the public Zig module, a low-level `ctypes` binding, and a high-level
-NumPy/Astropy-style API. `src/` is unchanged and contains **no C** (the `.h` contract lives under
-`bindings/c/`, outside the `GC-1` guard's `src tools test` scope). Interoperability is verified
-both directions against Astropy and the committed golden corpus. Honest limits as delivered:
+`zig build capi`) over the public Zig module, a low-level `ctypes` binding, a high-level
+NumPy/Astropy-style API, and a TypeScript package (`bindings/typescript/`) mirroring the same two
+layers (a single WebAssembly build of the same C ABI under an astropy-style TypedArray API,
+running on Node/Bun/browsers). `src/` is unchanged
+and contains **no C** (the `.h` contract lives under `bindings/c/`, outside the `GC-1` guard's
+`src tools test` scope). Interoperability is verified both directions against Astropy and the
+committed golden corpus, plus a TS↔Python cross-check in CI. Honest limits as delivered (they
+apply to both language bindings unless noted; TypeScript-specific ones are listed at the end):
 
 - **Not a CFITSIO drop-in.** The exported symbols are `zf_*`, not `fits_*`/`ff*`; the ABI is
   purpose-built for bindings (opaque handles + runtime datatype codes), not a CFITSIO replacement.
-- **Integer null masks.** Float nulls surface as NaN; for integer images/columns the raw `BLANK`/
-  `TNULLn` values are readable (and exposed via `zf_table_col_info`), but the high-level API does
-  not yet return `numpy.ma` masked arrays for them — masking integer nulls is a follow-up.
+- **Integer null masks.** Float nulls surface as NaN. Integer **images** declaring `BLANK`
+  (or `ZBLANK`/plain `BLANK` in a tile-compressed header) are promoted to float with NaN at the
+  blanked pixels, matching astropy/funpack; the unsigned-`BZERO`-convention path intentionally
+  keeps raw unsigned ints and ignores `BLANK`, exactly as astropy does. In-place **update-mode**
+  write-back of a BLANK-promoted image is not supported: the promoted array is float while the
+  on-disk data unit is integer, so a mutated-data flush fails loud (`NanToInt`, status 412)
+  rather than corrupting — use `writeto()` to a new file (the reconstruction path drops the
+  then-illegal `BLANK` card from the float output). Table `TNULLn` values remain readable (and
+  exposed via `zf_table_col_info`), but the high-level API does not yet return `numpy.ma` masked
+  arrays for integer columns — that masking is a follow-up.
+- **Duplicate table column names require positional access.** The high-level table data models are
+  keyed by effective name (trimmed `TTYPE`, or `colN` when unnamed), so materializing a table with
+  duplicate effective names raises `FitsTableError` (status 219) rather than hiding or mis-writing
+  a physical column. Metadata inspection and pristine byte-for-byte copies remain available; use
+  the low-level indexed column API when duplicate names must be addressed.
 - **VLA writing.** The high-level `from_columns`/`writeto` path writes variable-length-array
   columns, reserving the heap (`PCOUNT`) up front via `zf_create_tbl_heap`; reading VLAs is
   complete. The lower-level `zf_write_col_vla` still assumes the heap is reserved (create the table
@@ -90,6 +180,77 @@ both directions against Astropy and the committed golden corpus. Honest limits a
 - **Toolchain for wheels.** The `ziglang` PyPI package can lag the 0.16 toolchain this project
   targets, so wheel builds use a real Zig 0.16 (CI `setup-zig` / the in-container installer); the
   hatch build hook falls back to a system `zig` when `ziglang` is absent.
+- **`writeto()` of a *scanned* quantized-float compressed image re-quantizes with default
+  knobs.** The FITS header records the method (`ZQUANTIZ`) but not the quantization *level*
+  (CFITSIO stores `q` only in a free-text `HISTORY` card), and the Python re-emit path writes
+  `ZDITHER0 = 1` rather than reusing the source seed — so re-emitting decodes the pixels and
+  quantizes them *again* (a second, bounded lossy pass at the default level; the codec, tiling
+  and method are preserved, and the result is a fully valid file). Integer-codec and lossless
+  copies are unaffected; copying compressed HDUs verbatim (no re-quantization) is a follow-up.
+- **TypeScript-specific.** 64-bit integer data uses `BigInt64Array`/`BigUint64Array` (`bigint`
+  values); complex values are interleaved float pairs (no complex array type in JS); header
+  integers parse to `number` when exactly double-representable, else `bigint`;
+  `KeywordNotFound` is not also a `KeyError` (no such JS class); handles need an explicit
+  `close()` (or `using` on runtimes with `Symbol.dispose`) — there is no GC-based freeing.
+  (Historical: the pre-wasm FFI backends carried a bun:ffi ≤1.3.14 darwin-arm64 stack-argument
+  workaround; the package is wasm-only now and the workaround is gone with the backends.)
+- **Signed-byte (`i1`) images (TypeScript).** The high-level image writer does not map
+  `Int8Array` data to the FITS `BZERO = -128` signed-byte convention yet — it fails with a typed
+  error rather than writing a mislabeled unsigned image. (The table-side `Int8Array` rejection in
+  `tableFromArrays` is the sibling limit, listed below.)
+- **WebAssembly execution (TypeScript).** The compute-heavy codecs (RICE/HCOMPRESS/quantize) run
+  inside wasm at roughly 1.5–3× the runtime of a native build, and large image/table transfers
+  copy through wasm linear memory. The module is single-threaded, and its heap only grows —
+  pages are never returned to the OS for the life of the instance.
+- **No filesystem inside the wasm module (TypeScript).** Path-based file I/O is a JS-side
+  convenience (`node:fs`) available on Node/Bun only; browsers use `fromBytes`/`toBytes`.
+  Writing a `.fits.gz` via the C ABI (`zf_save_gzip`) and the raw `zf_open_file`/`zf_create_file`
+  return `NotWritable` in the wasm build — the high-level `open`/`writeTo` route around them.
+
+### TypeScript high-level ergonomics (the TS-native surface)
+
+The TypeScript package layers a TS-idiomatic surface (discriminated `kind`, typed `image()`/
+`table()` accessors, a columnar-plus-row `TableData`, `Header` Map semantics, the
+`tableFromArrays`/`imageFromArray` factories, and `ImageHDU.section()`) over the astropy-shaped
+classes. It is **additive sugar** — the Python-parity classes and the `lowlevel` escape hatch are
+unchanged and always sufficient. Honest boundaries of that sugar:
+
+- **HDU `kind` narrowing is exact for `"image"`/`"bintable"`/`"asciitable"`, partial for
+  `"primary"`/`"compimage"`.** Because `PrimaryHDU`/`CompImageHDU` extend `ImageHDU`, narrowing
+  `AnyHDU` on `kind === "primary"` yields `PrimaryHDU | ImageHDU` (and `"compimage"` →
+  `CompImageHDU | ImageHDU`). Harmless — every image kind shares the same `FitsArray | null`
+  `.data` — and the typed `image()`/`table()` accessors sidestep it entirely.
+- **`TableData<T>` / `HDUList.table<T>()` column shapes are a compile-time contract only.** `T`
+  is never checked at runtime: a wrong `T` mis-types reads without throwing, and a column name
+  outside `T` falls through to the untyped `ColumnValues` overload. The **runtime**-checked reads
+  are `numeric()/strings()/vla()/complex()`, which throw `FitsTypeError` on a kind mismatch.
+- **A `Row<T>` numeric cell is typed `ElementOf<V> | V`** (scalar *or* TypedArray slice), because
+  repeat-1-vs-vector is a runtime distinction TypeScript cannot see. Row slices are **zero-copy
+  views** over the column buffer — mutating a returned slice mutates the column (and, in update
+  mode, is written back on `flush()`). For a statically-known element type, prefer the column
+  accessors.
+- **`ImageHDU.section()` (strided cutout) is image-data only.** It reads the plain image data
+  unit via `zf_read_subset`, so it fails loud (`NotSupportedError`) on a tile-compressed image —
+  read the whole array through `.data`. In update mode it flushes pending in-place `.data` edits
+  first, so a section never lags `.data`; in read-only mode it reads the file **as opened**, so
+  unflushed in-memory edits are not visible. Windows are 0-based, half-open `[start, stop)` in
+  C-order; negative, out-of-bounds, or empty windows throw `RangeError`.
+- **In-place table write-back matches unique columns by name and cannot add columns.** Setting a
+  reordered `TableData` in update mode writes each changed column to its true on-disk slot; a
+  `TableData` carrying a column name absent from the file fails loud (`NotSupportedError`) rather
+  than silently mis-writing (an index-based match would corrupt a reordered table). Row-count,
+  VLA, and scaled/unsigned-column in-place edits remain unsupported (fail-loud) — use `writeTo()`.
+- **`Header` iteration is Map-style over `[keyword, value]` entries.** A parsed header may repeat
+  a keyword across cards: iteration yields **every** card, `get()` returns the **first**, and
+  `size` counts them **all**, so `new Map([...header]).size` can be smaller. Commentary
+  (`COMMENT`/`HISTORY`/blank) cards are excluded from iteration — see `.comments`/`.history`.
+- **`tableFromArrays` TFORM inference is a convenience, not exhaustive.** `Int8Array` (no FITS
+  binary signed-byte code) is rejected fail-loud, complex columns are not inferable, and a
+  uniformly-empty cell array infers a variable-length column (`1P<t>`) rather than a 0-repeat
+  fixed one. Pass an explicit `Column[]` via `BinTableHDU.fromColumns` for complex (`C`/`M`),
+  signed-byte, or hand-tuned formats. Arbitrary `BSCALE`/`BZERO` scaling is **not** expressible
+  through the high-level image writer (it derives scaling from the array dtype and emits only the
+  unsigned `u2/u4/u8` `BZERO` convention) — use `lowlevel` for a custom `BSCALE`/`BZERO`.
 
 None of these require ABI changes to address — they are extension points, not design constraints.
 
@@ -108,24 +269,44 @@ that work — each is *fail-loud* (a clear error), never silent data loss.
   write back changed cell values of ordinary (fixed-width, unscaled) columns. Changing the row
   count, or editing a variable-length-array (`P`/`Q`) or `TSCAL`/`TZERO`-scaled column in place,
   raises `NotImplementedError` — use `writeto()` to a new file (which reconstructs) for those.
+- **Python & TypeScript: HDUList structural edits (insert/delete/reorder) persist on `flush()`/`close()`**
+  (2026-07-07, BUGHUNT-2026-07-06 items 4+8 — previously they were silently dropped). The reconcile
+  appends first and deletes the displaced originals after, so a mid-append failure rolls the file
+  back byte-identically and a (raw-I/O) delete-phase failure can only leave duplicate — never
+  missing — HDUs. Shifted HDUs of the same file travel as **exact byte copies** (`zf_copy_hdu`):
+  user keywords, VLA heaps, compression bytes, and checksums survive verbatim. Documented
+  boundaries, each fail-loud: the **primary HDU must remain first** (`insert(0, …)`, `del h[0]`,
+  `reverse()` raise `NotImplementedError` — use `writeto()`); the **same HDU object may not occupy
+  two positions** (`ValueError` — insert a copy instead); an HDU adopted from *another* HDUList is
+  re-serialized through the reconstruct path, which does not yet preserve a table's user keywords
+  (pre-existing `_emit` limitation, tracked in `BUGHUNT-2026-07-06.md`). One undetected aliasing
+  edge (same as astropy): a single `Header` object shared between two different HDUs — the
+  last-flushed HDU wins the header's live-persist hook; give each HDU its own `Header`.
 - **Python: `append` and structural table edits go through the file, not a scratch copy.** Appending
-  an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`; there is no
-  transactional rollback of a partial in-place structural edit if the device write fails midway
-  (the same is true at the Zig layer — see the append/copy rollback that *is* implemented, versus
-  the header-rewrite path which validates-before-mutating but does not un-shift relocated bytes on a
-  mid-write I/O error).
+  an HDU to an update-mode list serializes it to the open file on `flush()`/`close()`. The HDU-level
+  reconcile above rolls back its append phase on failure; there is still no transactional rollback of
+  a partial in-place structural *table* edit if the device write fails midway (the same is true at
+  the Zig layer — see the append/copy rollback that *is* implemented, versus the header-rewrite path
+  which validates-before-mutating but does not un-shift relocated bytes on a mid-write I/O error).
 - **Header `update()`/`modify()` do not support HIERARCH long-keyword cards.** Reading a HIERARCH
   card by its hierarchical name is correct (`get`/`has`/`comment`/`getValue`/`getHierarch`), but the
   *write* helpers build a fixed-format 8-char card (`Card.buildValue`) and cannot construct a
   HIERARCH card, so updating a HIERARCH keyword's value in place is unsupported. Rebuild the card via
   the HIERARCH builder (`src/header/hierarch.zig`) instead.
-- **Dithered/quantized-float compression interop is verified but not yet golden-committed.** The
-  fix was validated against real `fpack`/`funpack` (zigfitsio decodes an `fpack SUBTRACTIVE_DITHER_1`
-  file bit-for-bit identically to `funpack` — max pixel diff 0) and is covered by hermetic
-  round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles, ZBLANK).
-  A CFITSIO-authored dithered `.fz` **golden fixture** under `test/golden/` plus an `fpack`
-  cross-check wired into the toolchain-gated `interop` CI job is a follow-up (the §1 golden corpus
-  is integer-tile only).
+- **Dithered/quantized-float compression interop is golden-committed** (closing the earlier
+  follow-up note here): CFITSIO-authored quantized-float `.fz` goldens now live under
+  `test/golden/compress/` — HCOMPRESS `SUBTRACTIVE_DITHER_1` (pinned `ZDITHER0=1`; fpack's
+  clock-derived seed is non-deterministic, so the C generator authors it), HCOMPRESS `NO_DITHER`
+  (`fpack -q0 4`), and RICE `SUBTRACTIVE_DITHER_1` — each paired with funpack's own decode, which
+  zigfitsio, Astropy (`interop/xval.py`), and the Python bindings must reproduce to the exact f32
+  bit pattern. One honest boundary discovered while authoring them: CFITSIO itself is **not
+  bit-stable across its own builds** for pixels that reconstruct near zero (`ZZERO` is fudged to
+  an exact multiple of `ZSCALE`, so `s·ZSCALE + ZZERO` cancels catastrophically and the result
+  depends on the compiler's FMA contraction — an arm64 Homebrew funpack yields a `2⁻⁵³` residual
+  where baseline-x86-64 CFITSIO, Astropy, and zigfitsio all yield exactly `0.0`). The committed
+  goldens use an all-positive field so every reference build agrees on every bit; the hermetic
+  round-trip unit tests (`NO_DITHER`, `SUBTRACTIVE_DITHER_2`, lossless-fallback/±Inf tiles,
+  ZBLANK) still cover zero-crossing data semantically.
 - **ASCII-table float TFORM is reconstructed heuristically on copy.** When a *modified* ASCII table
   is re-serialized, a float column's `Ew.d` precision is derived as `E{w}.{w-7}` from the column
   width, because the C ABI's `ZfColInfo` exposes width and typecode but not the original `TDISP`/

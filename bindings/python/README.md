@@ -1,27 +1,26 @@
-# zigfitsio (Python)
+# zigfitsio
 
-Python bindings for [**zigfitsio**](https://github.com/anhydrous99/zigfitsio) — a pure-[Zig](https://ziglang.org)
-implementation of [FITS](https://fits.gsfc.nasa.gov) 4.0 I/O with feature parity goals against
-CFITSIO, and **no C dependencies**.
+[![Python wheels](https://github.com/anhydrous99/zigfitsio/actions/workflows/python-wheels.yml/badge.svg)](https://github.com/anhydrous99/zigfitsio/actions/workflows/python-wheels.yml)
+[![PyPI](https://img.shields.io/pypi/v/zigfitsio)](https://pypi.org/project/zigfitsio/)
+[![Python versions](https://img.shields.io/pypi/pyversions/zigfitsio)](https://pypi.org/project/zigfitsio/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/anhydrous99/zigfitsio/blob/main/LICENSE)
 
-Two layers are provided:
+**Read and write FITS files with a NumPy-first, astropy.io.fits-style API — no C compiler, no CFITSIO required.**
 
-- **High-level**, NumPy-first API modeled on `astropy.io.fits` — `open`, `HDUList`, the HDU
-  classes, `Column`, `Header`, and the `getdata`/`getheader`/`writeto`/`verify` conveniences.
-- **Low-level** 1:1 `ctypes` binding under `zigfitsio.lowlevel` (the C ABI from
-  `bindings/c/zigfitsio.h`) for power users.
+Python bindings for [zigfitsio](https://github.com/anhydrous99/zigfitsio), a pure-Zig FITS 4.0
+I/O library. The native code is a Zig-built shared library loaded via `ctypes`, in two layers:
 
-The native code is a Zig-built shared library loaded via `ctypes`; there is **no C compiler
-requirement** at install time when using a prebuilt wheel.
+- **High-level** (`zigfitsio`) — modeled on `astropy.io.fits`: `open`, `HDUList`, the HDU classes, `Column`, `Header`, and `getdata`/`getheader`/`writeto`/`verify`.
+- **Low-level** (`zigfitsio.lowlevel`) — a 1:1 `ctypes` binding over the C ABI, for power users.
 
 ## Install
 
 ```sh
-pip install zigfitsio          # prebuilt wheel (recommended)
+pip install zigfitsio
 ```
 
-Building from source requires a Zig toolchain (supplied automatically by the `ziglang` build
-dependency, or a system `zig` 0.16 on `PATH`).
+Prebuilt wheels need no compiler. Building from source requires a Zig 0.16 toolchain (supplied
+automatically by the `ziglang` build dependency, or a system `zig` on `PATH`).
 
 ## Quickstart
 
@@ -35,10 +34,12 @@ zf.writeto("image.fits", np.arange(12, dtype="f4").reshape(3, 4), overwrite=True
 # Read it back (NumPy array, shape (NAXIS2, NAXIS1), C-order — like astropy)
 with zf.open("image.fits") as hdul:
     data = hdul[0].data
-    hdr = hdul[0].header
-    print(data.shape, hdr["NAXIS1"])
+    print(data.shape, hdul[0].header["NAXIS1"])
+```
 
-# Build a binary table
+### Tables
+
+```python
 cols = [
     zf.Column("INDEX", "J", np.array([10, 20, 30], dtype="i4")),
     zf.Column("FLUX",  "E", np.array([1.5, 2.5, 3.5], dtype="f4"), unit="Jy"),
@@ -47,16 +48,15 @@ cols = [
 zf.HDUList([zf.PrimaryHDU(), zf.BinTableHDU.from_columns(cols, name="EVENTS")]).writeto(
     "table.fits", overwrite=True
 )
+```
 
-# Tile-compressed image (RICE_1)
+### Compressed images
+
+```python
 ramp = np.arange(256, dtype="i4").reshape(16, 16)
 zf.HDUList([zf.PrimaryHDU(), zf.CompImageHDU(ramp, compression="RICE_1")]).writeto(
     "comp.fits", overwrite=True
 )
-
-# Structural validation (fitsverify-style)
-for f in zf.verify("image.fits"):
-    print(f)
 ```
 
 ### Headers (dict-like)
@@ -75,6 +75,13 @@ with zf.open("image.fits", mode="update") as hdul:
 with zf.open("wcs.fits") as hdul:
     lon, lat = hdul[0].pix2world(40.0, 30.0)   # 1-based pixel (FITS CRPIX convention)
     px, py = hdul[0].world2pix(lon, lat)
+```
+
+### Validation
+
+```python
+for finding in zf.verify("image.fits"):   # fitsverify-style structural checks
+    print(finding)
 ```
 
 ### Low-level (ctypes)
@@ -99,21 +106,29 @@ ll.lib.zf_close(h)
   widened to float when real scaling is present, or to `u2/u4/u8` for the unsigned convention.
 - Errors are raised as typed `FitsError` subclasses (`KeywordNotFound` is also a `KeyError`).
 
+## Known limitations
+
+- Not a CFITSIO drop-in — the ABI is purpose-built `zf_*` symbols, not `fits_*`.
+- Integer `BLANK`/`TNULLn` values are not auto-masked (no `numpy.ma`); float nulls surface as NaN.
+- In-place update of compressed images, VLA or scaled columns, or a changed row count raises —
+  use `writeto()` to a new file instead.
+- Tables with duplicate effective column names can be inspected as metadata or copied verbatim,
+  but high-level data access/reconstruction raises `FitsTableError` (status 219); use low-level
+  indexed column reads when duplicates must be addressed.
+- `writeto()` of a *scanned* quantized-float compressed image re-quantizes at the default level
+  (the FITS header does not record the level).
+
+The full list lives in
+[CAVEATS.md](https://github.com/anhydrous99/zigfitsio/blob/main/CAVEATS.md).
+
 ## Development
 
 ```sh
-zig build capi                                   # build the shared library into zig-out/lib
-pip install -e .[test]                           # editable install (builds the lib via the hook)
-pytest bindings/python/tests -q                  # run the suite (incl. astropy cross-checks)
-```
-
-When running tests against an uninstalled checkout, point the loader at the dev build:
-
-```sh
-ZIGFITSIO_LIBRARY=$PWD/zig-out/lib/libzigfitsio_capi.dylib \
-PYTHONPATH=bindings/python/src pytest bindings/python/tests -q
+zig build capi                    # build the shared library into zig-out/lib
+pip install -e .[test]            # editable install (builds the lib via the hook)
+pytest bindings/python/tests -q   # run the suite (incl. astropy cross-checks)
 ```
 
 ## License
 
-MIT — see [`LICENSE`](../../LICENSE).
+MIT — see [LICENSE](https://github.com/anhydrous99/zigfitsio/blob/main/LICENSE).

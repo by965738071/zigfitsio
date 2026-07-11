@@ -88,6 +88,7 @@ pub const Hdu = struct {
         return self;
     }
 
+    /// Release the parsed axis list and header owned by this HDU.
     pub fn deinit(self: *Hdu, alloc: Allocator) void {
         alloc.free(self.axes);
         self.header.deinit(alloc);
@@ -185,7 +186,7 @@ pub const Hdu = struct {
         // counts to i64, so an absurd GCOUNT/PCOUNT that drives data_bytes toward 2^64 would later
         // overflow those casts. A real data unit is astronomically smaller — reject the rest with
         // a typed error here (NFR-SAFE-1) rather than admitting a value that panics on use.
-        if (total > std.math.maxInt(i64) - block.BLOCK) return error.LimitExceeded;
+        if (total > std.math.maxInt(i64) - @as(u64, block.BLOCK)) return error.LimitExceeded;
         return total;
     }
 };

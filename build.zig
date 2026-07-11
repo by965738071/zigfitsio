@@ -7,6 +7,8 @@
 //!   zig build fitsverify   — run the structural-validation CLI demo (X-TOOL)
 //!   zig build fuzz         — run the header/table fuzz harnesses (NFR-SAFE-2)
 //!   zig build wasm-check   — compile the freestanding core for wasm32 (NFR-PORT-3)
+//!   zig build docs         — emit compiler-backed Zig Autodoc into zig-out/docs/zig
+//!   zig build wiki-zig     — emit Wiki-native Zig API Markdown and a symbol manifest
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -29,6 +31,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // `zig build docs` — ask the compiler to analyze the real consumer module and install its
+    // native Autodoc output. This is deliberately independent of the Wiki Markdown renderer:
+    // compiler documentation is the semantic validation/artifact, while `wiki-zig` below
+    // supplies deterministic Markdown suitable for github.com/.../wiki.
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const docs_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zigfitsio",
+        .root_module = docs_mod,
+    });
+    const emitted_docs = docs_lib.getEmittedDocs();
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = emitted_docs,
+        .install_dir = .prefix,
+        .install_subdir = "docs/zig",
+    });
+    const docs_step = b.step("docs", "Generate compiler-backed Zig API documentation");
+    docs_step.dependOn(&install_docs.step);
+
     // C-ABI shim (Python/C bindings, design bindings/). A separate dynamic library compiled
     // from `bindings/capi/capi.zig`, which imports the public `zigfitsio` module and exports the
     // `zf_*` C symbols. Kept out of `src/` so the repo's "no C header under src" guard is moot;
@@ -44,6 +69,16 @@ pub fn build(b: *std.Build) void {
         .name = "zigfitsio_capi",
         .root_module = capi_mod,
     });
+    // Force the LLVM backend for the C-ABI shim regardless of optimize mode. Zig 0.16.0's
+    // self-hosted x86_64 backend miscompiles the System V AMD64 argument prologue for an
+    // `export fn` that spills integer args to the stack *and* takes `f32`/`f64` by value
+    // (e.g. `zf_write_compressed2`/`zf_write_compressed3`): it reads the SSE args from `xmm6`
+    // instead of `xmm0`/`xmm1`, so a real C-ABI caller (ctypes/C) passes garbage for those
+    // floats. Zig↔Zig callers agree on the wrong convention, so the capi-test never sees it;
+    // only an external caller does. ReleaseFast already routed through LLVM (why the wheels are
+    // correct), but a Debug `zig build capi` — the local dev + smoke-test flow — was broken.
+    // LLVM emits the correct prologue (`xmm0`/`xmm1`), so pin it here at the ABI boundary.
+    capi_lib.use_llvm = true;
     b.installArtifact(capi_lib);
     // Install the shared library into `zig-out/lib` when `zig build capi` is invoked directly
     // (the compile step alone does not copy the artifact out of the cache).
@@ -69,6 +104,34 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the unit/integration test suite");
     test_step.dependOn(&run_tests.step);
+
+    // `zig build wiki-zig -- <out-dir> --tag vX.Y.Z --sha <sha> [--repo-url <url>]`
+    // walks only the public surface reachable from `src/root.zig`, verifies the root names
+    // against compiler reflection, and writes `Zig-API.md` plus `zig-api-symbols.json`.
+    // The executable is always built for the host so documentation can still be generated
+    // when a caller selects a cross-compilation target for the library.
+    const wiki_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const wiki_mod = b.createModule(.{
+        .root_source_file = b.path("tools/wiki/zig_api.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    wiki_mod.addImport("zigfitsio", wiki_api_mod);
+    const wiki_exe = b.addExecutable(.{ .name = "zig-api-wiki", .root_module = wiki_mod });
+    const run_wiki = b.addRunArtifact(wiki_exe);
+    if (b.args) |args| run_wiki.addArgs(args);
+    const wiki_step = b.step("wiki-zig", "Generate the GitHub Wiki Zig API reference");
+    wiki_step.dependOn(&run_wiki.step);
+
+    const wiki_tests = b.addTest(.{ .root_module = wiki_mod });
+    const run_wiki_tests = b.addRunArtifact(wiki_tests);
+    const wiki_test_step = b.step("wiki-zig-test", "Test the Zig Wiki API generator");
+    wiki_test_step.dependOn(&run_wiki_tests.step);
+    test_step.dependOn(&run_wiki_tests.step);
 
     // The C-ABI shim's own round-trip tests (`bindings/capi/test_capi.zig`) are wired into the
     // default `test` step too (test-plan Phase 4): previously `capi-test` only ran in one Linux
@@ -198,4 +261,33 @@ pub fn build(b: *std.Build) void {
     });
     const wasm_step = b.step("wasm-check", "Compile the core for wasm32-freestanding");
     wasm_step.dependOn(&wasm_lib.step);
+
+    // `zig build wasm` — the shippable single-package artifact: the C-ABI shim compiled to a
+    // wasm32-freestanding *reactor* module (no `_start`; `zf_*` + `memory` exported). This is
+    // the one binary the npm `zigfitsio` package loads on every platform (Bun/Node/browser)
+    // through the WebAssembly FFI backend, replacing the seven native `zigfitsio-*` packages.
+    // `openFile`/`createFile`/`saveGzipFile` degrade to `error.NotWritable` here (fits.zig
+    // gates the OS leaves out under freestanding); the JS layer routes file I/O through the
+    // in-memory open/create + read-bytes APIs instead.
+    const wasm_capi_libmod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const wasm_capi_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/capi/capi.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_capi_mod.addImport("zigfitsio", wasm_capi_libmod);
+    const wasm_reactor = b.addExecutable(.{
+        .name = "zigfitsio",
+        .root_module = wasm_capi_mod,
+    });
+    wasm_reactor.entry = .disabled; // reactor: no entry point
+    wasm_reactor.rdynamic = true; // export the `export fn zf_*` symbols
+    wasm_reactor.export_memory = true; // export linear `memory` for the JS backend
+    const wasm_install = b.addInstallArtifact(wasm_reactor, .{});
+    const wasm_build_step = b.step("wasm", "Build the wasm32-freestanding C-ABI reactor (zigfitsio.wasm)");
+    wasm_build_step.dependOn(&wasm_install.step);
 }

@@ -139,9 +139,11 @@ const Builder = struct {
         const after_kw = std.mem.trimStart(u8, line[i..], " ");
 
         // Resolve auto-indexing (`NAXIS#` → `NAXIS1`, …) then normalize/validate the name.
+        // Strict: a template keyword is user input, though the tokenizer's split at the
+        // first space/'=' means a spaced token cannot actually reach this call.
         var name_buf: [16]u8 = undefined;
         const kw_final = try self.substituteIndex(alloc, kw, &name_buf);
-        const name = try Name.parse(kw_final);
+        const name = try Name.parseStrict(kw_final);
 
         // `SIMPLE` / `XTENSION` begin a new HDU.
         if (name.eqlText("SIMPLE") or name.eqlText("XTENSION")) {

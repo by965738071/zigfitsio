@@ -35,8 +35,11 @@ fn fillByte(f: Fill) u8 {
 /// so it yields a huge-but-finite offset that a later read rejects cleanly (EndOfStream /
 /// "data extends past EOF") rather than panicking during the eager HDU scan (NFR-SAFE-1/2).
 pub fn roundUpBlocks(n: u64) u64 {
-    if (n > std.math.maxInt(u64) - (BLOCK - 1)) return (std.math.maxInt(u64) / BLOCK) * BLOCK;
-    return ((n + BLOCK - 1) / BLOCK) * BLOCK;
+    // 64-bit throughout: `BLOCK` is `usize` (32-bit on wasm32), so widen it explicitly rather
+    // than let the expression narrow to `usize` and overflow the `u64` ceiling constants.
+    const b: u64 = BLOCK;
+    if (n > std.math.maxInt(u64) - (b - 1)) return (std.math.maxInt(u64) / b) * b;
+    return ((n + b - 1) / b) * b;
 }
 
 /// A block-aligned read cache over a `Device`.
@@ -55,6 +58,7 @@ pub const BlockReader = struct {
         return .{ .dev = dev, .alloc = allocator, .window = window };
     }
 
+    /// Release the block-aligned read window allocated by `init`.
     pub fn deinit(self: *BlockReader) void {
         self.alloc.free(self.window);
     }
@@ -116,6 +120,7 @@ pub const BlockWriter = struct {
         return .{ .dev = dev, .alloc = allocator, .buf = buf, .base = start_off };
     }
 
+    /// Release the staging buffer allocated by `init`.
     pub fn deinit(self: *BlockWriter) void {
         self.alloc.free(self.buf);
     }
